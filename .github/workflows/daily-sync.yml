@@ -1,0 +1,61 @@
+name: Daily Sync
+
+on:
+  schedule:
+    # Run every 6 hours (4x daily): 12 AM, 6 AM, 12 PM, 6 PM UTC
+    # In MST: 5 PM, 11 PM, 5 AM, 11 AM
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allow manual trigger from GitHub Actions UI
+    inputs:
+      skip_thumbnails:
+        description: 'Skip thumbnail processing (faster sync)'
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write   # Required for WIF OIDC token
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Requires these GitHub Actions repository variables (Settings → Variables):
+      #   GCP_PROJECT_NUMBER          — your GCP project number
+      #   GCP_WIF_POOL_ID             — Workload Identity Pool ID
+      #   GCP_WIF_PROVIDER_ID         — Workload Identity Provider ID
+      #   GCP_SERVICE_ACCOUNT_EMAIL   — service account email
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/${{ vars.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ vars.GCP_WIF_POOL_ID }}/providers/${{ vars.GCP_WIF_PROVIDER_ID }}'
+          service_account: '${{ vars.GCP_SERVICE_ACCOUNT_EMAIL }}'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Only connection credentials are needed as secrets.
+      # Operational config (shared_drive_id, sync_folders, drive_label_id, etc.)
+      # is loaded from the Supabase app_settings table by the sync script.
+      - name: Run sync
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.skip_thumbnails }}" = "true" ]; then
+            FLAGS="$FLAGS --skip-thumbnails"
+          fi
+          npx tsx scripts/sync.ts $FLAGS

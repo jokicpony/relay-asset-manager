@@ -1,0 +1,776 @@
+@import "tailwindcss";
+
+:root {
+  /* Core palette - deep slate/charcoal with warm accents */
+  --ram-bg-primary: #0c0e12;
+  --ram-bg-secondary: #141720;
+  --ram-bg-tertiary: #1a1e2a;
+  --ram-bg-elevated: #1f2435;
+  --ram-bg-hover: #252a3a;
+
+  --ram-border: rgba(255, 255, 255, 0.06);
+  --ram-border-hover: rgba(255, 255, 255, 0.12);
+
+  --ram-text-primary: #f0f2f5;
+  --ram-text-secondary: #8b92a5;
+  --ram-text-tertiary: #5a6178;
+
+  /* Accent - warm amber/gold brand color */
+  --ram-accent: #e8a838;
+  --ram-accent-hover: #f0b848;
+  --ram-accent-muted: rgba(232, 168, 56, 0.12);
+
+  /* Badge colors */
+  --ram-green: #34d399;
+  --ram-green-bg: rgba(52, 211, 153, 0.12);
+  --ram-amber: #fbbf24;
+  --ram-amber-bg: rgba(251, 191, 36, 0.12);
+  --ram-orange: #fb923c;
+  --ram-orange-bg: rgba(251, 146, 60, 0.12);
+  --ram-red: #f87171;
+  --ram-red-bg: rgba(248, 113, 113, 0.12);
+  --ram-gray: #6b7280;
+  --ram-gray-bg: rgba(107, 114, 128, 0.12);
+
+  /* Teal — action/success color (namer, login) */
+  --ram-teal: #2dd4bf;
+  --ram-teal-bg: rgba(45, 212, 191, 0.12);
+
+  /* Surface — card/container backgrounds */
+  --ram-surface: #141720;
+  --ram-surface-raised: #1a1e2a;
+
+  /* Selection */
+  --ram-select: rgba(232, 168, 56, 0.20);
+  --ram-select-border: rgba(232, 168, 56, 0.50);
+}
+
+@theme inline {
+  --color-background: var(--ram-bg-primary);
+  --color-foreground: var(--ram-text-primary);
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+body {
+  background: var(--ram-bg-primary);
+  color: var(--ram-text-primary);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/* Masonry grid — CSS Grid approach (row-major fill, no JS transpose needed) */
+.masonry-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-auto-rows: 10px;
+  column-gap: 12px;
+  /* No row-gap — vertical spacing handled by card margin */
+}
+
+.masonry-item {
+  /* grid-row span is set inline by AssetCard based on aspect ratio */
+  margin-bottom: 12px;
+}
+
+@media (max-width: 1536px) {
+  .masonry-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+@media (max-width: 1280px) {
+  .masonry-grid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (max-width: 768px) {
+  .masonry-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 480px) {
+  .masonry-grid {
+    grid-template-columns: repeat(1, 1fr);
+  }
+}
+
+/* Asset card transitions */
+.asset-card {
+  position: relative;
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  background: var(--ram-bg-tertiary);
+}
+
+/* Persistent top scrim — always visible for badge/checkbox readability */
+.asset-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 48px;
+  background: linear-gradient(to bottom,
+      rgba(0, 0, 0, 0.55) 0%,
+      rgba(0, 0, 0, 0.25) 60%,
+      rgba(0, 0, 0, 0) 100%);
+  z-index: 5;
+  pointer-events: none;
+  border-radius: 8px 8px 0 0;
+}
+
+.asset-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.asset-card.selected {
+  outline: 2px solid var(--ram-select-border);
+  outline-offset: -2px;
+  background: var(--ram-select);
+}
+
+/* Expired card dimming treatment */
+.asset-card.expired-dimmed {
+  opacity: 0.55;
+  filter: saturate(0.4);
+  transition: opacity 0.3s ease, filter 0.3s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.asset-card.expired-dimmed:hover {
+  opacity: 0.85;
+  filter: saturate(0.7);
+}
+
+.asset-card .overlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top,
+      rgba(0, 0, 0, 0.7) 0%,
+      rgba(0, 0, 0, 0) 40%,
+      rgba(0, 0, 0, 0) 70%,
+      rgba(0, 0, 0, 0.3) 100%);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.asset-card:hover .overlay {
+  opacity: 1;
+}
+
+.asset-card .hud {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 12px;
+  transform: translateY(8px);
+  opacity: 0;
+  transition: all 0.2s ease;
+}
+
+.asset-card:hover .hud {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* Checkbox animation */
+.select-check {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  background: rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  z-index: 10;
+}
+
+.asset-card:hover .select-check,
+.asset-card.selected .select-check {
+  opacity: 1;
+}
+
+.asset-card.selected .select-check {
+  background: var(--ram-accent);
+  border-color: var(--ram-accent);
+}
+
+/* Badges container */
+.badges {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  z-index: 10;
+}
+
+/* Video play icon */
+.video-indicator {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 5;
+  transition: transform 0.2s ease, background 0.2s ease;
+}
+
+.asset-card:hover .video-indicator {
+  transform: translate(-50%, -50%) scale(1.1);
+  background: rgba(0, 0, 0, 0.8);
+}
+
+/* Shortcut provenance indicator — bottom-left link icon */
+.shortcut-indicator {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px 4px 7px;
+  border-radius: 20px;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(8px);
+  border: 1.5px solid rgba(255, 255, 255, 0.15);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  z-index: 5;
+  opacity: 0.85;
+  transition: opacity 0.15s ease, border-color 0.15s ease;
+}
+
+.asset-card:hover .shortcut-indicator {
+  opacity: 1;
+  border-color: rgba(255, 255, 255, 0.4);
+}
+
+/* Shortcut clone indicator — subtle icon for linked assets */
+.shortcut-clone-badge {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px 4px 7px;
+  border-radius: 20px;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(8px);
+  border: 1.5px solid rgba(255, 255, 255, 0.15);
+  color: var(--ram-accent);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  z-index: 10;
+  opacity: 0.85;
+  transition: opacity 0.15s ease, border-color 0.15s ease;
+}
+
+.asset-card:hover .shortcut-clone-badge {
+  opacity: 1;
+  border-color: var(--ram-accent);
+}
+
+/* Action bar slide up */
+.action-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 50;
+  transform: translateY(100%);
+  transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.action-bar.visible {
+  transform: translateY(0);
+}
+
+/* Modal overlay */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(8px);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fadeIn 0.2s ease;
+}
+
+.modal-content {
+  animation: scaleIn 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Search bar glow effect */
+.search-bar {
+  position: relative;
+}
+
+.search-bar::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--ram-accent), transparent, var(--ram-accent));
+  opacity: 0;
+  z-index: -1;
+  transition: opacity 0.3s ease;
+}
+
+.search-bar:focus-within::after {
+  opacity: 0.2;
+}
+
+/* Enter key hint badge — appears while typing to cue semantic search */
+.search-enter-hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px 3px 6px;
+  border-radius: 6px;
+  border: 1px solid rgba(232, 168, 56, 0.25);
+  background: rgba(232, 168, 56, 0.08);
+  color: var(--ram-accent);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+  animation: hintFadeIn 0.2s ease;
+}
+
+.search-enter-hint:hover {
+  background: rgba(232, 168, 56, 0.16);
+  border-color: rgba(232, 168, 56, 0.4);
+}
+
+@keyframes hintFadeIn {
+  from {
+    opacity: 0;
+    transform: translateX(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Order pill group — segmented ordering mode selector */
+.order-pill-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--ram-bg-tertiary);
+  border: 1px solid var(--ram-border);
+}
+
+.order-pill {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ram-text-tertiary);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.order-pill:hover {
+  background: var(--ram-bg-hover);
+  color: var(--ram-text-secondary);
+}
+
+.order-pill.active {
+  background: var(--ram-accent-muted);
+  border-color: rgba(232, 168, 56, 0.35);
+  color: var(--ram-accent);
+  font-weight: 600;
+}
+
+.order-pill.shuffle-active {
+  animation: shuffleGlow 2.5s ease-in-out infinite;
+}
+
+@keyframes shuffleGlow {
+
+  0%,
+  100% {
+    box-shadow: 0 0 6px rgba(232, 168, 56, 0.08);
+  }
+
+  50% {
+    box-shadow: 0 0 12px rgba(232, 168, 56, 0.2);
+  }
+}
+
+.shuffle-dice {
+  display: inline-block;
+  font-size: 13px;
+}
+
+.shuffle-dice.spin {
+  animation: diceSpin 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes diceSpin {
+  0% {
+    transform: rotate(0deg) scale(1);
+  }
+
+  50% {
+    transform: rotate(180deg) scale(1.15);
+  }
+
+  100% {
+    transform: rotate(360deg) scale(1);
+  }
+}
+
+/* Folder tree */
+.folder-item {
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+  font-size: 13px;
+  color: var(--ram-text-secondary);
+}
+
+.folder-item:hover {
+  background: var(--ram-bg-hover);
+  color: var(--ram-text-primary);
+}
+
+.folder-item.active {
+  background: var(--ram-accent-muted);
+  color: var(--ram-accent);
+}
+
+/* Top-level library folders — section headers */
+.folder-item.top-level {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ram-text-primary);
+  margin-top: 2px;
+}
+
+.folder-item.top-level:hover {
+  color: var(--ram-text-primary);
+}
+
+.folder-item.top-level.active {
+  color: var(--ram-accent);
+}
+
+/* Divider between top-level folder sections */
+.folder-section-divider {
+  height: 1px;
+  background: var(--ram-border);
+  margin: 6px 12px;
+}
+
+/* Indent guide line for nested children */
+.folder-children {
+  position: relative;
+  margin-left: 20px;
+}
+
+.folder-children::before {
+  content: '';
+  position: absolute;
+  left: 6px;
+  top: 0;
+  bottom: 8px;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* Folder hidden-eye tooltip */
+.folder-hidden-tooltip-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.folder-hidden-tooltip {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  white-space: nowrap;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: rgba(20, 23, 32, 0.95);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--ram-text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 100;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+/* Tooltip arrow */
+.folder-hidden-tooltip::before {
+  content: '';
+  position: absolute;
+  right: 100%;
+  top: 50%;
+  transform: translateY(-50%);
+  border: 5px solid transparent;
+  border-right-color: rgba(20, 23, 32, 0.95);
+}
+
+.folder-hidden-tooltip-wrap:hover .folder-hidden-tooltip {
+  opacity: 1;
+}
+
+/* Subtle loading shimmer */
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.shimmer {
+  background: linear-gradient(90deg,
+      var(--ram-bg-tertiary) 25%,
+      var(--ram-bg-hover) 50%,
+      var(--ram-bg-tertiary) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+/* Spinner animation for download queue */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Subtle pulse for active downloads button */
+@keyframes downloadPulse {
+
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(232, 168, 56, 0.15);
+  }
+
+  50% {
+    box-shadow: 0 0 0 4px rgba(232, 168, 56, 0.08);
+  }
+}
+
+@keyframes pulse-glow {
+
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 4px 1px rgba(245, 158, 11, 0.4);
+  }
+
+  50% {
+    opacity: 0.5;
+    box-shadow: 0 0 8px 3px rgba(245, 158, 11, 0.6);
+  }
+}
+
+/* Search pulse — subtle breathing animation on search icon during semantic search */
+@keyframes search-pulse {
+
+  0%,
+  100% {
+    opacity: 0.4;
+    transform: scale(1);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+/* ── Pinboard ─────────────────────────────────────────────── */
+
+/* Sidebar pinboard section */
+.pinboard-section {
+  margin: 0 8px 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(232, 168, 56, 0.06);
+  border-left: 2px solid var(--ram-accent);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.pinboard-section:hover {
+  background: rgba(232, 168, 56, 0.1);
+}
+
+.pinboard-section.active {
+  background: var(--ram-accent-muted);
+}
+
+/* Card pin icon — bottom-right, appears on hover, mirrors shortcut indicator */
+.pinboard-pin {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px 4px 7px;
+  border-radius: 20px;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(8px);
+  border: 1.5px solid rgba(255, 255, 255, 0.15);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  opacity: 0;
+  transition: opacity 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+  z-index: 10;
+  cursor: pointer;
+}
+
+.asset-card:hover .pinboard-pin {
+  opacity: 1;
+}
+
+.pinboard-pin:hover {
+  border-color: var(--ram-accent);
+  transform: scale(1.05);
+}
+
+.pinboard-pin.pinned {
+  opacity: 1;
+  color: var(--ram-accent);
+  border-color: rgba(232, 168, 56, 0.5);
+  background: rgba(232, 168, 56, 0.15);
+}
+
+@keyframes pinBounce {
+  0% {
+    transform: scale(1);
+  }
+
+  40% {
+    transform: scale(1.25);
+  }
+
+  100% {
+    transform: scale(1);
+  }
+}
+
+.pinboard-pin.just-pinned {
+  animation: pinBounce 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* ── Namer queue toggle pulse ────────────────────────────────── */
+@keyframes queuePulse {
+  0%, 100% {
+    box-shadow: 2px 2px 12px rgba(0,0,0,0.3);
+  }
+  50% {
+    box-shadow: 2px 2px 12px rgba(0,0,0,0.3), 0 0 0 4px rgba(45, 212, 191, 0.12);
+  }
+}
+
+.namer-queue-toggle:hover {
+  background: var(--ram-bg-hover);
+  border-color: var(--ram-border-hover);
+}
+
+/* Namer setup toggle button hover */
+.namer-setup-toggle:hover {
+  border-color: var(--ram-border-hover);
+  background: var(--ram-bg-hover) !important;
+}
