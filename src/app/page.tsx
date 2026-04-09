@@ -716,16 +716,52 @@ function Home() {
     }
   }, [relayHistory]);
 
-  // Loading state
+  // Loading state — skeleton UI so the user sees the app shell immediately
   if (loading) {
     return (
-      <div className="flex h-screen items-center justify-center" style={{ background: 'var(--ram-bg-primary)' }}>
-        <div className="flex flex-col items-center gap-4">
-          <div className="w-10 h-10 rounded-full border-2 border-t-transparent animate-spin"
-            style={{ borderColor: 'var(--ram-accent)', borderTopColor: 'transparent' }} />
-          <p className="text-sm" style={{ color: 'var(--ram-text-secondary)' }}>
-            Loading assets...
-          </p>
+      <div className="flex h-screen overflow-hidden" style={{ background: 'var(--ram-bg-primary)' }}>
+        {/* Sidebar placeholder */}
+        <div
+          className="flex-shrink-0 w-56 p-4 space-y-3"
+          style={{ borderRight: '1px solid var(--ram-border)', background: 'var(--ram-bg-secondary)' }}
+        >
+          <div className="h-5 w-24 rounded animate-pulse" style={{ background: 'var(--ram-bg-tertiary)' }} />
+          {[80, 65, 90, 70, 85, 60].map((w, i) => (
+            <div key={i} className="h-4 rounded animate-pulse" style={{ background: 'var(--ram-bg-tertiary)', width: `${w}%` }} />
+          ))}
+        </div>
+        {/* Main content placeholder */}
+        <div className="flex-1 flex flex-col min-w-0">
+          {/* Header placeholder */}
+          <header
+            className="flex-shrink-0 px-6 py-4 flex items-center gap-4"
+            style={{ borderBottom: '1px solid var(--ram-border)' }}
+          >
+            <div
+              className="w-8 h-8 rounded-lg flex items-center justify-center text-sm font-bold"
+              style={{ background: 'linear-gradient(135deg, var(--ram-accent), #d4922e)', color: 'var(--ram-bg-primary)' }}
+            >
+              R
+            </div>
+            <div>
+              <h1 className="text-sm font-semibold" style={{ color: 'var(--ram-text-primary)' }}>Relay Asset Manager</h1>
+              <p className="text-[11px]" style={{ color: 'var(--ram-text-tertiary)' }}>Loading assets...</p>
+            </div>
+          </header>
+          {/* Skeleton grid */}
+          <div className="flex-1 overflow-hidden p-6">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+              {[...Array(24)].map((_, i) => (
+                <div key={i} className="rounded-lg overflow-hidden" style={{ background: 'var(--ram-bg-secondary)', border: '1px solid var(--ram-border)' }}>
+                  <div className="aspect-[4/3] animate-pulse" style={{ background: 'var(--ram-bg-tertiary)' }} />
+                  <div className="p-2 space-y-1.5">
+                    <div className="h-3 rounded animate-pulse" style={{ background: 'var(--ram-bg-tertiary)', width: '75%' }} />
+                    <div className="h-2.5 rounded animate-pulse" style={{ background: 'var(--ram-bg-tertiary)', width: '50%' }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
     );
