@@ -4,6 +4,17 @@ import { useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import type { NamerFilePreview } from '@/lib/namer/types';
 
+type FilterType = 'all' | 'images' | 'videos';
+
+const IMAGE_MIMES = new Set([
+    'image/jpeg', 'image/png', 'image/webp', 'image/gif',
+    'image/tiff', 'image/heic', 'image/heif',
+]);
+const VIDEO_MIMES = new Set([
+    'video/mp4', 'video/quicktime', 'video/x-msvideo',
+    'video/x-matroska', 'video/webm', 'video/mpeg',
+]);
+
 interface FilePreviewTableProps {
     files: NamerFilePreview[];
     onToggleExclude: (fileId: string) => void;
@@ -13,6 +24,9 @@ interface FilePreviewTableProps {
     onExecute: () => void;
     canExecute: boolean;
     isProcessing: boolean;
+    loadId: number;
+    onSelectFiltered?: (ids: string[]) => void;
+    onDeselectFiltered?: (ids: string[]) => void;
 }
 
 export default function FilePreviewTable({
@@ -24,28 +38,69 @@ export default function FilePreviewTable({
     onExecute,
     canExecute,
     isProcessing,
+    loadId,
+    onSelectFiltered,
+    onDeselectFiltered,
 }: FilePreviewTableProps) {
     const [hoveredId, setHoveredId] = useState<string | null>(null);
     const [hoverPos, setHoverPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
     const previewRef = useRef<HTMLDivElement>(null);
+    const [filterType, setFilterType] = useState<FilterType>('all');
+    const [searchQuery, setSearchQuery] = useState('');
+
+    useEffect(() => {
+        setFilterType('all');
+        setSearchQuery('');
+    }, [loadId]);
+
+    const visibleFiles = files.filter(file => {
+        if (file.status === 'processing' || file.status === 'success' || file.status === 'error') return true;
+        if (filterType === 'images' && !IMAGE_MIMES.has(file.mimeType)) return false;
+        if (filterType === 'videos' && !VIDEO_MIMES.has(file.mimeType)) return false;
+        if (searchQuery.trim()) {
+            const q = searchQuery.trim().toLowerCase();
+            if (!file.originalName.toLowerCase().includes(q)) return false;
+        }
+        return true;
+    });
+    const isFiltered = filterType !== 'all' || searchQuery.trim() !== '';
+    const filteredToggleableIds = visibleFiles
+        .filter(f => f.status === 'pending' || f.status === 'excluded')
+        .map(f => f.id);
+
     const pendingCount = files.filter(f => f.status === 'pending').length;
     const excludedCount = files.filter(f => f.status === 'excluded').length;
     const totalCount = files.length;
 
     return (
         <div className="px-6 py-3 flex flex-col" style={{ minHeight: 0 }}>
-            {/* Summary bar with Select All / Deselect All */}
-            <div className="flex items-center gap-3 mb-3">
-                <p style={{ fontSize: '12px', color: 'var(--ram-text-secondary)', fontWeight: 500 }}>
-                    <span style={{ color: 'var(--ram-teal)', fontWeight: 700 }}>{pendingCount}</span> file{pendingCount !== 1 ? 's' : ''} selected
-                    <span style={{ color: 'var(--ram-text-tertiary)' }}> ({totalCount} total)</span>
-                    {excludedCount > 0 && (
-                        <span style={{ color: 'var(--ram-text-tertiary)' }}> · {excludedCount} excluded</span>
-                    )}
-                </p>
+            {/* Row 1 — counts */}
+            <p style={{ fontSize: '12px', color: 'var(--ram-text-secondary)', fontWeight: 500, marginBottom: 8 }}>
+                <span style={{ color: 'var(--ram-teal)', fontWeight: 700 }}>{pendingCount}</span> file{pendingCount !== 1 ? 's' : ''} selected
+                <span style={{ color: 'var(--ram-text-tertiary)' }}> ({totalCount} total)</span>
+                {excludedCount > 0 && (
+                    <span style={{ color: 'var(--ram-text-tertiary)' }}> · {excludedCount} excluded</span>
+                )}
+                {isFiltered && (
+                    <span style={{ color: 'var(--ram-text-tertiary)' }}> · showing {visibleFiles.length} of {totalCount}</span>
+                )}
+            </p>
+
+            {/* Row 2 — filter pills + Select All / Deselect All + search */}
+            <div className="flex items-center gap-2 mb-3">
+                <div className="order-pill-group">
+                    {(['all', 'images', 'videos'] as FilterType[]).map(t => (
+                        <button key={t} className={`order-pill${filterType === t ? ' active' : ''}`}
+                            onClick={() => setFilterType(t)}>
+                            {t === 'all' ? 'All' : t === 'images' ? 'Images' : 'Videos'}
+                        </button>
+                    ))}
+                </div>
                 <span style={{ color: 'var(--ram-border)' }}>|</span>
                 <button
-                    onClick={onSelectAll}
+                    onClick={() => isFiltered && onSelectFiltered
+                        ? onSelectFiltered(filteredToggleableIds)
+                        : onSelectAll()}
                     style={{
                         background: 'none',
                         border: 'none',
@@ -59,11 +114,16 @@ export default function FilePreviewTable({
                     Select All
                 </button>
                 <button
-                    onClick={onDeselectAll}
+                    onClick={() => isFiltered && onDeselectFiltered
+                        ? onDeselectFiltered(filteredToggleableIds)
+                        : onDeselectAll()}
                     style={{
                         background: 'none',
                         border: 'none',
-                        color: excludedCount < totalCount ? 'var(--ram-teal)' : 'var(--ram-text-tertiary)',
+                        color: (isFiltered
+                            ? visibleFiles.some(f => f.status === 'pending')
+                            : excludedCount < totalCount)
+                            ? 'var(--ram-teal)' : 'var(--ram-text-tertiary)',
                         fontSize: '12px',
                         cursor: 'pointer',
                         padding: 0,
@@ -72,6 +132,37 @@ export default function FilePreviewTable({
                 >
                     Deselect All
                 </button>
+                <span style={{ color: 'var(--ram-border)' }}>|</span>
+                <div
+                    className="flex items-center gap-1.5 px-2 py-1 rounded-md"
+                    style={{
+                        background: 'var(--ram-bg-tertiary)',
+                        border: '1px solid var(--ram-border)',
+                        maxWidth: 220,
+                        flex: 1,
+                    }}
+                >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none"
+                        stroke="var(--ram-text-tertiary)" strokeWidth="2" style={{ flexShrink: 0 }}>
+                        <circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" />
+                    </svg>
+                    <input
+                        type="text"
+                        placeholder="Filter by name…"
+                        value={searchQuery}
+                        onChange={e => setSearchQuery(e.target.value)}
+                        className="bg-transparent outline-none flex-1"
+                        style={{ fontSize: '11px', color: 'var(--ram-text-primary)', minWidth: 0 }}
+                    />
+                    {searchQuery && (
+                        <button onClick={() => setSearchQuery('')} style={{ lineHeight: 0, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+                            <svg width="10" height="10" viewBox="0 0 24 24" fill="none"
+                                stroke="var(--ram-text-tertiary)" strokeWidth="2.5">
+                                <path d="M18 6L6 18M6 6l12 12" />
+                            </svg>
+                        </button>
+                    )}
+                </div>
             </div>
 
             {/* Table */}
@@ -98,7 +189,12 @@ export default function FilePreviewTable({
 
                 {/* Rows */}
                 <div>
-                    {files.map(file => {
+                    {visibleFiles.length === 0 && isFiltered && (
+                        <div className="flex items-center justify-center py-16" style={{ color: 'var(--ram-text-tertiary)', fontSize: '14px' }}>
+                            No files match the current filter
+                        </div>
+                    )}
+                    {visibleFiles.map(file => {
                         const isExcluded = file.status === 'excluded';
                         const isProcessed = file.status === 'success' || file.status === 'error';
                         const isHovered = hoveredId === file.id;

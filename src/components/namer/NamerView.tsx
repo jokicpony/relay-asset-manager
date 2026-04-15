@@ -178,6 +178,7 @@ export default function NamerView() {
                 status: 'pending',
             }));
             setFiles(previews);
+            setLoadCount(c => c + 1);
             setCounter(1); // Reset counter for new folder
         } catch (err) {
             logger.error('namer', 'Failed to load files', { error: err instanceof Error ? err.message : String(err) });
@@ -258,6 +259,22 @@ export default function NamerView() {
     const deselectAll = useCallback(() => {
         setFiles(prev => prev.map(f =>
             f.status === 'pending' ? { ...f, status: 'excluded' as const } : f
+        ));
+    }, []);
+
+    const [loadCount, setLoadCount] = useState(0);
+
+    const selectFiltered = useCallback((ids: string[]) => {
+        const s = new Set(ids);
+        setFiles(prev => prev.map(f =>
+            s.has(f.id) && f.status === 'excluded' ? { ...f, status: 'pending' as const } : f
+        ));
+    }, []);
+
+    const deselectFiltered = useCallback((ids: string[]) => {
+        const s = new Set(ids);
+        setFiles(prev => prev.map(f =>
+            s.has(f.id) && f.status === 'pending' ? { ...f, status: 'excluded' as const } : f
         ));
     }, []);
 
@@ -1208,6 +1225,9 @@ export default function NamerView() {
                             onExecute={() => setShowConfirmModal(true)}
                             canExecute={canExecute}
                             isProcessing={isProcessing}
+                            loadId={loadCount}
+                            onSelectFiltered={selectFiltered}
+                            onDeselectFiltered={deselectFiltered}
                         />
 
                     </>
