@@ -14,6 +14,8 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getDriveAccessToken } from '@/lib/google/auth';
+import { isInSharedDrive } from '@/lib/google/drive-scope';
+import { getConfig } from '@/lib/config';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import type { AIMetadata } from '@/lib/namer/types';
@@ -118,6 +120,13 @@ export async function POST(request: NextRequest) {
         }
 
         const token = await getDriveAccessToken();
+
+        // Bound the namer to the configured shared drive — the service account
+        // may reach other drives, but the namer must not read files outside the DAM.
+        const { sharedDriveId } = await getConfig();
+        if (!(await isInSharedDrive(token, fileId, sharedDriveId))) {
+            return NextResponse.json({ error: 'File is outside the configured shared drive' }, { status: 403 });
+        }
 
         // 1. Fetch and prepare image
         const { base64, mimeType } = await fetchAndPrepareImage(fileId, token);

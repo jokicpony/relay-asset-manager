@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
+import { createClient as createServiceClient } from '@supabase/supabase-js';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { logger } from '@/lib/logger';
 
@@ -23,13 +24,21 @@ export async function DELETE(request: NextRequest) {
 
         // Verify user is authenticated
         const supabase = await createClient();
-        const { data: { session } } = await supabase.auth.getSession();
-        if (!session) {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
             return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
         }
 
         // Get Drive access token via WIF service account
         const accessToken = await getDriveAccessToken();
+
+        // Shortcut rows are removed with the service role — RLS allows only
+        // service-role writes to the shortcuts table; the user client above is
+        // used only for the auth check.
+        const admin = createServiceClient(
+            process.env.NEXT_PUBLIC_SUPABASE_URL!,
+            process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+        );
 
         const results: { id: string; success: boolean; error?: string }[] = [];
 
@@ -51,7 +60,7 @@ export async function DELETE(request: NextRequest) {
                 }
 
                 // Remove from Supabase shortcuts table
-                const { error: dbError } = await supabase
+                const { error: dbError } = await admin
                     .from('shortcuts')
                     .delete()
                     .eq('shortcut_drive_id', id);

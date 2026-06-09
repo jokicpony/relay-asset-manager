@@ -1,7 +1,7 @@
 'use client';
 
 import { createClient } from '@/lib/supabase/client';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 /**
  * Login page with Google SSO.
@@ -10,6 +10,14 @@ import { useState } from 'react';
 export default function LoginPage() {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+
+    // Surface the allowlist rejection bounced here by the auth middleware.
+    useEffect(() => {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('error') === 'not_authorized') {
+            setError("This account isn't authorized to access Relay. Contact the workspace owner.");
+        }
+    }, []);
 
     const handleGoogleLogin = async () => {
         setLoading(true);

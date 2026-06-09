@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
+import { createClient as createServiceClient } from '@supabase/supabase-js';
 import { getDriveAccessToken } from '@/lib/google/auth';
+import { resolveFolderPathById } from '@/lib/google/folder-path';
+import { getConfig } from '@/lib/config';
 import { logger } from '@/lib/logger';
 
 /**
@@ -14,33 +17,60 @@ import { logger } from '@/lib/logger';
  * Body: {
  *   assets: { driveFileId: string, assetId: string, name: string }[],
  *   targetFolderId: string,
- *   targetFolderPath: string
  * }
+ *
+ * `targetFolderPath` is resolved server-side from `targetFolderId` so that
+ * shortcut rows always carry the full canonical path, regardless of how the
+ * client built its breadcrumb.
  */
 export async function POST(request: NextRequest) {
     try {
-        const { assets, targetFolderId, targetFolderPath } = await request.json() as {
+        const { assets, targetFolderId } = await request.json() as {
             assets: { driveFileId: string; assetId: string; name: string }[];
             targetFolderId: string;
-            targetFolderPath: string;
         };
 
         if (!assets || assets.length === 0) {
             return NextResponse.json({ error: 'No assets specified' }, { status: 400 });
         }
-        if (!targetFolderId || !targetFolderPath) {
+        if (!targetFolderId) {
             return NextResponse.json({ error: 'No target folder specified' }, { status: 400 });
         }
 
         // Verify user is authenticated
         const supabase = await createClient();
-        const { data: { session } } = await supabase.auth.getSession();
-        if (!session) {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
             return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
         }
 
         // Get Drive access token via WIF service account
         const accessToken = await getDriveAccessToken();
+
+        // Shortcut rows are written with the service role — RLS allows only
+        // service-role writes to the shortcuts table; the user client above is
+        // used only for the auth check.
+        const admin = createServiceClient(
+            process.env.NEXT_PUBLIC_SUPABASE_URL!,
+            process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+        );
+
+        // Resolve the canonical folder path from the Drive folder ID. This is
+        // the source-of-truth value written into shortcuts.project_folder_path —
+        // never trust whatever path string the client constructed.
+        const config = await getConfig();
+        const { path: targetFolderPath } = await resolveFolderPathById(
+            accessToken,
+            targetFolderId,
+            config.sharedDriveId
+        );
+
+        if (targetFolderPath === '/unknown') {
+            return NextResponse.json(
+                { error: 'Could not resolve target folder path' },
+                { status: 400 }
+            );
+        }
 
         const results: { name: string; success: boolean; shortcutId?: string; error?: string }[] = [];
 
@@ -73,7 +103,7 @@ export async function POST(request: NextRequest) {
                 const created = await res.json();
 
                 // Record in Supabase shortcuts table
-                const { error: dbError } = await supabase
+                const { error: dbError } = await admin
                     .from('shortcuts')
                     .insert({
                         shortcut_drive_id: created.id,
@@ -105,6 +135,7 @@ export async function POST(request: NextRequest) {
             failed,
             total: assets.length,
             results,
+            resolvedFolderPath: targetFolderPath,
         });
     } catch (err) {
         logger.error('shortcut', 'Shortcut creation error', { error: String(err) });

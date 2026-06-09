@@ -1465,6 +1465,60 @@ async function snapshotMetadata(): Promise<Map<string, MetadataSnapshot>> {
     return map;
 }
 
+// ---------------------------------------------------------------------------
+// Embedding input builders — shared by the batch path and the per-asset retry
+// fallbacks below so the text + multimodal logic lives in exactly one place.
+// ---------------------------------------------------------------------------
+function buildEmbedText(asset: any): string {
+    const textParts: string[] = [];
+    const baseName = asset.name.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
+    textParts.push(baseName);
+    if (asset.parsed_shoot_description) textParts.push(asset.parsed_shoot_description);
+    if (asset.parsed_creator) textParts.push(`by ${asset.parsed_creator}`);
+    textParts.push(asset.asset_type);
+    if (asset.folder_path && asset.folder_path !== '/') {
+        const folders = asset.folder_path
+            .split('/')
+            .filter(Boolean)
+            .map((f: string) => f.replace(/^\d+\.\s*/, ''))
+            .join(' > ');
+        textParts.push(folders);
+    }
+    if (asset.description) textParts.push(asset.description);
+    return textParts.join(' | ');
+}
+
+// Build the multimodal content parts (text + optional thumbnail image).
+// Thumbnails are stored as .webp but hold JPEG/PNG bytes; Gemini only accepts
+// image/jpeg and image/png, so the real format is sniffed from magic bytes.
+async function buildEmbedParts(asset: any): Promise<{ parts: any[]; hasImage: boolean }> {
+    const parts: any[] = [{ text: buildEmbedText(asset) }];
+
+    if (asset.thumbnail_url && !asset.thumbnail_url.includes('googleusercontent.com') && asset.drive_file_id) {
+        const supabase = getSupabase();
+        for (const thumbPath of [`custom_${asset.drive_file_id}.webp`, `${asset.drive_file_id}.webp`]) {
+            try {
+                const { data: thumbData, error: thumbErr } = await supabase.storage
+                    .from('thumbnails')
+                    .download(thumbPath);
+                if (!thumbErr && thumbData) {
+                    const buffer = Buffer.from(await thumbData.arrayBuffer());
+                    const hex = buffer.slice(0, 4).toString('hex');
+                    const mimeType = hex.startsWith('ffd8') ? 'image/jpeg'
+                        : hex.startsWith('8950') ? 'image/png'
+                        : 'image/jpeg';
+                    parts.push({ inline_data: { mime_type: mimeType, data: buffer.toString('base64') } });
+                    return { parts, hasImage: true };
+                }
+            } catch {
+                // Fall through to text-only
+            }
+        }
+    }
+
+    return { parts, hasImage: false };
+}
+
 async function reEmbedChanged(
     files: DriveFile[],
     beforeSnapshot: Map<string, MetadataSnapshot>
@@ -1555,64 +1609,11 @@ async function reEmbedChanged(
         // Build multimodal requests: text + thumbnail for each asset
         const requests = await Promise.all(
             batch.map(async (asset) => {
-                // Build text part
-                const textParts: string[] = [];
-                const baseName = asset.name.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
-                textParts.push(baseName);
-                if (asset.parsed_shoot_description) textParts.push(asset.parsed_shoot_description);
-                if (asset.parsed_creator) textParts.push(`by ${asset.parsed_creator}`);
-                textParts.push(asset.asset_type);
-                if (asset.folder_path && asset.folder_path !== '/') {
-                    const folders = asset.folder_path
-                        .split('/')
-                        .filter(Boolean)
-                        .map((f: string) => f.replace(/^\d+\.\s*/, ''))
-                        .join(' > ');
-                    textParts.push(folders);
-                }
-                if (asset.description) textParts.push(asset.description);
-                const text = textParts.join(' | ');
-
-                // Build content parts array (text + optional image)
-                const contentParts: any[] = [{ text }];
-
-                // Try to download thumbnail for multimodal embedding
-                if (asset.thumbnail_url && !asset.thumbnail_url.includes('googleusercontent.com') && asset.drive_file_id) {
-                    const thumbPaths = [
-                        `custom_${asset.drive_file_id}.webp`,
-                        `${asset.drive_file_id}.webp`,
-                    ];
-                    for (const thumbPath of thumbPaths) {
-                        try {
-                            const { data: thumbData, error: thumbErr } = await supabase.storage
-                                .from('thumbnails')
-                                .download(thumbPath);
-                            if (!thumbErr && thumbData) {
-                                const arrayBuffer = await thumbData.arrayBuffer();
-                                const thumbBuffer = Buffer.from(arrayBuffer);
-                                const base64 = thumbBuffer.toString('base64');
-                                // Detect actual format from magic bytes — thumbnails are
-                                // stored as .webp but contain JPEG/PNG data. Gemini only
-                                // accepts image/jpeg and image/png.
-                                const hex = thumbBuffer.slice(0, 4).toString('hex');
-                                const mimeType = hex.startsWith('ffd8') ? 'image/jpeg'
-                                    : hex.startsWith('8950') ? 'image/png'
-                                    : 'image/jpeg'; // fallback
-                                contentParts.push({
-                                    inline_data: { mime_type: mimeType, data: base64 },
-                                });
-                                withImage++;
-                                break;
-                            }
-                        } catch {
-                            // Fall through to text-only
-                        }
-                    }
-                }
-
+                const { parts, hasImage } = await buildEmbedParts(asset);
+                if (hasImage) withImage++;
                 return {
                     model: 'models/gemini-embedding-2-preview',
-                    content: { parts: contentParts },
+                    content: { parts },
                     outputDimensionality: 768,
                 };
             })
@@ -1678,40 +1679,9 @@ async function reEmbedChanged(
                     log(`  ⚠️  Batch ${Math.floor(i / EMBED_BATCH) + 1} failed after ${MAX_RETRIES + 1} attempts, retrying individually...`);
                     for (const asset of batch) {
                         try {
-                            // Build text part
-                            const textParts: string[] = [];
-                            const bn = asset.name.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
-                            textParts.push(bn);
-                            if (asset.parsed_shoot_description) textParts.push(asset.parsed_shoot_description);
-                            if (asset.parsed_creator) textParts.push(`by ${asset.parsed_creator}`);
-                            textParts.push(asset.asset_type);
-                            if (asset.folder_path && asset.folder_path !== '/') {
-                                const folders = asset.folder_path.split('/').filter(Boolean)
-                                    .map((f: string) => f.replace(/^\d+\.\s*/, '')).join(' > ');
-                                textParts.push(folders);
-                            }
-                            if (asset.description) textParts.push(asset.description);
-                            const text = textParts.join(' | ');
-
                             // Try multimodal first
-                            const cParts: any[] = [{ text }];
-                            if (asset.thumbnail_url && !asset.thumbnail_url.includes('googleusercontent.com') && asset.drive_file_id) {
-                                for (const tp of [`custom_${asset.drive_file_id}.webp`, `${asset.drive_file_id}.webp`]) {
-                                    try {
-                                        const { data: td, error: te } = await supabase.storage.from('thumbnails').download(tp);
-                                        if (!te && td) {
-                                            const ab = await td.arrayBuffer();
-                                            const buf = Buffer.from(ab);
-                                            const hex = buf.slice(0, 4).toString('hex');
-                                            const mt = hex.startsWith('ffd8') ? 'image/jpeg' : hex.startsWith('8950') ? 'image/png' : 'image/jpeg';
-                                            cParts.push({ inline_data: { mime_type: mt, data: buf.toString('base64') } });
-                                            break;
-                                        }
-                                    } catch { /* skip */ }
-                                }
-                            }
-
-                            const singleReq = [{ model: 'models/gemini-embedding-2-preview', content: { parts: cParts }, outputDimensionality: 768 }];
+                            const { parts, hasImage } = await buildEmbedParts(asset);
+                            const singleReq = [{ model: 'models/gemini-embedding-2-preview', content: { parts }, outputDimensionality: 768 }];
                             const singleRes = await fetch(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {
                                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({ requests: singleReq }),
@@ -1723,26 +1693,12 @@ async function reEmbedChanged(
 
                             const { error: ue } = await (supabase.from('assets') as any)
                                 .update({ embedding: JSON.stringify(vec) }).eq('id', asset.id);
-                            if (!ue) { embedded++; if (cParts.length > 1) withImage++; }
+                            if (!ue) { embedded++; if (hasImage) withImage++; }
                             else failed++;
                         } catch {
                             // Multimodal failed — try text-only
                             try {
-                                const textParts2: string[] = [];
-                                const bn2 = asset.name.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
-                                textParts2.push(bn2);
-                                if (asset.parsed_shoot_description) textParts2.push(asset.parsed_shoot_description);
-                                if (asset.parsed_creator) textParts2.push(`by ${asset.parsed_creator}`);
-                                textParts2.push(asset.asset_type);
-                                if (asset.folder_path && asset.folder_path !== '/') {
-                                    const folders = asset.folder_path.split('/').filter(Boolean)
-                                        .map((f: string) => f.replace(/^\d+\.\s*/, '')).join(' > ');
-                                    textParts2.push(folders);
-                                }
-                                if (asset.description) textParts2.push(asset.description);
-                                const text2 = textParts2.join(' | ');
-
-                                const textReq = [{ model: 'models/gemini-embedding-2-preview', content: { parts: [{ text: text2 }] }, outputDimensionality: 768 }];
+                                const textReq = [{ model: 'models/gemini-embedding-2-preview', content: { parts: [{ text: buildEmbedText(asset) }] }, outputDimensionality: 768 }];
                                 const textRes = await fetch(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {
                                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                                     body: JSON.stringify({ requests: textReq }),

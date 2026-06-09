@@ -39,10 +39,26 @@ export async function POST(request: NextRequest) {
 
         // Verify user is authenticated
         const supabase = await createClient();
-        const { data: { session } } = await supabase.auth.getSession();
+        const { data: { user } } = await supabase.auth.getUser();
 
-        if (!session) {
+        if (!user) {
             return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+        }
+
+        // Authorization: restrict the zip to in-scope library files. The
+        // service account can read the entire shared drive, so filter the
+        // request down to files that actually exist as active assets
+        // (confused-deputy / IDOR).
+        const requestedIds = files.map((f) => f.driveFileId);
+        const { data: scopedRows } = await supabase
+            .from('assets')
+            .select('drive_file_id')
+            .in('drive_file_id', requestedIds)
+            .eq('is_active', true);
+        const inScope = new Set((scopedRows ?? []).map((r) => r.drive_file_id));
+        const allowedFiles = files.filter((f) => inScope.has(f.driveFileId));
+        if (allowedFiles.length === 0) {
+            return NextResponse.json({ error: 'No in-scope files to download' }, { status: 400 });
         }
 
         // Get Drive access token via WIF service account
@@ -55,7 +71,7 @@ export async function POST(request: NextRequest) {
                 const centralDirectory: Uint8Array[] = [];
                 let offset = 0;
 
-                for (const file of files) {
+                for (const file of allowedFiles) {
                     try {
                         const driveUrl = `https://www.googleapis.com/drive/v3/files/${file.driveFileId}?alt=media&supportsAllDrives=true`;
                         const driveRes = await fetch(driveUrl, {

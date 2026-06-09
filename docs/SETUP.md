@@ -15,6 +15,9 @@ Supabase provides the database, auth, and thumbnail storage.
    - Row-level security policies
    - A `thumbnails` storage bucket
    - The `match_assets` function for semantic search
+
+   > **Upgrading an existing install?** Also run the files in `supabase/migrations/` (in date order) in the SQL Editor. `schema.sql` is always the complete, current schema for fresh installs; the migration files apply the same incremental changes to databases created earlier.
+
 3. Go to **Project Settings → API** and copy:
    - **Project URL** → `NEXT_PUBLIC_SUPABASE_URL`
    - **anon public key** → `NEXT_PUBLIC_SUPABASE_ANON_KEY`
@@ -84,6 +87,15 @@ npm run dev
 Open [http://localhost:3000](http://localhost:3000), sign in with Google, then go to **Settings → Sync** and trigger a sync. Your Drive assets will appear within a few minutes.
 
 ---
+
+## Optional: Access Control
+
+By default, anyone who clears the Google OAuth consent screen can sign in. To restrict access at the app layer (defense-in-depth, independent of OAuth), set either or both in your environment:
+
+- `AUTH_ALLOWED_EMAILS` — comma-separated allowed email addresses
+- `AUTH_ALLOWED_DOMAINS` — comma-separated allowed email domains
+
+Leave both empty (the default) for no app-level restriction. When set, signed-in users whose email isn't permitted are bounced to the login page by middleware.
 
 ## Optional: Gemini (Semantic Search)
 

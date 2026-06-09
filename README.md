@@ -242,6 +242,15 @@ The included workflow (`.github/workflows/daily-sync.yml`) runs the sync pipelin
 
 > **Without GitHub Actions:** Run syncs manually from the Settings panel in the UI, or via `npx tsx scripts/sync.ts`.
 
+### Access Control (Sign-In Allowlist)
+
+By default, anyone who clears Google sign-in (governed by your OAuth consent screen — see [docs/SETUP.md](docs/SETUP.md#oauth-consent-screen)) can use Relay. To additionally restrict access at the application layer, set either or both:
+
+- `AUTH_ALLOWED_EMAILS` — comma-separated list of allowed email addresses
+- `AUTH_ALLOWED_DOMAINS` — comma-separated list of allowed email domains
+
+When both are empty (the default), no app-level restriction is applied. When set, a signed-in user whose email isn't on the list is redirected to login. It's enforced in middleware as defense-in-depth, independent of your OAuth configuration.
+
 ## 🔐 Authentication
 
 Relay supports a 3-tier Google auth strategy:
