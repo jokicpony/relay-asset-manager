@@ -195,9 +195,7 @@ export default function FolderPickerModal({
         if (originalAssets.length === 0) return;
         setRelaying(true);
 
-        // Track as recently used
         const lastCrumb = breadcrumbs[breadcrumbs.length - 1];
-        addToRecent(lastCrumb, currentFolderPath);
 
         try {
             const res = await fetch('/api/drive/shortcut', {
@@ -210,11 +208,18 @@ export default function FolderPickerModal({
                         name: a.name,
                     })),
                     targetFolderId: currentFolderId,
-                    targetFolderPath: currentFolderPath || '/',
                 }),
             });
             const data = await res.json();
-            setRelayResult({ ...data, targetPath: currentFolderPath || 'Shared Drive root' });
+            // The server re-resolves the canonical folder path; prefer it over
+            // the locally-built `currentFolderPath`, which can be truncated when
+            // the user navigated via search or recent.
+            const resolvedPath: string = data.resolvedFolderPath || currentFolderPath || '/';
+            setRelayResult({ ...data, targetPath: resolvedPath || 'Shared Drive root' });
+
+            // Track as recently used — store the canonical path so subsequent
+            // recent-clicks land in the same place with the correct breadcrumb.
+            addToRecent(lastCrumb, resolvedPath);
 
             // Record in relay history
             const successfulResults = (data.results || []).filter((r: { success: boolean; shortcutId?: string }) => r.success && r.shortcutId);
@@ -223,7 +228,7 @@ export default function FolderPickerModal({
                 assetIds: originalAssets.map((a) => a.id.includes('::sc::') ? a.id.split('::sc::')[0] : a.id),
                 shortcutIds: successfulResults.map((r: { shortcutId: string }) => r.shortcutId),
                 targetFolder: breadcrumbs[breadcrumbs.length - 1].name,
-                targetPath: currentFolderPath || '/',
+                targetPath: resolvedPath || '/',
                 succeeded: data.succeeded,
                 failed: data.failed,
                 total: data.total ?? originalAssets.length,
@@ -251,12 +256,36 @@ export default function FolderPickerModal({
         }
     };
 
-    // Navigate to a recent folder
-    const handleRecentClick = (recent: RecentFolder) => {
+    // Resolve a folder's full ancestor chain via the server, then set
+    // breadcrumbs from it. Falls back to a leaf-only breadcrumb if the
+    // resolution fails — that's still safe because the server re-resolves the
+    // canonical path at relay time, but it does mean the displayed breadcrumb
+    // is briefly truncated. The relay itself is always correct.
+    const navigateByFolderId = useCallback(async (folderId: string, fallbackName: string) => {
+        try {
+            const res = await fetch(`/api/drive/folders/path?folderId=${encodeURIComponent(folderId)}`);
+            if (res.ok) {
+                const data = await res.json() as { breadcrumbs?: { id: string; name: string }[] };
+                if (data.breadcrumbs && data.breadcrumbs.length > 0) {
+                    setBreadcrumbs([
+                        { id: '', name: 'Shared Drive' },
+                        ...data.breadcrumbs,
+                    ]);
+                    return;
+                }
+            }
+        } catch {
+            // Fall through to leaf-only breadcrumb
+        }
         setBreadcrumbs([
             { id: '', name: 'Shared Drive' },
-            { id: recent.id, name: recent.name },
+            { id: folderId, name: fallbackName },
         ]);
+    }, []);
+
+    // Navigate to a recent folder
+    const handleRecentClick = (recent: RecentFolder) => {
+        navigateByFolderId(recent.id, recent.name);
     };
 
     // Navigate to a search result folder
@@ -264,10 +293,7 @@ export default function FolderPickerModal({
         // Jump directly into the folder, clearing search
         setSearchQuery('');
         setSearchResults(null);
-        setBreadcrumbs([
-            { id: '', name: 'Shared Drive' },
-            { id: folder.id, name: folder.name },
-        ]);
+        navigateByFolderId(folder.id, folder.name);
     };
 
     // ─── Result screen after relay ──────────────────────────────

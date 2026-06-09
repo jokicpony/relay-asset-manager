@@ -21,7 +21,7 @@ import { parseFilename } from '@/lib/filename-utils';
 import { getConfig } from '@/lib/config';
 import { logger } from '@/lib/logger';
 import { createClient } from '@supabase/supabase-js';
-import type { DriveFile } from '@/lib/sync/drive-crawler';
+import type { DriveFile } from '@/lib/sync/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -74,7 +74,7 @@ function parseLabelFields(file: any, labelId: string, rightsConfig: RightsLabelC
 }
 
 // ---------------------------------------------------------------------------
-// MIME type sets — must match drive-crawler.ts
+// MIME type sets — must match the crawler in scripts/sync.ts
 // ---------------------------------------------------------------------------
 const IMAGE_MIMES = new Set([
     'image/jpeg', 'image/png', 'image/webp', 'image/gif',
@@ -87,13 +87,16 @@ const VIDEO_MIMES = new Set([
 
 // ---------------------------------------------------------------------------
 // Folder path resolution
+//
+// pathCache is request-scoped (passed in by the handler) — never module-level.
+// A shared module cache would be corrupted by concurrent ingests, and the
+// end-of-request clear() would wipe another in-flight request's entries.
 // ---------------------------------------------------------------------------
-const pathCache = new Map<string, string>();
-
 async function resolveFolderPath(
     drive: ReturnType<typeof google.drive>,
     parentId: string,
     driveId: string,
+    pathCache: Map<string, string>,
 ): Promise<string> {
     if (parentId === driveId) return '/';
     if (pathCache.has(parentId)) return pathCache.get(parentId)!;
@@ -106,7 +109,7 @@ async function resolveFolderPath(
         });
 
         const parentPath = res.data.parents?.[0]
-            ? await resolveFolderPath(drive, res.data.parents[0], driveId)
+            ? await resolveFolderPath(drive, res.data.parents[0], driveId, pathCache)
             : '/';
 
         const fullPath = parentPath === '/'
@@ -158,6 +161,9 @@ export async function POST(request: NextRequest) {
         auth.setCredentials({ access_token: accessToken });
         const drive = google.drive({ version: 'v3', auth });
 
+        // Request-scoped folder path cache (see resolveFolderPath note above).
+        const pathCache = new Map<string, string>();
+
         const syncFolders = config.syncFolders.map(f => f.toLowerCase());
         const labelId = config.driveLabelId;
 
@@ -207,7 +213,7 @@ export async function POST(request: NextRequest) {
                     continue;
                 }
 
-                const folderPath = await resolveFolderPath(drive, parentId, driveId);
+                const folderPath = await resolveFolderPath(drive, parentId, driveId, pathCache);
 
                 if (!isInSyncScope(folderPath, syncFolders)) {
                     skipped.push({ fileId, reason: `Not in sync scope: ${folderPath}` });
@@ -340,9 +346,6 @@ export async function POST(request: NextRequest) {
                 updated_at: new Date().toISOString(),
             });
         }
-
-        // Clear path cache for next request
-        pathCache.clear();
 
         logger.info('ingest', `Ingest complete: ${upserted} upserted, ${thumbnailsUpdated} thumbnails`, {
             skipped: skipped.length,

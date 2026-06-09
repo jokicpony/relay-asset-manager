@@ -224,6 +224,14 @@ function Home() {
     })();
   }, []);
 
+  // Refresh the asset list + folder tree from the server. Single source of
+  // truth for the flows that re-pull after a mutation (ingest, relay, trash).
+  const refreshAssets = useCallback(async () => {
+    const data = await fetchAllAssets();
+    setAssets(data);
+    setFolderTree(buildFolderTree(data));
+  }, []);
+
   // Fetch trash queue
   const fetchTrash = useCallback(async () => {
     try {
@@ -250,8 +258,7 @@ function Home() {
         setTrashItems((prev) => prev.filter((item) => item.id !== id));
         if (action === 'restore') {
           // Re-fetch assets to show the restored one
-          const allAssets = await fetchAllAssets();
-          setAssets(allAssets);
+          await refreshAssets();
         }
       }
     } catch { /* silent */ }
@@ -363,14 +370,31 @@ function Home() {
   useEffect(() => {
     const handler = async () => {
       try {
-        const data = await fetchAllAssets();
-        setAssets(data);
-        setFolderTree(buildFolderTree(data));
+        await refreshAssets();
       } catch { /* silent */ }
     };
     window.addEventListener('ram:ingest-complete', handler);
     return () => window.removeEventListener('ram:ingest-complete', handler);
-  }, []);
+  }, [refreshAssets]);
+
+  // Precompute one lowercased search string per asset, rebuilt only when the
+  // asset list changes — not on every keystroke or sort comparison.
+  const searchIndex = useMemo(() => {
+    const idx = new Map<string, string>();
+    for (const asset of assets) {
+      const creator = resolveCreator(asset);
+      const parsed = parseFilename(asset.name);
+      idx.set(asset.id, [
+        asset.name,
+        asset.description,
+        ...asset.tags,
+        creator,
+        parsed.shootDescription,
+        asset.projectDescription,
+      ].filter(Boolean).join(' ').toLowerCase());
+    }
+    return idx;
+  }, [assets]);
 
   // Filter and sort assets based on current filters
   const { filteredAssets, textMatchIds } = useMemo((): { filteredAssets: Asset[]; textMatchIds: Set<string> } => {
@@ -413,19 +437,7 @@ function Home() {
       // IDs outside the current folder scope.
       if (filters.query) {
         const q = filters.query.toLowerCase();
-        const creator = resolveCreator(asset);
-        const parsed = parseFilename(asset.name);
-        const searchable = [
-          asset.name,
-          asset.description,
-          ...asset.tags,
-          creator,
-          parsed.shootDescription,
-          asset.projectDescription,
-        ]
-          .filter(Boolean)
-          .join(' ')
-          .toLowerCase();
+        const searchable = searchIndex.get(asset.id) ?? '';
         const textMatch = searchable.includes(q);
         const semanticMatch = semanticResults !== null && semanticResults.size > 0 && semanticResults.has(asset.id);
 
@@ -463,12 +475,7 @@ function Home() {
         const base = semanticResults.get(asset.id) ?? -1;
         if (base < 0) return base; // text-only match, sort last
         // Check text overlap
-        const creator = resolveCreator(asset);
-        const parsed = parseFilename(asset.name);
-        const searchable = [
-          asset.name, asset.description, ...asset.tags,
-          creator, parsed.shootDescription, asset.projectDescription,
-        ].filter(Boolean).join(' ').toLowerCase();
+        const searchable = searchIndex.get(asset.id) ?? '';
         return searchable.includes(q) ? base + OVERLAP_BOOST : base;
       };
       filtered.sort((a, b) => effectiveScore(b) - effectiveScore(a));
@@ -500,7 +507,7 @@ function Home() {
     }
 
     return { filteredAssets: filtered, textMatchIds };
-  }, [assets, filters, shuffleSeed, semanticResults, hiddenFolders]);
+  }, [assets, filters, shuffleSeed, semanticResults, hiddenFolders, searchIndex]);
 
   // When pinboard is active, scope to only pinned assets
   const scopedAssets = useMemo(() => {
@@ -686,11 +693,9 @@ function Home() {
 
   // After relay completes, refresh assets and close modal
   const handleRelayComplete = useCallback(async () => {
-    const allAssets = await fetchAllAssets();
-    setAssets(allAssets);
-    setFolderTree(buildFolderTree(allAssets));
+    await refreshAssets();
     clearSelection();
-  }, [clearSelection]);
+  }, [refreshAssets, clearSelection]);
 
   // Inject relay target folder into the folder tree for instant feedback
   const handleRelayRecorded = useCallback((entry: Parameters<typeof relayHistory.record>[0]) => {
@@ -855,9 +860,7 @@ function Home() {
             onUndo={async (item) => {
               relayHistory.markUndone(item.id);
               // Refresh assets to update relay count badges
-              const allAssets = await fetchAllAssets();
-              setAssets(allAssets);
-              setFolderTree(buildFolderTree(allAssets));
+              await refreshAssets();
             }}
           />
 
@@ -1119,9 +1122,7 @@ function Home() {
         <SettingsPanel
           onClose={() => setSettingsOpen(false)}
           onSyncComplete={async () => {
-            const allAssets = await fetchAllAssets();
-            setAssets(allAssets);
-            setFolderTree(buildFolderTree(allAssets));
+            await refreshAssets();
           }}
         />
       )}

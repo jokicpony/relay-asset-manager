@@ -12,6 +12,8 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getDriveAccessToken } from '@/lib/google/auth';
+import { isInSharedDrive } from '@/lib/google/drive-scope';
+import { getConfig } from '@/lib/config';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 
@@ -130,6 +132,13 @@ export async function POST(request: NextRequest) {
         }
 
         const token = await getDriveAccessToken();
+
+        // Bound the namer to the configured shared drive (see drive-scope).
+        const { sharedDriveId } = await getConfig();
+        if (!(await isInSharedDrive(token, fileId, sharedDriveId))) {
+            return NextResponse.json({ error: 'File is outside the configured shared drive' }, { status: 403 });
+        }
+
         const res = await applyLabelWithRetry(token, fileId, labelId, fieldValues || {});
 
         if (!res.ok) {

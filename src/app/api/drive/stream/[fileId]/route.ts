@@ -19,10 +19,25 @@ export async function GET(
     try {
         // Verify user is authenticated
         const supabase = await createClient();
-        const { data: { session }, error } = await supabase.auth.getSession();
+        const { data: { user } } = await supabase.auth.getUser();
 
-        if (error || !session) {
+        if (!user) {
             return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+        }
+
+        // Authorization: only stream files that are part of the curated,
+        // in-scope library. The service account can read the entire shared
+        // drive, so without this check any authenticated user could stream
+        // arbitrary Drive files by ID (confused-deputy / IDOR).
+        const { data: assetRow } = await supabase
+            .from('assets')
+            .select('id')
+            .eq('drive_file_id', fileId)
+            .eq('is_active', true)
+            .maybeSingle();
+
+        if (!assetRow) {
+            return NextResponse.json({ error: 'Not found' }, { status: 404 });
         }
 
         // Get Drive access token via WIF service account

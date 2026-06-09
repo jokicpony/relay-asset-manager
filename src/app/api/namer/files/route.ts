@@ -8,6 +8,8 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getDriveAccessToken } from '@/lib/google/auth';
+import { isInSharedDrive } from '@/lib/google/drive-scope';
+import { getConfig } from '@/lib/config';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import type { NamerFile } from '@/lib/namer/types';
@@ -29,6 +31,12 @@ export async function POST(request: NextRequest) {
         }
 
         const token = await getDriveAccessToken();
+
+        // Bound the namer to the configured shared drive (see drive-scope).
+        const { sharedDriveId } = await getConfig();
+        if (!(await isInSharedDrive(token, folderId, sharedDriveId))) {
+            return NextResponse.json({ error: 'Folder is outside the configured shared drive' }, { status: 403 });
+        }
 
         // First check if it's a folder or a file
         const metaRes = await fetch(

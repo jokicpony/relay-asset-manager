@@ -39,11 +39,20 @@ export interface AppConfig {
     rightsLabelConfig: RightsLabelConfig;  // Drive Label field ID → DB column mappings
 }
 
+// Short-TTL cache so repeated getConfig() calls within a request/burst don't
+// re-query app_settings each time. Busted on writes via updateSetting().
+let _configCache: { value: AppConfig; expires: number } | null = null;
+const CONFIG_TTL_MS = 30_000;
+
 /**
  * Fetch app config from DB with env var fallback.
  * Uses service role key so it works from API routes and the sync script.
  */
 export async function getConfig(): Promise<AppConfig> {
+    if (_configCache && Date.now() < _configCache.expires) {
+        return _configCache.value;
+    }
+
     const dbMap = new Map<string, unknown>();
 
     try {
@@ -79,7 +88,7 @@ export async function getConfig(): Promise<AppConfig> {
         choiceMap: {},
     };
 
-    return {
+    const config: AppConfig = {
         sharedDriveId:
             (dbMap.get('shared_drive_id') as string) ??
             process.env.GOOGLE_SHARED_DRIVE_ID ??
@@ -106,6 +115,9 @@ export async function getConfig(): Promise<AppConfig> {
         rightsLabelConfig:
             (dbMap.get('rights_label_config') as RightsLabelConfig) ?? defaultRightsConfig,
     };
+
+    _configCache = { value: config, expires: Date.now() + CONFIG_TTL_MS };
+    return config;
 }
 
 /**
@@ -128,5 +140,7 @@ export async function updateSetting(
     if (error) {
         return { success: false, error: error.message };
     }
+
+    _configCache = null; // bust cache so the next getConfig() sees the write
     return { success: true };
 }

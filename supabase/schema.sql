@@ -166,12 +166,9 @@ alter table public.assets enable row level security;
 create policy "Users can view assets"
     on public.assets for select to authenticated using (true);
 
-create policy "Authenticated users can insert assets"
-    on public.assets for insert to authenticated with check (true);
-
-create policy "Authenticated users can update assets"
-    on public.assets for update to authenticated
-    using (true) with check (true);
+-- No authenticated-client write policies: all writes go through server routes
+-- and the sync pipeline using the service role key (which bypasses RLS). This
+-- prevents a signed-in browser session from tampering with the library.
 
 -- Shortcuts
 alter table public.shortcuts enable row level security;
@@ -179,11 +176,9 @@ alter table public.shortcuts enable row level security;
 create policy "Users can view shortcuts"
     on public.shortcuts for select to authenticated using (true);
 
-create policy "Users can create shortcuts"
-    on public.shortcuts for insert to authenticated with check (true);
-
-create policy "Users can delete shortcuts"
-    on public.shortcuts for delete to authenticated using (true);
+-- No authenticated-client write policies: shortcut rows are created/deleted by
+-- server routes (/api/drive/shortcut[/delete]) and the sync pipeline using the
+-- service role key. Authenticated clients have read-only access.
 
 -- Sync logs
 alter table public.sync_logs enable row level security;
@@ -197,11 +192,10 @@ alter table app_settings enable row level security;
 create policy "Authenticated users can read settings"
     on app_settings for select using (auth.role() = 'authenticated');
 
-create policy "Authenticated users can update settings"
-    on app_settings for update using (auth.role() = 'authenticated');
-
-create policy "Authenticated users can insert settings"
-    on app_settings for insert with check (auth.role() = 'authenticated');
+-- No authenticated-client write policies: writes go through server routes
+-- (/api/settings/config, sync pipeline) using the service role key. This stops
+-- users from rewriting operational config directly via the anon key and
+-- bypassing the server-side key allowlist.
 
 -- Service role (used by sync pipeline) bypasses RLS automatically.
 

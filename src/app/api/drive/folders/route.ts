@@ -21,8 +21,8 @@ export async function GET(request: NextRequest) {
 
         // Verify user is authenticated
         const supabase = await createClient();
-        const { data: { session } } = await supabase.auth.getSession();
-        if (!session) {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
             return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
         }
 
@@ -135,8 +135,8 @@ export async function POST(request: NextRequest) {
 
         // Verify user is authenticated
         const supabase = await createClient();
-        const { data: { session } } = await supabase.auth.getSession();
-        if (!session) {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
             return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
         }
 

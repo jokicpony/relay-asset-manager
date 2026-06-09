@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import type { DriveFile } from './drive-crawler';
+import type { DriveFile } from './types';
 
 /**
  * Create a Supabase admin client (bypasses RLS) for server-side sync operations.
@@ -82,10 +82,9 @@ export async function upsertAssets(
                 file_size: file.fileSize ?? null,
                 updated_at: new Date().toISOString(),
             };
-            // Only write rights columns if the crawler actually fetched labels.
-            // The manual sync (drive-crawler.ts) doesn't request Drive Labels,
-            // so all rights fields are null. Omitting them from the upsert
-            // preserves the existing values set by the overnight sync.
+            // Only write rights columns if the caller actually fetched labels.
+            // When labels weren't requested/available, these are null — omit
+            // them so the upsert preserves values set by the overnight sync.
             const hasRightsData = file.organicRights !== null || file.paidRights !== null
                 || file.organicRightsExpiration !== null || file.paidRightsExpiration !== null;
             if (hasRightsData) {
@@ -123,72 +122,6 @@ export async function upsertAssets(
     }
 
     return { upserted, errors };
-}
-
-/**
- * Mark assets as inactive if their Drive file IDs are no longer in the active set.
- *
- * @param activeDriveIds  Set of file IDs currently in Drive
- * @returns Number of assets marked inactive
- */
-export async function markDeletedAssets(
-    activeDriveIds: Set<string>
-): Promise<{ deactivated: number; error: string | null }> {
-    const supabase = createAdminClient();
-
-    // Get all currently active assets from our database (paginated — default limit is 1000)
-    const dbAssets: { id: string; drive_file_id: string }[] = [];
-    let from = 0;
-    const PAGE = 1000;
-    while (true) {
-        const { data, error } = await supabase
-            .from('assets')
-            .select('id, drive_file_id')
-            .eq('is_active', true)
-            .range(from, from + PAGE - 1);
-
-        if (error) {
-            return { deactivated: 0, error: error.message };
-        }
-        if (!data || data.length === 0) break;
-        dbAssets.push(...data);
-        if (data.length < PAGE) break;
-        from += PAGE;
-    }
-
-    // Find assets in our DB that are no longer in Drive
-    const toDeactivate = dbAssets
-        .filter((asset) => !activeDriveIds.has(asset.drive_file_id))
-        .map((asset) => asset.id);
-
-    if (toDeactivate.length === 0) {
-        return { deactivated: 0, error: null };
-    }
-
-    // Mark them inactive in batches (with proper soft-delete tracking)
-    const BATCH_SIZE = 100;
-    let deactivated = 0;
-
-    for (let i = 0; i < toDeactivate.length; i += BATCH_SIZE) {
-        const batch = toDeactivate.slice(i, i + BATCH_SIZE);
-        const { error } = await supabase
-            .from('assets')
-            .update({
-                is_active: false,
-                deleted_at: new Date().toISOString(),
-                deleted_reason: 'orphaned',
-                updated_at: new Date().toISOString(),
-            })
-            .in('id', batch)
-            .is('deleted_at', null); // Don't reset countdown if already soft-deleted
-
-        if (error) {
-            return { deactivated, error: error.message };
-        }
-        deactivated += batch.length;
-    }
-
-    return { deactivated, error: null };
 }
 
 /**
