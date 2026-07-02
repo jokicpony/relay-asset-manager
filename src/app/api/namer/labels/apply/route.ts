@@ -82,8 +82,7 @@ async function applyLabelWithRetry(
         }],
     };
 
-    // Log the exact payload being sent to Google
-    logger.info('namer-labels-apply', `Sending modifyLabels for file=${fileId} label=${labelId}`, {
+    logger.debug('namer-labels-apply', `Sending modifyLabels for file=${fileId} label=${labelId}`, {
         fieldModCount: fieldModifications.length,
         payload: JSON.stringify(requestBody),
     });
@@ -121,10 +120,8 @@ export async function POST(request: NextRequest) {
         const body = await request.json();
         const { fileId, labelId, fieldValues } = body;
 
-        // Log incoming request for debugging
-        logger.info('namer-labels-apply', `Request: file=${fileId} label=${labelId}`, {
+        logger.debug('namer-labels-apply', `Request: file=${fileId} label=${labelId}`, {
             fieldValueKeys: Object.keys(fieldValues || {}),
-            fieldValuesSummary: JSON.stringify(fieldValues || {}),
         });
 
         if (!fileId || !labelId) {
@@ -151,12 +148,7 @@ export async function POST(request: NextRequest) {
         }
 
         const result = await res.json();
-
-        // Log success response from Google
-        logger.info('namer-labels-apply', `SUCCESS label ${labelId} on ${fileId}`, {
-            response: JSON.stringify(result).substring(0, 500),
-        });
-
+        logger.info('namer-labels-apply', `SUCCESS label ${labelId} on ${fileId}`);
         return NextResponse.json(result);
 
     } catch (err: unknown) {

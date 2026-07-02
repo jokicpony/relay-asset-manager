@@ -19,31 +19,12 @@ import { getConfig } from '@/lib/config';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import type { AIMetadata } from '@/lib/namer/types';
+import { DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT } from '@/lib/namer/ai-defaults';
 import sharp from 'sharp';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent';
-
-const DEFAULT_SYSTEM_PROMPT = `You are a Senior Creative Asset Manager optimizing images for semantic search in a Digital Asset Management system. Your keywords should help users find assets by searching for the MOOD, ACTIVITY, SETTING, PRODUCTS, or EMOTIONAL VIBE. Balance factual descriptors (objects, location) with experiential terms (feelings, activities, atmospheres).`;
-
-const DEFAULT_USER_PROMPT = `Analyze this image and return a JSON object with the following fields:
-
-context_environment: The primary setting as a brief phrase. (e.g., "freshwater river", "minimalist product studio", "alpine forest trail")
-
-seasonality: Season or weather conditions visible. (e.g., "summer", "winter storm", "golden autumn")
-
-lighting_mood: The light quality and emotional effect. (e.g., "warm golden hour", "dramatic storm light", "soft overcast")
-
-human_experience: Array of 2-3 activity or lifestyle descriptors. (e.g., ["fly fishing adventure", "peaceful nature retreat"])
-
-primary_objects: Array of 3-4 most important visible subjects. (e.g., ["insulated flask", "fly rod", "mountain stream"])
-
-color_palette: Array of 3 dominant HEX codes representing the image mood.
-
-label_csv: A single comma-separated string of 12-15 discovery keywords optimized for semantic search.
-
-Constraints: Output ONLY valid JSON. Keep individual tags to 1-3 words. Be specific and descriptive.`;
 
 const MAX_DIMENSION = 1024;
 const JPEG_QUALITY = 80;
@@ -135,9 +116,10 @@ export async function POST(request: NextRequest) {
         const systemPrompt = aiSettings?.systemPrompt || DEFAULT_SYSTEM_PROMPT;
         const userPrompt = aiSettings?.userPrompt || DEFAULT_USER_PROMPT;
 
-        const geminiRes = await fetch(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
+        // API key goes in a header — keys in query strings leak into logs/traces
+        const geminiRes = await fetch(GEMINI_API_URL, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
             body: JSON.stringify({
                 contents: [{
                     role: 'user',

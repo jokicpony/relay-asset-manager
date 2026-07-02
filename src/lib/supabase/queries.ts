@@ -1,10 +1,13 @@
 import { Asset, FolderNode } from '@/types';
 
 // ---------------------------------------------------------------------------
-// Fetch ALL assets via server-side API route (single request, cached)
+// Fetch ALL assets via server-side API route (single request, cached).
+// Pass { fresh: true } after a mutation (relay, trash, ingest, sync) to
+// bypass the browser's 60s HTTP cache — otherwise the change wouldn't be
+// visible until the cache expires.
 // ---------------------------------------------------------------------------
-export async function fetchAllAssets(): Promise<Asset[]> {
-    const res = await fetch('/api/assets');
+export async function fetchAllAssets(options?: { fresh?: boolean }): Promise<Asset[]> {
+    const res = await fetch('/api/assets', options?.fresh ? { cache: 'reload' } : undefined);
     if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `Failed to fetch assets (${res.status})`);

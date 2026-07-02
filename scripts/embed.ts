@@ -26,6 +26,7 @@
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 import { createClient } from '@supabase/supabase-js';
+import { buildEmbedText } from '../src/lib/embedding-text';
 
 // ---------------------------------------------------------------------------
 // Load environment
@@ -72,43 +73,9 @@ interface AssetRow {
     thumbnail_url: string | null;
 }
 
-function buildEmbeddingText(asset: AssetRow): string {
-    const parts: string[] = [];
-
-    // Filename (without extension)
-    const baseName = asset.name.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
-    parts.push(baseName);
-
-    // Parsed description (e.g., "Tailgate Upgrade Firelight")
-    if (asset.parsed_shoot_description) {
-        parts.push(asset.parsed_shoot_description);
-    }
-
-    // Creator
-    if (asset.parsed_creator) {
-        parts.push(`by ${asset.parsed_creator}`);
-    }
-
-    // Asset type
-    parts.push(asset.asset_type);
-
-    // Folder path segments (cleaned up)
-    if (asset.folder_path && asset.folder_path !== '/') {
-        const folders = asset.folder_path
-            .split('/')
-            .filter(Boolean)
-            .map((f) => f.replace(/^\d+\.\s*/, '')) // strip "1. " prefixes
-            .join(' > ');
-        parts.push(folders);
-    }
-
-    // Drive description if available
-    if (asset.description) {
-        parts.push(asset.description);
-    }
-
-    return parts.join(' | ');
-}
+// Embedding text comes from the shared builder (src/lib/embedding-text) so
+// sync.ts and embed.ts produce identical document text for the same asset.
+const buildEmbeddingText = buildEmbedText;
 
 // ---------------------------------------------------------------------------
 // Download thumbnail from Supabase Storage as base64
@@ -195,9 +162,9 @@ function buildEmbedRequest(text: string, thumbnail: { base64: string; mimeType: 
 async function batchEmbed(
     requests: ReturnType<typeof buildEmbedRequest>[]
 ): Promise<number[][]> {
-    const res = await fetch(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {
+    const res = await fetch(GEMINI_EMBED_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
         body: JSON.stringify({ requests }),
     });
 
@@ -358,8 +325,8 @@ async function main() {
                         thumbnail = await downloadThumbnailBase64(supabase, asset.drive_file_id, asset.thumbnail_url);
                     }
 
-                    let req = buildEmbedRequest(text, thumbnail);
-                    let singleRes = await batchEmbed([req]);
+                    const req = buildEmbedRequest(text, thumbnail);
+                    const singleRes = await batchEmbed([req]);
 
                     // If multimodal fails, fall back to text-only
                     if (!singleRes || singleRes.length === 0) throw new Error('Empty response');

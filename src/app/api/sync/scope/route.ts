@@ -65,9 +65,6 @@ export async function GET(request: NextRequest) {
                     return NextResponse.json({ inScope, folderPath: path, source: 'cache' });
                 }
             }
-
-            // Also check if folderId is a child of any cached folder
-            // by looking for paths where the folder is an ancestor
         }
 
         // 2. Cache miss — resolve folder path from Drive API

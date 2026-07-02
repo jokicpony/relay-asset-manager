@@ -30,8 +30,9 @@ function isWifConfigured(): boolean {
 function getAuthClient(): AuthClient {
     if (_authClient) return _authClient;
 
-    // Dynamic import of @vercel/oidc to avoid errors in local dev
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    // Lazy require of @vercel/oidc — getAuthClient is synchronous and this
+    // path only runs on Vercel, so a top-level import would break local dev
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { getVercelOidcToken } = require('@vercel/oidc');
 
     // The Vercel OIDC token must carry the audience we configured in the

@@ -1,23 +1,33 @@
 'use client';
 
 import { createClient } from '@/lib/supabase/client';
-import { useState, useEffect } from 'react';
+import { useState, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
 
 /**
  * Login page with Google SSO.
  * Redirects to Google OAuth flow via Supabase Auth.
+ *
+ * useSearchParams requires a Suspense boundary on statically rendered pages,
+ * so the form lives in an inner component.
  */
 export default function LoginPage() {
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState<string | null>(null);
+    return (
+        <Suspense fallback={null}>
+            <LoginForm />
+        </Suspense>
+    );
+}
 
-    // Surface the allowlist rejection bounced here by the auth middleware.
-    useEffect(() => {
-        const params = new URLSearchParams(window.location.search);
-        if (params.get('error') === 'not_authorized') {
-            setError("This account isn't authorized to access Relay. Contact the workspace owner.");
-        }
-    }, []);
+function LoginForm() {
+    const searchParams = useSearchParams();
+    const [loading, setLoading] = useState(false);
+    // Seed with the allowlist rejection bounced here by the auth middleware.
+    const [error, setError] = useState<string | null>(() =>
+        searchParams.get('error') === 'not_authorized'
+            ? "This account isn't authorized to access Relay. Contact the workspace owner."
+            : null
+    );
 
     const handleGoogleLogin = async () => {
         setLoading(true);

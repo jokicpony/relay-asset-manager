@@ -20,6 +20,8 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 import { google } from 'googleapis';
 import { createClient } from '@supabase/supabase-js';
+import { parseFilename } from '../src/lib/filename-utils';
+import { buildEmbedText } from '../src/lib/embedding-text';
 
 // ---------------------------------------------------------------------------
 // Load environment
@@ -151,7 +153,7 @@ async function loadConfig(): Promise<void> {
         }
 
         log('  ✅ Loaded settings from database (app_settings)');
-    } catch (err) {
+    } catch {
         log('  ⚠️  Could not load app_settings — using env var fallbacks');
     }
 
@@ -188,24 +190,9 @@ const VIDEO_MIMES = new Set([
 function isAssetMime(m: string) { return IMAGE_MIMES.has(m) || VIDEO_MIMES.has(m); }
 const SHORTCUT_MIME = 'application/vnd.google-apps.shortcut';
 
-// ---------------------------------------------------------------------------
-// Filename parser
-// ---------------------------------------------------------------------------
-function parseFilename(filename: string) {
-    const base = filename.replace(/\.[^.]+$/, '');
-    const match = base.match(/^(\d{8})_([^_]+)_(.+?)(?:_(\d+))?$/);
-    if (!match) return { creator: null, shootDate: null, shootDescription: null };
-    const [, dateStr, creator, desc] = match;
-    const year = parseInt(dateStr.slice(0, 4));
-    const month = parseInt(dateStr.slice(4, 6)) - 1;
-    const day = parseInt(dateStr.slice(6, 8));
-    const shootDate = new Date(year, month, day);
-    return {
-        creator,
-        shootDate: isNaN(shootDate.getTime()) ? null : shootDate,
-        shootDescription: desc.replace(/_/g, ' '),
-    };
-}
+// Filename parsing is shared with the app (src/lib/filename-utils) so the
+// overnight sync and the namer's targeted ingest write identical
+// parsed_creator / parsed_shoot_description values for the same file.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -789,16 +776,7 @@ async function resolveShortcuts(
     }
     log(`  ${filteredShortcuts.length} shortcuts in synced folders`);
 
-    // 3. Build a lookup: targetId → asset UUID from the DB
-    //    First check if targets are in the crawled files (most efficient)
-    const crawledIdSet = new Set(crawledFiles.map(f => f.id));
-    const targetIdsToLookup = new Set(
-        filteredShortcuts
-            .map(sc => sc.targetId)
-            .filter(tid => !crawledIdSet.has(tid)) // targets not already in crawl
-    );
-
-    // Fetch asset UUIDs for all target drive_file_ids
+    // 3. Fetch asset UUIDs for all target drive_file_ids
     const allTargetIds = [...new Set(filteredShortcuts.map(sc => sc.targetId))];
     const targetToAssetId = new Map<string, string>();
 
@@ -1280,8 +1258,11 @@ async function detectOrphans(
     const ignoredIds: string[] = [];
     for (const asset of activeAssets || []) {
         if (!crawledIds.has(asset.drive_file_id)) {
-            // Determine reason: check if the asset's folder_path starts with any ignored folder path
-            const isIgnored = ignoredFolderPaths.some(ip => asset.folder_path?.startsWith(ip));
+            // Determine reason: is the asset's folder_path the ignored folder or
+            // nested inside it? (Boundary-checked — plain startsWith would also
+            // match sibling folders sharing a name prefix.)
+            const isIgnored = ignoredFolderPaths.some(ip =>
+                asset.folder_path === ip || asset.folder_path?.startsWith(ip + '/'));
             if (isIgnored) {
                 ignoredIds.push(asset.id);
             } else {
@@ -1408,8 +1389,12 @@ async function purgeExpired(): Promise<number> {
 
     log(`  Found ${expired.length} expired assets — removing thumbnails + rows...`);
 
-    // Delete thumbnails from Supabase Storage
-    const thumbPaths = expired.map((a) => `${a.drive_file_id}.webp`);
+    // Delete thumbnails from Supabase Storage — both auto-generated and
+    // user-set custom frames, so purged assets don't leave orphaned objects
+    const thumbPaths = expired.flatMap((a) => [
+        `${a.drive_file_id}.webp`,
+        `custom_${a.drive_file_id}.webp`,
+    ]);
     const BATCH = 50;
     for (let i = 0; i < thumbPaths.length; i += BATCH) {
         const batch = thumbPaths.slice(i, i + BATCH);
@@ -1465,28 +1450,8 @@ async function snapshotMetadata(): Promise<Map<string, MetadataSnapshot>> {
     return map;
 }
 
-// ---------------------------------------------------------------------------
-// Embedding input builders — shared by the batch path and the per-asset retry
-// fallbacks below so the text + multimodal logic lives in exactly one place.
-// ---------------------------------------------------------------------------
-function buildEmbedText(asset: any): string {
-    const textParts: string[] = [];
-    const baseName = asset.name.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
-    textParts.push(baseName);
-    if (asset.parsed_shoot_description) textParts.push(asset.parsed_shoot_description);
-    if (asset.parsed_creator) textParts.push(`by ${asset.parsed_creator}`);
-    textParts.push(asset.asset_type);
-    if (asset.folder_path && asset.folder_path !== '/') {
-        const folders = asset.folder_path
-            .split('/')
-            .filter(Boolean)
-            .map((f: string) => f.replace(/^\d+\.\s*/, ''))
-            .join(' > ');
-        textParts.push(folders);
-    }
-    if (asset.description) textParts.push(asset.description);
-    return textParts.join(' | ');
-}
+// Embedding text comes from the shared builder (src/lib/embedding-text) so
+// sync.ts and embed.ts produce identical document text for the same asset.
 
 // Build the multimodal content parts (text + optional thumbnail image).
 // Thumbnails are stored as .webp but hold JPEG/PNG bytes; Gemini only accepts
@@ -1620,12 +1585,11 @@ async function reEmbedChanged(
         );
 
         // Retry loop for Gemini API calls
-        let success = false;
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
             try {
-                const res = await fetch(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {
+                const res = await fetch(GEMINI_EMBED_URL, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
                     body: JSON.stringify({ requests }),
                 });
 
@@ -1667,7 +1631,6 @@ async function reEmbedChanged(
                         log(`  ⚠️  ${dbFailed} DB writes failed in update batch`);
                     }
                 }
-                success = true;
                 break; // Success — exit retry loop
             } catch (err: any) {
                 if (attempt < MAX_RETRIES) {
@@ -1682,8 +1645,8 @@ async function reEmbedChanged(
                             // Try multimodal first
                             const { parts, hasImage } = await buildEmbedParts(asset);
                             const singleReq = [{ model: 'models/gemini-embedding-2-preview', content: { parts }, outputDimensionality: 768 }];
-                            const singleRes = await fetch(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {
-                                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            const singleRes = await fetch(GEMINI_EMBED_URL, {
+                                method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
                                 body: JSON.stringify({ requests: singleReq }),
                             });
 
@@ -1699,8 +1662,8 @@ async function reEmbedChanged(
                             // Multimodal failed — try text-only
                             try {
                                 const textReq = [{ model: 'models/gemini-embedding-2-preview', content: { parts: [{ text: buildEmbedText(asset) }] }, outputDimensionality: 768 }];
-                                const textRes = await fetch(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {
-                                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                const textRes = await fetch(GEMINI_EMBED_URL, {
+                                    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
                                     body: JSON.stringify({ requests: textReq }),
                                 });
                                 if (!textRes.ok) throw new Error(`API ${textRes.status}`);

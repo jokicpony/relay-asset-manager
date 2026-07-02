@@ -16,67 +16,68 @@ export async function GET() {
     }
 
     try {
-        // Latest sync log
-        const { data: latestSync } = await supabase
-            .from('sync_logs')
-            .select('*')
-            .order('finished_at', { ascending: false })
-            .limit(1)
-            .single();
-
-        // Average sync duration (for estimated time)
-        const { data: recentSyncs } = await supabase
-            .from('sync_logs')
-            .select('duration_secs')
-            .order('finished_at', { ascending: false })
-            .limit(5);
+        // All queries are independent — run them concurrently
+        const [
+            { data: latestSync },
+            { data: recentSyncs },
+            { count: totalAssets },
+            { count: photoCount },
+            { count: videoCount },
+            { count: embeddedCount },
+            { count: withOrganic },
+            { count: withPaid },
+            { count: trashCount },
+        ] = await Promise.all([
+            supabase
+                .from('sync_logs')
+                .select('*')
+                .order('finished_at', { ascending: false })
+                .limit(1)
+                .single(),
+            supabase
+                .from('sync_logs')
+                .select('duration_secs')
+                .order('finished_at', { ascending: false })
+                .limit(5),
+            supabase
+                .from('assets')
+                .select('*', { count: 'exact', head: true })
+                .eq('is_active', true),
+            supabase
+                .from('assets')
+                .select('*', { count: 'exact', head: true })
+                .eq('is_active', true)
+                .eq('asset_type', 'photo'),
+            supabase
+                .from('assets')
+                .select('*', { count: 'exact', head: true })
+                .eq('is_active', true)
+                .eq('asset_type', 'video'),
+            supabase
+                .from('assets')
+                .select('*', { count: 'exact', head: true })
+                .eq('is_active', true)
+                .not('embedding', 'is', null),
+            supabase
+                .from('assets')
+                .select('*', { count: 'exact', head: true })
+                .eq('is_active', true)
+                .not('organic_rights', 'is', null),
+            supabase
+                .from('assets')
+                .select('*', { count: 'exact', head: true })
+                .eq('is_active', true)
+                .not('paid_rights', 'is', null),
+            supabase
+                .from('assets')
+                .select('*', { count: 'exact', head: true })
+                .eq('is_active', false)
+                .not('deleted_at', 'is', null),
+        ]);
 
         const avgDuration = recentSyncs && recentSyncs.length > 0
             ? recentSyncs.reduce((sum, s) => sum + s.duration_secs, 0) / recentSyncs.length
             : null;
-
-        // Asset stats (aggregated from assets table)
-        const { count: totalAssets } = await supabase
-            .from('assets')
-            .select('*', { count: 'exact', head: true })
-            .eq('is_active', true);
-
-        const { count: photoCount } = await supabase
-            .from('assets')
-            .select('*', { count: 'exact', head: true })
-            .eq('is_active', true)
-            .eq('asset_type', 'photo');
-
-        const { count: videoCount } = await supabase
-            .from('assets')
-            .select('*', { count: 'exact', head: true })
-            .eq('is_active', true)
-            .eq('asset_type', 'video');
-
-        const { count: embeddedCount } = await supabase
-            .from('assets')
-            .select('*', { count: 'exact', head: true })
-            .eq('is_active', true)
-            .not('embedding', 'is', null);
-
-        const { count: withOrganic } = await supabase
-            .from('assets')
-            .select('*', { count: 'exact', head: true })
-            .eq('is_active', true)
-            .not('organic_rights', 'is', null);
-
-        const { count: withPaid } = await supabase
-            .from('assets')
-            .select('*', { count: 'exact', head: true })
-            .eq('is_active', true)
-            .not('paid_rights', 'is', null);
-
-        // Trash count
-        const { count: trashCount } = await supabase
-            .from('assets')
-            .select('*', { count: 'exact', head: true })
-            .eq('is_active', false)
-            .not('deleted_at', 'is', null);
 
         // Next sync: cron runs every 6 hours at 0, 6, 12, 18 UTC
         const CRON_INTERVAL_HOURS = 6;

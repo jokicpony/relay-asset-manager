@@ -7,9 +7,6 @@ interface ActionBarProps {
     onRelay: () => void;
     onDownload: () => void;
     onClearSelection: () => void;
-    downloading?: boolean;
-    googleConnected?: boolean;
-    onReconnect?: () => void;
     onPinToBoard?: () => void;
     onUnpinFromBoard?: () => void;
 }
@@ -19,9 +16,6 @@ export default function ActionBar({
     onRelay,
     onDownload,
     onClearSelection,
-    downloading = false,
-    googleConnected = true,
-    onReconnect,
     onPinToBoard,
     onUnpinFromBoard,
 }: ActionBarProps) {
@@ -30,7 +24,7 @@ export default function ActionBar({
     const feedbackTimer = useRef<NodeJS.Timeout | null>(null);
 
     const handleDownload = useCallback(() => {
-        if (!googleConnected || downloading || downloadFeedback !== 'idle') return;
+        if (downloadFeedback !== 'idle') return;
         onDownload();
         setDownloadFeedback('spinning');
         feedbackTimer.current = setTimeout(() => {
@@ -39,7 +33,7 @@ export default function ActionBar({
                 setDownloadFeedback('idle');
             }, 800);
         }, 800);
-    }, [googleConnected, downloading, downloadFeedback, onDownload]);
+    }, [downloadFeedback, onDownload]);
 
     return (
         <div className={`action-bar ${selectedCount > 0 ? 'visible' : ''}`}>
@@ -81,26 +75,6 @@ export default function ActionBar({
 
                 {/* Right: Actions */}
                 <div className="flex items-center gap-2">
-                    {/* Reconnect button when disconnected */}
-                    {!googleConnected && (
-                        <button
-                            onClick={onReconnect}
-                            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all hover:scale-[1.02] active:scale-[0.98]"
-                            style={{
-                                background: 'rgba(251, 191, 36, 0.12)',
-                                border: '1px solid rgba(251, 191, 36, 0.35)',
-                                color: 'var(--ram-amber, #fbbf24)',
-                            }}
-                        >
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
-                                <polyline points="10 17 15 12 10 7" />
-                                <line x1="15" y1="12" x2="3" y2="12" />
-                            </svg>
-                            Reconnect Drive
-                        </button>
-                    )}
-
                     {/* Pin to Board (browse mode) */}
                     {onPinToBoard && (
                         <button
@@ -140,15 +114,12 @@ export default function ActionBar({
 
                     {/* Shortcut to Folder — secondary */}
                     <button
-                        onClick={googleConnected ? onRelay : undefined}
-                        disabled={!googleConnected || downloading}
-                        className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-50 disabled:hover:scale-100"
+                        onClick={onRelay}
+                        className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all hover:scale-[1.02] active:scale-[0.98]"
                         style={{
                             background: 'var(--ram-bg-hover)',
                             border: '1px solid var(--ram-border-hover)',
                             color: 'var(--ram-text-primary)',
-                            opacity: !googleConnected ? 0.35 : 1,
-                            cursor: !googleConnected ? 'not-allowed' : 'pointer',
                         }}
                     >
                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -165,12 +136,12 @@ export default function ActionBar({
                     {/* Download — primary */}
                     <button
                         onClick={handleDownload}
-                        disabled={!googleConnected || downloading || downloadFeedback !== 'idle'}
+                        disabled={downloadFeedback !== 'idle'}
                         className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-60 disabled:hover:scale-100"
                         style={{
                             background: downloadFeedback === 'confirmed'
                                 ? 'rgba(52, 211, 153, 0.1)'
-                                : downloadFeedback === 'spinning' || downloading
+                                : downloadFeedback === 'spinning'
                                     ? 'var(--ram-accent-muted)'
                                     : 'var(--ram-accent)',
                             border: downloadFeedback === 'confirmed'
@@ -178,18 +149,16 @@ export default function ActionBar({
                                 : '1px solid transparent',
                             color: downloadFeedback === 'confirmed'
                                 ? 'var(--ram-green, #34d399)'
-                                : downloadFeedback === 'spinning' || downloading
+                                : downloadFeedback === 'spinning'
                                     ? 'var(--ram-accent)'
                                     : 'var(--ram-bg-primary)',
-                            opacity: !googleConnected ? 0.35 : 1,
-                            cursor: !googleConnected ? 'not-allowed' : 'pointer',
                         }}
                     >
                         {downloadFeedback === 'confirmed' ? (
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                                 <polyline points="20 6 9 17 4 12" />
                             </svg>
-                        ) : downloadFeedback === 'spinning' || downloading ? (
+                        ) : downloadFeedback === 'spinning' ? (
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="animate-spin">
                                 <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
                             </svg>
@@ -202,7 +171,7 @@ export default function ActionBar({
                         )}
                         {downloadFeedback === 'confirmed'
                             ? 'Queued ✓'
-                            : downloadFeedback === 'spinning' || downloading
+                            : downloadFeedback === 'spinning'
                                 ? 'Downloading…'
                                 : 'Download'}
                     </button>
@@ -211,4 +180,3 @@ export default function ActionBar({
         </div>
     );
 }
-

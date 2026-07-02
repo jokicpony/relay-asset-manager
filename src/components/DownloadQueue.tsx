@@ -342,12 +342,11 @@ function DownloadRow({ item, onReconnect }: { item: DownloadItem; onReconnect?: 
         : null;
     const isBatch = item.fileCount > 1;
 
-    // Show "Taking a while?" hint after 30s of downloading
+    // Show "Taking a while?" hint after 30s of downloading. No reset needed:
+    // the render condition gates on status, and items never re-enter
+    // 'downloading' once they complete or fail.
     useEffect(() => {
-        if (item.status !== 'downloading') {
-            setShowSlowHint(false);
-            return;
-        }
+        if (item.status !== 'downloading') return;
         const timer = setTimeout(() => setShowSlowHint(true), 30_000);
         return () => clearTimeout(timer);
     }, [item.status]);

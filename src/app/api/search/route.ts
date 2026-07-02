@@ -53,9 +53,10 @@ export async function GET(request: NextRequest) {
         // Step 1: Embed the query text using Gemini Embedding 2 (multimodal)
         // Text queries stay text-only — cross-modal search means a text query
         // automatically matches image-augmented document embeddings.
-        const embedRes = await fetch(`${GEMINI_EMBED_URL}?key=${GEMINI_API_KEY}`, {
+        // API key goes in a header — keys in query strings leak into logs/traces
+        const embedRes = await fetch(GEMINI_EMBED_URL, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
             body: JSON.stringify({
                 model: 'models/gemini-embedding-2-preview',
                 content: { parts: [{ text: query }] },

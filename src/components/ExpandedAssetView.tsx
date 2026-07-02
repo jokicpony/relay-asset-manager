@@ -19,8 +19,6 @@ interface ExpandedAssetViewProps {
     onRelay?: (asset: Asset) => void;
     isQueued?: boolean;
     isRelayed?: boolean;
-    googleConnected?: boolean;
-    onReconnect?: () => void;
     isPinned?: boolean;
     onTogglePin?: (asset: Asset) => void;
     onThumbnailUpdated?: (assetId: string, newUrl: string) => void;
@@ -37,8 +35,6 @@ export default function ExpandedAssetView({
     onRelay,
     isQueued = false,
     isRelayed = false,
-    googleConnected = true,
-    onReconnect,
     isPinned = false,
     onTogglePin,
     onThumbnailUpdated,
@@ -55,17 +51,17 @@ export default function ExpandedAssetView({
     const isLandscape = asset.width > asset.height;
     const creator = resolveCreator(asset);
     const parsed = parseFilename(asset.name);
+    // Drive Label override wins; filename parse is the fallback (same as resolveCreator)
+    const project = asset.projectDescription ?? parsed.shootDescription;
     const [playing, setPlaying] = useState(false);
     const [videoReady, setVideoReady] = useState(false);
     const [wantPlay, setWantPlay] = useState(false); // user clicked play but video isn't ready
-    const [slowBuffer, setSlowBuffer] = useState(false); // true after delay of buffering
     const [descExpanded, setDescExpanded] = useState(false);
     const [captureFeedback, setCaptureFeedback] = useState<'idle' | 'capturing' | 'success' | 'error'>('idle');
     const videoRef = useRef<HTMLVideoElement>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
 
     const drivePreviewUrl = `https://drive.google.com/file/d/${asset.driveFileId}/view`;
-    const isLargeFile = (asset.fileSize ?? 0) > 100 * 1024 * 1024; // >100MB
 
     const videoSrc = isVideo ? `/api/drive/stream/${asset.driveFileId}` : '';
 
@@ -80,7 +76,6 @@ export default function ExpandedAssetView({
         setPlaying(false);
         setVideoReady(false);
         setWantPlay(false);
-        setSlowBuffer(false);
         setDescExpanded(false);
         setDownloadFeedback('idle');
         setCaptureFeedback('idle');
@@ -89,7 +84,7 @@ export default function ExpandedAssetView({
     }, [asset.id]);
 
     const handleDownload = useCallback(() => {
-        if (!googleConnected || isQueued || !onDownload || downloadFeedback !== 'idle') return;
+        if (isQueued || !onDownload || downloadFeedback !== 'idle') return;
         onDownload(asset);
         setDownloadFeedback('spinning');
         dlFeedbackTimer.current = setTimeout(() => {
@@ -98,21 +93,7 @@ export default function ExpandedAssetView({
                 setDownloadFeedback('idle');
             }, 800);
         }, 800);
-    }, [googleConnected, isQueued, onDownload, downloadFeedback, asset]);
-
-    // Show "Having trouble?" fallback — immediately for large files, after 8s for others
-    useEffect(() => {
-        if (!wantPlay || videoReady) {
-            setSlowBuffer(false);
-            return;
-        }
-        if (isLargeFile) {
-            setSlowBuffer(true);
-            return;
-        }
-        const timer = setTimeout(() => setSlowBuffer(true), 8_000);
-        return () => clearTimeout(timer);
-    }, [wantPlay, videoReady, isLargeFile]);
+    }, [isQueued, onDownload, downloadFeedback, asset]);
 
     // Preload video on expand — start fetching immediately
     useEffect(() => {
@@ -221,7 +202,6 @@ export default function ExpandedAssetView({
         e.stopPropagation();
         setWantPlay(false);
         setPlaying(false);
-        setSlowBuffer(false);
         const video = videoRef.current;
         if (video) {
             video.pause();
@@ -451,30 +431,24 @@ export default function ExpandedAssetView({
                         {/* Subtle persistent Drive link for all videos */}
                         {isVideo && (
                             <a
-                                href={googleConnected ? drivePreviewUrl : undefined}
+                                href={drivePreviewUrl}
                                 target="_blank"
                                 rel="noopener noreferrer"
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    if (!googleConnected) {
-                                        e.preventDefault();
-                                        onReconnect?.();
-                                    }
-                                }}
+                                onClick={(e) => e.stopPropagation()}
                                 className="absolute bottom-3 right-3 flex items-center gap-1.5 text-[10px] font-medium px-2.5 py-1 rounded-md transition-opacity opacity-40 hover:opacity-100 z-10"
                                 style={{
                                     background: 'rgba(0, 0, 0, 0.5)',
-                                    color: googleConnected ? 'rgba(255, 255, 255, 0.8)' : 'var(--ram-amber, #f59e0b)',
+                                    color: 'rgba(255, 255, 255, 0.8)',
                                     backdropFilter: 'blur(4px)',
                                 }}
-                                title={googleConnected ? 'Open in Google Drive' : 'Reconnect Google Drive to preview'}
+                                title="Open in Google Drive"
                             >
                                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                                     <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
                                     <polyline points="15 3 21 3 21 9" />
                                     <line x1="10" y1="14" x2="21" y2="3" />
                                 </svg>
-                                {googleConnected ? 'Having trouble previewing? Open in Drive' : 'Reconnect Drive to preview'}
+                                Having trouble previewing? Open in Drive
                             </a>
                         )}
                     </div>
@@ -516,7 +490,7 @@ export default function ExpandedAssetView({
                             {asset.duration && (
                                 <MetadataRow
                                     label="Duration"
-                                    value={`${Math.floor(asset.duration / 60)}:${String(asset.duration % 60).padStart(2, '0')}`}
+                                    value={`${Math.floor(asset.duration / 60)}:${String(Math.floor(asset.duration % 60)).padStart(2, '0')}`}
                                 />
                             )}
                             <MetadataRow label="Format" value={asset.mimeType.split('/')[1]?.toUpperCase() || asset.mimeType} />
@@ -536,11 +510,10 @@ export default function ExpandedAssetView({
                         </MetadataSection>
 
                         {/* Credits (from filename parser or Drive Labels) */}
-                        {(creator || parsed.shootDescription) && (
+                        {(creator || project) && (
                             <MetadataSection title="Credits">
                                 {creator && <MetadataRow label="Creator" value={creator} />}
-                                {parsed.shootDescription && <MetadataRow label="Project" value={parsed.shootDescription} />}
-                                {asset.projectDescription && <MetadataRow label="Project" value={asset.projectDescription} />}
+                                {project && <MetadataRow label="Project" value={project} />}
                             </MetadataSection>
                         )}
 
@@ -622,31 +595,11 @@ export default function ExpandedAssetView({
 
                         {/* Quick actions */}
                         <div className="flex flex-col gap-2 mt-2 pt-4" style={{ borderTop: '1px solid var(--ram-border)' }}>
-                            {/* Reconnect banner when Drive is disconnected */}
-                            {!googleConnected && (
-                                <button
-                                    onClick={() => onReconnect?.()}
-                                    className="flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-lg text-sm font-medium transition-all hover:scale-[1.01] active:scale-[0.99]"
-                                    style={{
-                                        background: 'rgba(251, 191, 36, 0.12)',
-                                        border: '1px solid rgba(251, 191, 36, 0.35)',
-                                        color: 'var(--ram-amber, #fbbf24)',
-                                    }}
-                                >
-                                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
-                                        <polyline points="10 17 15 12 10 7" />
-                                        <line x1="15" y1="12" x2="3" y2="12" />
-                                    </svg>
-                                    Reconnect Drive
-                                </button>
-                            )}
-
                             {/* Primary: Download */}
                             {onDownload && (
                                 <button
                                     onClick={handleDownload}
-                                    disabled={!googleConnected || isQueued || downloadFeedback !== 'idle'}
+                                    disabled={isQueued || downloadFeedback !== 'idle'}
                                     className="flex items-center justify-center gap-2 w-full px-4 py-2.5 rounded-lg text-sm font-medium transition-all hover:scale-[1.01] active:scale-[0.99] disabled:hover:scale-100"
                                     style={{
                                         background: downloadFeedback === 'confirmed' || isQueued
@@ -662,8 +615,7 @@ export default function ExpandedAssetView({
                                             : downloadFeedback === 'spinning'
                                                 ? 'var(--ram-accent)'
                                                 : 'var(--ram-bg-primary)',
-                                        opacity: !googleConnected ? 0.35 : 1,
-                                        cursor: !googleConnected ? 'not-allowed' : isQueued ? 'default' : 'pointer',
+                                        cursor: isQueued ? 'default' : 'pointer',
                                     }}
                                 >
                                     {downloadFeedback === 'confirmed' || isQueued ? (
@@ -691,17 +643,17 @@ export default function ExpandedAssetView({
 
                             {/* Secondary: Shortcut to Folder */}
                             {onRelay && (
-                                <div className="relative" title={!googleConnected ? 'Reconnect Drive to create shortcut' : asset.isShortcut ? 'Shortcuts cannot be shortcutted — only original files' : isRelayed ? 'Already shortcutted this session' : undefined}>
+                                <div className="relative" title={asset.isShortcut ? 'Shortcuts cannot be shortcutted — only original files' : isRelayed ? 'Already shortcutted this session' : undefined}>
                                     <button
-                                        onClick={() => googleConnected && !asset.isShortcut && !isRelayed && onRelay(asset)}
-                                        disabled={!googleConnected || asset.isShortcut || isRelayed}
+                                        onClick={() => !asset.isShortcut && !isRelayed && onRelay(asset)}
+                                        disabled={asset.isShortcut || isRelayed}
                                         className="flex items-center justify-center gap-2 w-full px-4 py-2 rounded-lg text-sm font-medium transition-all hover:scale-[1.01] active:scale-[0.99] disabled:hover:scale-100"
                                         style={{
                                             background: isRelayed ? 'rgba(52, 211, 153, 0.1)' : asset.isShortcut ? 'var(--ram-bg-tertiary)' : 'var(--ram-bg-hover)',
                                             color: isRelayed ? 'var(--ram-green, #34d399)' : asset.isShortcut ? 'var(--ram-text-tertiary)' : 'var(--ram-text-primary)',
                                             border: `1px solid ${isRelayed ? 'rgba(52, 211, 153, 0.3)' : 'var(--ram-border-hover)'}`,
-                                            opacity: !googleConnected ? 0.35 : asset.isShortcut ? 0.4 : 1,
-                                            cursor: !googleConnected || asset.isShortcut || isRelayed ? 'not-allowed' : 'pointer',
+                                            opacity: asset.isShortcut ? 0.4 : 1,
+                                            cursor: asset.isShortcut || isRelayed ? 'not-allowed' : 'pointer',
                                         }}
                                     >
                                         {isRelayed ? (

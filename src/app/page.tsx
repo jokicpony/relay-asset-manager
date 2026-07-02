@@ -19,6 +19,13 @@ import NamerView from '@/components/namer/NamerView';
 
 const PAGE_SIZE = 48;
 
+// True when `path` is `parent` itself or nested inside it. Plain startsWith
+// would also match sibling folders sharing a name prefix ("/Studio Archive"
+// under "/Studio").
+function isPathWithin(path: string, parent: string): boolean {
+  return path === parent || path.startsWith(parent.endsWith('/') ? parent : parent + '/');
+}
+
 const DEFAULT_FILTERS: SearchFilters = {
   query: '',
   folderPath: null,
@@ -84,40 +91,7 @@ function filtersToUrl(filters: SearchFilters): string {
   return parts.length ? `?${parts.join('&')}` : window.location.pathname;
 }
 
-// ── Popup auth wrapper ──────────────────────────────────────────
-// If this page loaded inside a popup after an OAuth reconnect flow,
-// show a minimal "Connected" screen, post message back, and close.
-// This must be a separate component so Home's hooks are never skipped.
-export default function HomeWrapper() {
-  const [isPopupAuth, setIsPopupAuth] = useState(false);
-  useEffect(() => {
-    if (window.opener && localStorage.getItem('relay_popup_auth')) {
-      setIsPopupAuth(true);
-      localStorage.removeItem('relay_popup_auth');
-      window.opener.postMessage(
-        { type: 'RELAY_AUTH_COMPLETE', status: 'success' },
-        window.location.origin
-      );
-      setTimeout(() => window.close(), 800);
-    }
-  }, []);
-
-  if (isPopupAuth) {
-    return (
-      <div style={{
-        background: '#0c0e12', color: '#f0f2f5', fontFamily: 'system-ui',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        height: '100vh', fontSize: 16,
-      }}>
-        ✅ Connected! This window will close…
-      </div>
-    );
-  }
-
-  return <Home />;
-}
-
-function Home() {
+export default function Home() {
   // Data state
   const [assets, setAssets] = useState<Asset[]>([]);
   const [folderTree, setFolderTree] = useState<FolderNode>({
@@ -225,9 +199,10 @@ function Home() {
   }, []);
 
   // Refresh the asset list + folder tree from the server. Single source of
-  // truth for the flows that re-pull after a mutation (ingest, relay, trash).
+  // truth for the flows that re-pull after a mutation (ingest, relay, trash) —
+  // fresh:true bypasses the 60s browser cache so the change shows immediately.
   const refreshAssets = useCallback(async () => {
-    const data = await fetchAllAssets();
+    const data = await fetchAllAssets({ fresh: true });
     setAssets(data);
     setFolderTree(buildFolderTree(data));
   }, []);
@@ -401,13 +376,13 @@ function Home() {
     const textMatchIds = new Set<string>();
     const filtered = assets.filter((asset) => {
       // Folder scope
-      if (filters.folderPath && !asset.folderPath.startsWith(filters.folderPath)) {
+      if (filters.folderPath && !isPathWithin(asset.folderPath, filters.folderPath)) {
         return false;
       }
 
       // Hidden folders — excluded from "All Folders" master view only
       if (!filters.folderPath && hiddenFolders.length > 0) {
-        if (hiddenFolders.some(hp => asset.folderPath.startsWith(hp))) {
+        if (hiddenFolders.some(hp => isPathWithin(asset.folderPath, hp))) {
           return false;
         }
       }
@@ -545,7 +520,7 @@ function Home() {
   // is needed — visibleAssets can be rendered directly in sort order.
 
   // Selection handlers
-  const handleSelect = useCallback((id: string, _shiftKey: boolean) => {
+  const handleSelect = useCallback((id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) {
@@ -1004,7 +979,6 @@ function Home() {
             }}
             onSearchSubmit={triggerSemanticSearch}
             isSearching={semanticLoading}
-            resultCount={Math.min(visibleCount, filteredAssets.length)}
             totalCount={filteredAssets.length}
             totalAssetCount={assets.length}
             isShuffled={shuffleSeed !== null}

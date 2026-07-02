@@ -41,7 +41,7 @@ interface NamerQueueProps {
  * Countdown display component for pending ingests.
  */
 function IngestCountdown({ firesAt }: { firesAt: number }) {
-    const [remaining, setRemaining] = useState(Math.max(0, firesAt - Date.now()));
+    const [remaining, setRemaining] = useState(() => Math.max(0, firesAt - Date.now()));
 
     useEffect(() => {
         const interval = setInterval(() => {

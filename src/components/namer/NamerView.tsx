@@ -4,13 +4,10 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import * as namerApi from '@/lib/namer/namer-api';
 import { logger } from '@/lib/logger';
 import type {
-    NamerFile,
     NamerFilePreview,
     NamerSettings,
-    NamingSchema,
     SchemaField,
     DriveLabel,
-    BatchConfig,
     AIMetadata,
 } from '@/lib/namer/types';
 import { PASSTHROUGH_SCHEMA_KEY } from '@/lib/namer/types';
@@ -59,7 +56,7 @@ export default function NamerView() {
     const [aiEnabled, setAiEnabled] = useState(true);
 
     // ─── Queue (batches processed inline) ──────────────────────
-    const [batches, setBatches] = useState<BatchInfo[]>([]);;
+    const [batches, setBatches] = useState<BatchInfo[]>([]);
     const [isProcessing, setIsProcessing] = useState(false);
     const processingRef = useRef(false);
     const batchFileIdsRef = useRef<Set<string>>(new Set());
@@ -221,7 +218,6 @@ export default function NamerView() {
     useEffect(() => {
         if (files.length === 0) return;
         setFiles(prev => {
-            const pendingFiles = prev.filter(f => f.status === 'pending' || f.status === 'excluded');
             let idx = 0;
             return prev.map(f => {
                 if (f.status === 'pending') {
@@ -437,11 +433,7 @@ export default function NamerView() {
                 for (const labelId of batchLabelIds) {
                     try {
                         const fv = batchLabelFieldValues[labelId] || {};
-                        const fieldCount = Object.keys(fv).length;
-                        const fieldSummary = Object.entries(fv).map(([fId, v]) =>
-                            `${fId}=${JSON.stringify(v)}`
-                        ).join(', ');
-                        const result = await namerApi.applyLabel(file.id, labelId, fv as Record<string, import('@/lib/namer/types').LabelFieldValue>);
+                        await namerApi.applyLabel(file.id, labelId, fv as Record<string, import('@/lib/namer/types').LabelFieldValue>);
                         await new Promise(r => setTimeout(r, 500));
                     } catch (labelErr: unknown) {
                         const errMsg = labelErr instanceof Error ? labelErr.message : String(labelErr);
@@ -1217,6 +1209,7 @@ export default function NamerView() {
                             </div>
                         )}
                         <FilePreviewTable
+                            key={loadCount} // remount per load — resets filter/search state
                             files={files}
                             onToggleExclude={toggleExclude}
                             onSelectAll={selectAll}
@@ -1225,7 +1218,6 @@ export default function NamerView() {
                             onExecute={() => setShowConfirmModal(true)}
                             canExecute={canExecute}
                             isProcessing={isProcessing}
-                            loadId={loadCount}
                             onSelectFiltered={selectFiltered}
                             onDeselectFiltered={deselectFiltered}
                         />

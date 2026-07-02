@@ -37,10 +37,7 @@ export async function GET() {
             return NextResponse.json({ labels: [] });
         }
 
-        logger.info('namer-labels', `Fetching ${labelIds.length} labels by ID`, {
-            labelIds,
-            tokenPrefix: token.substring(0, 10) + '...',
-        });
+        logger.info('namer-labels', `Fetching ${labelIds.length} labels by ID`, { labelIds });
 
         // Fetch each label individually — Promise.allSettled for resilience
         const results = await Promise.allSettled(

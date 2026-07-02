@@ -18,35 +18,15 @@ export async function GET() {
         return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
 
-    // Try with deleted_reason column; fall back if migration hasn't been applied
-    let data: any[] | null = null;
-    let hasReasonColumn = true;
-
-    const result1 = await supabase
+    const { data, error } = await supabase
         .from('assets')
         .select('id, name, thumbnail_url, folder_path, asset_type, deleted_at, deleted_reason')
         .eq('is_active', false)
         .not('deleted_at', 'is', null)
         .order('deleted_at', { ascending: true });
 
-    if (result1.error && result1.error.message.includes('deleted_reason')) {
-        // Column doesn't exist yet — query without it
-        hasReasonColumn = false;
-        const result2 = await supabase
-            .from('assets')
-            .select('id, name, thumbnail_url, folder_path, asset_type, deleted_at')
-            .eq('is_active', false)
-            .not('deleted_at', 'is', null)
-            .order('deleted_at', { ascending: true });
-
-        if (result2.error) {
-            return NextResponse.json({ error: result2.error.message }, { status: 500 });
-        }
-        data = result2.data;
-    } else if (result1.error) {
-        return NextResponse.json({ error: result1.error.message }, { status: 500 });
-    } else {
-        data = result1.data;
+    if (error) {
+        return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
     // Add days remaining before purge
@@ -59,7 +39,7 @@ export async function GET() {
         return {
             ...asset,
             daysRemaining,
-            deleted_reason: hasReasonColumn ? (asset.deleted_reason ?? 'orphaned') : 'orphaned',
+            deleted_reason: asset.deleted_reason ?? 'orphaned',
         };
     });
 
@@ -86,25 +66,13 @@ export async function POST(request: NextRequest) {
     }
 
     if (action === 'restore') {
-        // Try with deleted_reason; fall back if column doesn't exist
-        let restoreError: any = null;
-        const { error: err1 } = await supabase
+        const { error } = await supabase
             .from('assets')
             .update({ is_active: true, deleted_at: null, deleted_reason: null })
             .eq('id', id);
 
-        if (err1 && err1.message.includes('deleted_reason')) {
-            const { error: err2 } = await supabase
-                .from('assets')
-                .update({ is_active: true, deleted_at: null })
-                .eq('id', id);
-            restoreError = err2;
-        } else {
-            restoreError = err1;
-        }
-
-        if (restoreError) {
-            return NextResponse.json({ error: restoreError.message }, { status: 500 });
+        if (error) {
+            return NextResponse.json({ error: error.message }, { status: 500 });
         }
         return NextResponse.json({ success: true, action: 'restored' });
     }
@@ -121,8 +89,11 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: 'Asset not found' }, { status: 404 });
         }
 
-        // Delete thumbnail from storage
-        await supabase.storage.from('thumbnails').remove([`${asset.drive_file_id}.webp`]);
+        // Delete thumbnails from storage — both auto-generated and user-set custom
+        await supabase.storage.from('thumbnails').remove([
+            `${asset.drive_file_id}.webp`,
+            `custom_${asset.drive_file_id}.webp`,
+        ]);
 
         // Hard-delete the row
         const { error } = await supabase.from('assets').delete().eq('id', id);

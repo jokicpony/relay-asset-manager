@@ -54,16 +54,6 @@ interface SyncProgress {
     updated_at: string;
 }
 
-interface WorkflowStatus {
-    found: boolean;
-    run_id?: number;
-    status?: string;       // queued | in_progress | completed
-    conclusion?: string | null; // success | failure | cancelled
-    html_url?: string;
-    steps?: WorkflowStep[];
-    sync_progress?: SyncProgress | null;
-}
-
 // Map GitHub Actions step names to display labels
 const WORKFLOW_STEP_DISPLAY: Record<string, { label: string; icon: string }> = {
     'Checkout': { label: 'Checkout', icon: '📋' },

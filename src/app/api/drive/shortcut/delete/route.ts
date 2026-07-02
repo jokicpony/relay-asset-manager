@@ -40,9 +40,22 @@ export async function DELETE(request: NextRequest) {
             process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
         );
 
+        // Authorization: only delete Drive files that are tracked shortcuts.
+        // The service account can delete anything it can reach, so without this
+        // check any authenticated user could delete arbitrary Drive files by ID.
+        const { data: knownRows } = await admin
+            .from('shortcuts')
+            .select('shortcut_drive_id')
+            .in('shortcut_drive_id', shortcutIds);
+        const knownIds = new Set((knownRows ?? []).map((r) => r.shortcut_drive_id));
+
         const results: { id: string; success: boolean; error?: string }[] = [];
 
         for (const id of shortcutIds) {
+            if (!knownIds.has(id)) {
+                results.push({ id, success: false, error: 'Not a tracked shortcut' });
+                continue;
+            }
             try {
                 // Delete from Google Drive
                 const res = await fetch(

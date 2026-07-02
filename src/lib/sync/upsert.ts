@@ -20,16 +20,10 @@ function createAdminClient() {
  */
 export async function upsertAssets(
     files: DriveFile[],
-    supabaseAccessToken?: string,
     options?: { preserveExistingThumbnails?: boolean }
 ): Promise<{ upserted: number; errors: string[] }> {
     const supabase = createAdminClient();
     const preserveThumbnails = options?.preserveExistingThumbnails ?? false;
-
-    // If we have a user's Supabase access token, set it for RLS
-    if (supabaseAccessToken) {
-        supabase.realtime.setAuth(supabaseAccessToken);
-    }
 
     // When preserving thumbnails, look up which assets already have one
     // so we only set thumbnail_url for genuinely new assets

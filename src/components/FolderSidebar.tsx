@@ -467,6 +467,7 @@ function FolderTreeNode({
                             selectedPath={selectedPath}
                             onSelect={onSelect}
                             depth={depth + 1}
+                            pinboardActive={pinboardActive}
                             onContextMenu={onContextMenu}
                         />
                     ))}

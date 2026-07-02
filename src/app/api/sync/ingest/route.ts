@@ -21,6 +21,7 @@ import { parseFilename } from '@/lib/filename-utils';
 import { getConfig } from '@/lib/config';
 import { logger } from '@/lib/logger';
 import { createClient } from '@supabase/supabase-js';
+import { createClient as createServerClient } from '@/lib/supabase/server';
 import type { DriveFile } from '@/lib/sync/types';
 
 export const runtime = 'nodejs';
@@ -136,6 +137,14 @@ function isInSyncScope(folderPath: string, syncFolders: string[]): boolean {
 // POST handler
 // ---------------------------------------------------------------------------
 export async function POST(request: NextRequest) {
+    // Auth check — the middleware also gates /api, but keep the in-route check
+    // consistent with every other route (defense in depth).
+    const supabaseAuth = await createServerClient();
+    const { data: { user } } = await supabaseAuth.auth.getUser();
+    if (!user) {
+        return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+    }
+
     try {
         const { fileIds, destFolderId } = await request.json();
 
@@ -291,7 +300,6 @@ export async function POST(request: NextRequest) {
         logger.info('ingest', `Upserting ${driveFiles.length} assets`);
         const { upserted, errors: upsertErrors } = await upsertAssets(
             driveFiles,
-            undefined,
             { preserveExistingThumbnails: true }
         );
 

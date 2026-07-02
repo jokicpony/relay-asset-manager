@@ -231,9 +231,11 @@ export function useDeferredIngest(defaultDelayMs: number = 300000) {
 
         init();
 
-        // Cleanup timers on unmount
+        // Cleanup timers on unmount. The Map itself is never reassigned, so
+        // capturing it here is safe and satisfies the ref-in-cleanup lint rule.
+        const timers = timersRef.current;
         return () => {
-            for (const timer of timersRef.current.values()) {
+            for (const timer of timers.values()) {
                 clearTimeout(timer);
             }
         };

@@ -17,7 +17,7 @@ interface AssetCardProps {
     isExpired?: boolean;
     similarity?: number;
     textMatch?: boolean;
-    onSelect: (id: string, shiftKey: boolean) => void;
+    onSelect: (id: string) => void;
     onExpand: (asset: Asset) => void;
     isPinned?: boolean;
     onTogglePin?: (id: string) => void;
@@ -50,7 +50,7 @@ const AssetCard = memo(function AssetCard({ asset, selected, isExpired, similari
     const handleClick = (e: React.MouseEvent) => {
         if (e.shiftKey || e.metaKey) {
             e.preventDefault();
-            onSelect(asset.id, e.shiftKey);
+            onSelect(asset.id);
         } else {
             onExpand(asset);
         }
@@ -58,7 +58,7 @@ const AssetCard = memo(function AssetCard({ asset, selected, isExpired, similari
 
     const handleCheckboxClick = (e: React.MouseEvent) => {
         e.stopPropagation();
-        onSelect(asset.id, e.shiftKey);
+        onSelect(asset.id);
     };
 
     const handlePinClick = (e: React.MouseEvent) => {
@@ -172,7 +172,7 @@ const AssetCard = memo(function AssetCard({ asset, selected, isExpired, similari
                     })()}
                     {isVideo && asset.duration && (
                         <div className="text-[10px] text-white/60 mt-0.5">
-                            {Math.floor(asset.duration / 60)}:{String(asset.duration % 60).padStart(2, '0')}
+                            {Math.floor(asset.duration / 60)}:{String(Math.floor(asset.duration % 60)).padStart(2, '0')}
                         </div>
                     )}
                     {similarity !== undefined && (

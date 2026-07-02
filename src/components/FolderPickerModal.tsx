@@ -211,6 +211,9 @@ export default function FolderPickerModal({
                 }),
             });
             const data = await res.json();
+            if (!res.ok) {
+                throw new Error(data.error || `Shortcut request failed (${res.status})`);
+            }
             // The server re-resolves the canonical folder path; prefer it over
             // the locally-built `currentFolderPath`, which can be truncated when
             // the user navigated via search or recent.

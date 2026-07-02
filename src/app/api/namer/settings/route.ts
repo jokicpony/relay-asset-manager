@@ -13,6 +13,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import type { NamerSettings, NamingSchemas, Dropdowns, AISettings } from '@/lib/namer/types';
+import { DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT } from '@/lib/namer/ai-defaults';
 
 const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -22,24 +23,8 @@ const supabase = createClient(
 // Default settings — used for seeding and fallbacks
 const DEFAULT_AI_SETTINGS: AISettings = {
     enabled: true,
-    systemPrompt: `You are a Senior Creative Asset Manager optimizing images for semantic search in a Digital Asset Management system. Your keywords should help users find assets by searching for the MOOD, ACTIVITY, SETTING, PRODUCTS, or EMOTIONAL VIBE. Balance factual descriptors (objects, location) with experiential terms (feelings, activities, atmospheres).`,
-    userPrompt: `Analyze this image and return a JSON object with the following fields:
-
-context_environment: The primary setting as a brief phrase. (e.g., "freshwater river", "minimalist product studio", "alpine forest trail")
-
-seasonality: Season or weather conditions visible. (e.g., "summer", "winter storm", "golden autumn")
-
-lighting_mood: The light quality and emotional effect. (e.g., "warm golden hour", "dramatic storm light", "soft overcast")
-
-human_experience: Array of 2-3 activity or lifestyle descriptors. (e.g., ["fly fishing adventure", "peaceful nature retreat"])
-
-primary_objects: Array of 3-4 most important visible subjects. (e.g., ["insulated flask", "fly rod", "mountain stream"])
-
-color_palette: Array of 3 dominant HEX codes representing the image mood.
-
-label_csv: A single comma-separated string of 12-15 discovery keywords optimized for semantic search.
-
-Constraints: Output ONLY valid JSON. Keep individual tags to 1-3 words. Be specific and descriptive.`,
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
+    userPrompt: DEFAULT_USER_PROMPT,
     promptLocked: true,
     delayMs: 500,
 };

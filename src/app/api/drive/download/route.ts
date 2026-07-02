@@ -26,6 +26,14 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: 'No files specified' }, { status: 400 });
         }
 
+        // Verify user is authenticated
+        const supabase = await createClient();
+        const { data: { user } } = await supabase.auth.getUser();
+
+        if (!user) {
+            return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+        }
+
         // Single file — redirect to the streaming GET endpoint
         if (files.length === 1) {
             const file = files[0];
@@ -35,14 +43,6 @@ export async function POST(request: NextRequest) {
             );
             url.searchParams.set('name', file.name);
             return NextResponse.redirect(url);
-        }
-
-        // Verify user is authenticated
-        const supabase = await createClient();
-        const { data: { user } } = await supabase.auth.getUser();
-
-        if (!user) {
-            return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
         }
 
         // Authorization: restrict the zip to in-scope library files. The

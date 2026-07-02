@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { createClient as createServiceClient } from '@supabase/supabase-js';
 import { getDriveAccessToken } from '@/lib/google/auth';
+import { isInSharedDrive } from '@/lib/google/drive-scope';
 import { resolveFolderPathById } from '@/lib/google/folder-path';
 import { getConfig } from '@/lib/config';
 import { logger } from '@/lib/logger';
@@ -55,10 +56,32 @@ export async function POST(request: NextRequest) {
             process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
         );
 
+        // Authorization: the target folder must live in the configured shared
+        // drive — the service account may reach other drives, but shortcuts
+        // must not be plantable outside the DAM.
+        const config = await getConfig();
+        if (!(await isInSharedDrive(accessToken, targetFolderId, config.sharedDriveId))) {
+            return NextResponse.json(
+                { error: 'Target folder is outside the configured shared drive' },
+                { status: 403 }
+            );
+        }
+
+        // Authorization: only shortcut files that exist as active library
+        // assets. Resolve the asset UUID server-side from drive_file_id —
+        // never trust the client-supplied assetId (confused-deputy / IDOR).
+        const { data: assetRows } = await admin
+            .from('assets')
+            .select('id, drive_file_id')
+            .in('drive_file_id', assets.map((a) => a.driveFileId))
+            .eq('is_active', true);
+        const assetIdByDriveId = new Map(
+            (assetRows ?? []).map((r) => [r.drive_file_id, r.id])
+        );
+
         // Resolve the canonical folder path from the Drive folder ID. This is
         // the source-of-truth value written into shortcuts.project_folder_path —
         // never trust whatever path string the client constructed.
-        const config = await getConfig();
         const { path: targetFolderPath } = await resolveFolderPathById(
             accessToken,
             targetFolderId,
@@ -75,6 +98,11 @@ export async function POST(request: NextRequest) {
         const results: { name: string; success: boolean; shortcutId?: string; error?: string }[] = [];
 
         for (const asset of assets) {
+            const libraryAssetId = assetIdByDriveId.get(asset.driveFileId);
+            if (!libraryAssetId) {
+                results.push({ name: asset.name, success: false, error: 'Not an active library asset' });
+                continue;
+            }
             try {
                 // Create the Google Drive shortcut
                 const res = await fetch('https://www.googleapis.com/drive/v3/files?supportsAllDrives=true', {
@@ -107,7 +135,7 @@ export async function POST(request: NextRequest) {
                     .from('shortcuts')
                     .insert({
                         shortcut_drive_id: created.id,
-                        target_asset_id: asset.assetId,
+                        target_asset_id: libraryAssetId,
                         project_folder_path: targetFolderPath,
                         project_folder_drive_id: targetFolderId,
                     });

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import type { NamerFilePreview } from '@/lib/namer/types';
 
@@ -24,7 +24,6 @@ interface FilePreviewTableProps {
     onExecute: () => void;
     canExecute: boolean;
     isProcessing: boolean;
-    loadId: number;
     onSelectFiltered?: (ids: string[]) => void;
     onDeselectFiltered?: (ids: string[]) => void;
 }
@@ -38,20 +37,16 @@ export default function FilePreviewTable({
     onExecute,
     canExecute,
     isProcessing,
-    loadId,
     onSelectFiltered,
     onDeselectFiltered,
 }: FilePreviewTableProps) {
     const [hoveredId, setHoveredId] = useState<string | null>(null);
     const [hoverPos, setHoverPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
     const previewRef = useRef<HTMLDivElement>(null);
+    // Filter/search state resets per file load: the parent keys this component
+    // by load counter, so a fresh load remounts with clean state.
     const [filterType, setFilterType] = useState<FilterType>('all');
     const [searchQuery, setSearchQuery] = useState('');
-
-    useEffect(() => {
-        setFilterType('all');
-        setSearchQuery('');
-    }, [loadId]);
 
     const visibleFiles = files.filter(file => {
         if (file.status === 'processing' || file.status === 'success' || file.status === 'error') return true;

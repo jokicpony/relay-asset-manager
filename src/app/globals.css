@@ -92,12 +92,6 @@ body {
   margin-bottom: 12px;
 }
 
-@media (max-width: 1536px) {
-  .masonry-grid {
-    grid-template-columns: repeat(4, 1fr);
-  }
-}
-
 @media (max-width: 1280px) {
   .masonry-grid {
     grid-template-columns: repeat(3, 1fr);
@@ -258,60 +252,6 @@ body {
 .asset-card:hover .video-indicator {
   transform: translate(-50%, -50%) scale(1.1);
   background: rgba(0, 0, 0, 0.8);
-}
-
-/* Shortcut provenance indicator — bottom-left link icon */
-.shortcut-indicator {
-  position: absolute;
-  bottom: 8px;
-  left: 8px;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 10px 4px 7px;
-  border-radius: 20px;
-  background: rgba(0, 0, 0, 0.65);
-  backdrop-filter: blur(8px);
-  border: 1.5px solid rgba(255, 255, 255, 0.15);
-  color: rgba(255, 255, 255, 0.85);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  z-index: 5;
-  opacity: 0.85;
-  transition: opacity 0.15s ease, border-color 0.15s ease;
-}
-
-.asset-card:hover .shortcut-indicator {
-  opacity: 1;
-  border-color: rgba(255, 255, 255, 0.4);
-}
-
-/* Shortcut clone indicator — subtle icon for linked assets */
-.shortcut-clone-badge {
-  position: absolute;
-  bottom: 8px;
-  left: 8px;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 10px 4px 7px;
-  border-radius: 20px;
-  background: rgba(0, 0, 0, 0.65);
-  backdrop-filter: blur(8px);
-  border: 1.5px solid rgba(255, 255, 255, 0.15);
-  color: var(--ram-accent);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  z-index: 10;
-  opacity: 0.85;
-  transition: opacity 0.15s ease, border-color 0.15s ease;
-}
-
-.asset-card:hover .shortcut-clone-badge {
-  opacity: 1;
-  border-color: var(--ram-accent);
 }
 
 /* Action bar slide up */
@@ -560,69 +500,6 @@ body {
   background: rgba(255, 255, 255, 0.06);
 }
 
-/* Folder hidden-eye tooltip */
-.folder-hidden-tooltip-wrap {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-}
-
-.folder-hidden-tooltip {
-  position: absolute;
-  left: calc(100% + 8px);
-  top: 50%;
-  transform: translateY(-50%);
-  white-space: nowrap;
-  padding: 5px 10px;
-  border-radius: 6px;
-  background: rgba(20, 23, 32, 0.95);
-  backdrop-filter: blur(8px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  color: var(--ram-text-secondary);
-  font-size: 11px;
-  font-weight: 500;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.15s ease;
-  z-index: 100;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
-}
-
-/* Tooltip arrow */
-.folder-hidden-tooltip::before {
-  content: '';
-  position: absolute;
-  right: 100%;
-  top: 50%;
-  transform: translateY(-50%);
-  border: 5px solid transparent;
-  border-right-color: rgba(20, 23, 32, 0.95);
-}
-
-.folder-hidden-tooltip-wrap:hover .folder-hidden-tooltip {
-  opacity: 1;
-}
-
-/* Subtle loading shimmer */
-@keyframes shimmer {
-  0% {
-    background-position: -200% 0;
-  }
-
-  100% {
-    background-position: 200% 0;
-  }
-}
-
-.shimmer {
-  background: linear-gradient(90deg,
-      var(--ram-bg-tertiary) 25%,
-      var(--ram-bg-hover) 50%,
-      var(--ram-bg-tertiary) 75%);
-  background-size: 200% 100%;
-  animation: shimmer 1.5s infinite;
-}
-
 /* Spinner animation for download queue */
 @keyframes spin {
   from {
@@ -644,20 +521,6 @@ body {
 
   50% {
     box-shadow: 0 0 0 4px rgba(232, 168, 56, 0.08);
-  }
-}
-
-@keyframes pulse-glow {
-
-  0%,
-  100% {
-    opacity: 1;
-    box-shadow: 0 0 4px 1px rgba(245, 158, 11, 0.4);
-  }
-
-  50% {
-    opacity: 0.5;
-    box-shadow: 0 0 8px 3px rgba(245, 158, 11, 0.6);
   }
 }
 
@@ -754,16 +617,7 @@ body {
   animation: pinBounce 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 
-/* ── Namer queue toggle pulse ────────────────────────────────── */
-@keyframes queuePulse {
-  0%, 100% {
-    box-shadow: 2px 2px 12px rgba(0,0,0,0.3);
-  }
-  50% {
-    box-shadow: 2px 2px 12px rgba(0,0,0,0.3), 0 0 0 4px rgba(45, 212, 191, 0.12);
-  }
-}
-
+/* ── Namer queue toggle ──────────────────────────────────────── */
 .namer-queue-toggle:hover {
   background: var(--ram-bg-hover);
   border-color: var(--ram-border-hover);

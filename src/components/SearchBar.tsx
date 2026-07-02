@@ -7,14 +7,13 @@ interface SearchBarProps {
     onFiltersChange: (filters: SearchFilters) => void;
     onSearchSubmit?: () => void;
     isSearching?: boolean;
-    resultCount: number;
     totalCount: number;
     totalAssetCount: number;
     isShuffled: boolean;
     onShuffle: () => void;
 }
 
-export default function SearchBar({ filters, onFiltersChange, onSearchSubmit, isSearching, resultCount, totalCount, totalAssetCount, isShuffled, onShuffle }: SearchBarProps) {
+export default function SearchBar({ filters, onFiltersChange, onSearchSubmit, isSearching, totalCount, totalAssetCount, isShuffled, onShuffle }: SearchBarProps) {
     const updateFilter = <K extends keyof SearchFilters>(key: K, value: SearchFilters[K]) => {
         onFiltersChange({ ...filters, [key]: value });
     };

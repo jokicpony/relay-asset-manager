@@ -126,46 +126,5 @@ export interface NamerSettings {
     helpGuideContent: string;
 }
 
-// ---------------------------------------------------------------------------
-// Batch Processing
-// ---------------------------------------------------------------------------
-
-export interface BatchConfig {
-    sourceId: string;
-    destId: string;
-    selectedLabelIds: string[];
-    labelFieldValues: LabelFieldValues;
-    tagSummary: string;
-    aiSettings: AISettings;
-}
-
-export interface BatchFile {
-    id: string;
-    name: string;
-    proposedName: string;
-    status: 'queued' | 'processing' | 'analyzing' | 'tagging' | 'success' | 'error';
-    finalName: string | null;
-    mimeType: string;
-    thumbnailLink?: string;
-    imageMediaMetadata?: { width: number; height: number };
-    videoMediaMetadata?: { width: number; height: number };
-    parents?: string[];
-    orientation?: string | null;
-}
-
-export interface BatchProgress {
-    completed: number;
-    total: number;
-    errors: number;
-}
-
-export interface Batch {
-    id: string;
-    files: BatchFile[];
-    config: BatchConfig;
-    progress: BatchProgress;
-    status: 'queued' | 'processing' | 'completed';
-    isRevert?: boolean;
-    isReverted?: boolean;
-    createdAt: string;
-}
+// Batch-processing state shapes live with their only consumer:
+// src/components/namer/NamerQueue.tsx (BatchInfo / BatchFile).

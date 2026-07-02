@@ -33,7 +33,11 @@ const LEVEL_PRIORITY: Record<LogLevel, number> = {
 
 const APP_NAME = process.env.APP_NAME || 'relay-asset-manager';
 const ENV = process.env.VERCEL_ENV || process.env.NODE_ENV || 'development';
-const MIN_LEVEL: LogLevel = (process.env.LOG_LEVEL as LogLevel) || 'info';
+// Fall back to 'info' on unknown LOG_LEVEL values — an invalid level would
+// otherwise make every shouldLog() comparison false and silence all output.
+const MIN_LEVEL: LogLevel = process.env.LOG_LEVEL && process.env.LOG_LEVEL in LEVEL_PRIORITY
+    ? (process.env.LOG_LEVEL as LogLevel)
+    : 'info';
 const IS_JSON = ENV === 'production' || process.env.CI === 'true';
 
 function shouldLog(level: LogLevel): boolean {

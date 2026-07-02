@@ -39,6 +39,18 @@ export async function POST(request: NextRequest) {
             process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
         );
 
+        // Only accept thumbnails for files that exist as active library assets.
+        // This also rejects malformed IDs before they reach a storage key.
+        const { data: assetRow } = await supabase
+            .from('assets')
+            .select('id')
+            .eq('drive_file_id', driveFileId)
+            .eq('is_active', true)
+            .maybeSingle();
+        if (!assetRow) {
+            return NextResponse.json({ error: 'Asset not found' }, { status: 404 });
+        }
+
         // Upload to Supabase Storage
         const arrayBuffer = await file.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);

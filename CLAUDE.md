@@ -63,14 +63,15 @@ Things that aren't obvious from the code but cost time when forgotten.
 - **The folder sidebar tree mixes two sources.** Paths come from `assets.folder_path` (real ingested files) AND virtual entries synthesized from `shortcuts.project_folder_path` in `/api/assets`. A phantom top-level folder usually means a bad path in `shortcuts`, not a sync bug.
 - **Drive folder paths must be derived from `project_folder_drive_id`, never trusted from client-supplied strings.** The folder ID is the gold-standard identifier; path strings are display/cache values that can drift.
 - **`[relay-ignore]` in a folder's Drive description** skips that folder and all descendants during sync.
+- **`parseFilename` is shared** — `src/lib/filename-utils.ts` is the single parser used by the app, the namer ingest, and `scripts/sync.ts`. Don't fork it: divergent parsed values trigger mass re-embeds on the next sync (embedding text includes the parsed description).
 
 ### Caching
 
-- **`/api/assets` returns `Cache-Control: private, max-age=60, stale-while-revalidate=300`.** UI changes from sync or DB writes won't show in the browser for up to 60s; hard-reload to bypass.
+- **`/api/assets` returns `Cache-Control: private, max-age=60, stale-while-revalidate=300`.** In-app mutation flows (relay, trash, namer ingest, sync-complete) call `fetchAllAssets({ fresh: true })`, which bypasses the cache via `cache: 'reload'`. Changes made *outside* your session (another user's relay, the cron sync) can still appear up to 60s stale until reload.
 
 ### Supabase RLS
 
-- **`assets`, `shortcuts`, and `app_settings` are read-only for the user's anon-key client; all writes are service-role-only.** Authenticated clients get SELECT (the `/api/assets` route reads via the user session); every INSERT/UPDATE/DELETE goes through a server route or the sync pipeline using a service-role client (`createClient` from `@supabase/supabase-js` with `SUPABASE_SERVICE_ROLE_KEY`). Mutating these tables from the browser will be denied by RLS. (Migration: `supabase/migrations/2026-06-08_lockdown_write_rls.sql`.)
+- **`assets`, `shortcuts`, and `app_settings` are read-only for the user's anon-key client; all writes are service-role-only.** Authenticated clients get SELECT (the `/api/assets` route reads via the user session); every INSERT/UPDATE/DELETE goes through a server route or the sync pipeline using a service-role client (`createClient` from `@supabase/supabase-js` with `SUPABASE_SERVICE_ROLE_KEY`). Mutating these tables from the browser will be denied by RLS. (Migrations: `supabase/migrations/2026-06-08_lockdown_write_rls.sql`, `2026-06-10_drop_authenticated_thumbnail_upload.sql` — both applied manually in the SQL Editor.)
 - **Supabase silently no-ops RLS-filtered updates** — no error returned, just zero rows affected. Always chain `.select('id')` after `.update()` if you need to verify rows actually changed.
 
 ### Configuration

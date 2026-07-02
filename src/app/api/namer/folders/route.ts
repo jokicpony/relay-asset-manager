@@ -8,6 +8,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getDriveAccessToken } from '@/lib/google/auth';
+import { isInSharedDrive } from '@/lib/google/drive-scope';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import { getConfig } from '@/lib/config';
@@ -28,14 +29,16 @@ export async function GET(request: NextRequest) {
         const token = await getDriveAccessToken();
         const config = await getConfig();
 
-        // Single folder lookup by ID
+        // Single folder lookup by ID — bounded to the configured shared drive
         if (folderId) {
+            if (!(await isInSharedDrive(token, folderId, config.sharedDriveId))) {
+                return NextResponse.json({ error: 'Folder is outside the configured shared drive' }, { status: 403 });
+            }
             const res = await fetch(
                 `${DRIVE_API}/files/${folderId}?fields=id,name,mimeType&supportsAllDrives=true`,
                 { headers: { Authorization: `Bearer ${token}` } }
             );
             if (!res.ok) {
-                const err = await res.text();
                 return NextResponse.json({ error: `Drive API error: ${res.status}` }, { status: res.status });
             }
             const folder = await res.json();

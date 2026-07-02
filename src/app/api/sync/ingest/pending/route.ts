@@ -70,7 +70,7 @@ export async function GET() {
     try {
         const pending = await getPendingIngests();
         return NextResponse.json({ pending });
-    } catch (err) {
+    } catch {
         return NextResponse.json({ pending: [] });
     }
 }

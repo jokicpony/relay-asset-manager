@@ -106,14 +106,11 @@ export async function GET() {
                 }
             });
 
-        // Fetch all asset pages
+        // Fetch all asset pages while the shortcuts query runs concurrently
         const PAGE_SIZE = 1000;
         const allRows: DbAsset[] = [];
         let offset = 0;
         let hasMore = true;
-
-        // Start shortcuts fetch, then begin paginated asset fetch
-        await shortcutPromise;
 
         while (hasMore) {
             const { data, error } = await supabase
@@ -133,6 +130,9 @@ export async function GET() {
             hasMore = data.length === PAGE_SIZE;
             offset += PAGE_SIZE;
         }
+
+        // Shortcut map must be complete before enrichment
+        await shortcutPromise;
 
         // Map to frontend Asset type with shortcut enrichment
         const allAssets: Asset[] = allRows.map((row) =>

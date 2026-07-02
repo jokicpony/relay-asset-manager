@@ -53,31 +53,6 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
     );
 }
 
-// ─── Field type badge ──────────────────────────────────────────
-function TypeBadge({ type }: { type: string }) {
-    const colors: Record<string, { bg: string; text: string }> = {
-        text: { bg: 'rgba(96, 165, 250, 0.15)', text: '#60a5fa' },
-        select: { bg: 'rgba(167, 139, 250, 0.15)', text: '#a78bfa' },
-        date: { bg: 'rgba(251, 191, 36, 0.15)', text: '#fbbf24' },
-        counter: { bg: 'rgba(52, 211, 153, 0.15)', text: '#34d399' },
-    };
-    const c = colors[type] || colors.text;
-    return (
-        <span style={{
-            fontSize: '9px',
-            fontWeight: 700,
-            textTransform: 'uppercase',
-            letterSpacing: '0.5px',
-            padding: '2px 6px',
-            borderRadius: '4px',
-            background: c.bg,
-            color: c.text,
-        }}>
-            {type}
-        </span>
-    );
-}
-
 export default function NamerSettingsPanel({ settings, onSave, onClose }: NamerSettingsProps) {
     const [activeTab, setActiveTab] = useState<'schemas' | 'dropdowns' | 'ai'>('schemas');
     const [saving, setSaving] = useState(false);
@@ -117,7 +92,8 @@ export default function NamerSettingsPanel({ settings, onSave, onClose }: NamerS
     };
 
     const removeSchema = (name: string) => {
-        const { [name]: _, ...rest } = schemas;
+        const rest = { ...schemas };
+        delete rest[name];
         setSchemas(rest);
         if (expandedSchema === name) setExpandedSchema(null);
         setDeleteConfirm(null);
@@ -207,7 +183,8 @@ export default function NamerSettingsPanel({ settings, onSave, onClose }: NamerS
     };
 
     const removeCategory = (category: string) => {
-        const { [category]: _, ...rest } = dropdowns;
+        const rest = { ...dropdowns };
+        delete rest[category];
         setDropdowns(rest);
     };
 

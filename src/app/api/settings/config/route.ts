@@ -47,7 +47,7 @@ export async function PUT(request: NextRequest) {
         }
 
         // Whitelist allowed keys
-        const ALLOWED_KEYS = ['shared_drive_id', 'sync_folders', 'drive_label_id', 'namer_label_ids', 'semantic_similarity_threshold', 'hidden_folders'];
+        const ALLOWED_KEYS = ['shared_drive_id', 'sync_folders', 'drive_label_id', 'namer_label_ids', 'semantic_similarity_threshold', 'hidden_folders', 'rights_label_config'];
         if (!ALLOWED_KEYS.includes(key)) {
             return NextResponse.json({ error: `Invalid setting key: ${key}` }, { status: 400 });
         }
