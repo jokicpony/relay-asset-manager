@@ -22,7 +22,7 @@ export interface Asset {
   assetType: AssetType;
   folderPath: string;
   thumbnailUrl: string;
-  previewUrl?: string; // for video streaming
+  thumbColor?: string; // dominant colour (#rrggbb), shown while the thumbnail loads
   width: number;
   height: number;
   duration?: number; // video only, in seconds
@@ -41,8 +41,6 @@ export interface Asset {
 
   // System
   createdAt: string;
-  updatedAt: string;
-  isActive: boolean;
 
   // Shortcut provenance — project folders this asset is linked from
   shortcutFolders?: string[];
@@ -50,6 +48,17 @@ export interface Asset {
   // Shortcut clone marker — set when this entry represents a shortcut, not the original
   isShortcut?: boolean;
   originalFolderPath?: string;  // the master asset's real folder path
+}
+
+/**
+ * GET /api/assets response. Shortcuts travel as [assetId, folderPath] pairs
+ * and are expanded into clone entries client-side (see expandAssetList) —
+ * sending full clones duplicated every field, descriptions included, for
+ * each of ~1.2k shortcuts.
+ */
+export interface AssetListPayload {
+  assets: Asset[];
+  shortcuts: [string, string][];
 }
 
 export interface SearchFilters {

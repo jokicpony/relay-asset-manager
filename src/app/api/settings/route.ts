@@ -28,12 +28,14 @@ export async function GET() {
             supabase
                 .from('sync_logs')
                 .select('*')
+                .eq('source', 'cron') // in-app ingests are logged here too
                 .order('finished_at', { ascending: false })
                 .limit(1)
                 .single(),
             supabase
                 .from('sync_logs')
                 .select('duration_secs')
+                .eq('source', 'cron')
                 .order('finished_at', { ascending: false })
                 .limit(5),
             supabase

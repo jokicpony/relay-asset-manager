@@ -6,6 +6,7 @@ import { logger } from '@/lib/logger';
 import { getComplianceBadges } from '@/lib/badge-utils';
 import { resolveCreator, parseFilename } from '@/lib/filename-utils';
 import ComplianceBadge from './ComplianceBadge';
+import { EXPANDED_IMAGE_SIZES } from './AssetCard';
 import Image from 'next/image';
 
 interface ExpandedAssetViewProps {
@@ -327,6 +328,7 @@ export default function ExpandedAssetView({
                                         height={asset.height}
                                         className={`object-contain rounded-lg ${isLandscape ? 'w-full' : 'h-full'}`}
                                         style={{ maxHeight: '60vh' }}
+                                        sizes={EXPANDED_IMAGE_SIZES}
                                         priority
                                     />
                                     <div className="absolute inset-0 flex items-center justify-center">
@@ -366,6 +368,7 @@ export default function ExpandedAssetView({
                                 height={asset.height}
                                 className={`object-contain rounded-lg ${isLandscape ? 'w-full' : 'h-full'}`}
                                 style={{ maxHeight: '60vh' }}
+                                sizes={EXPANDED_IMAGE_SIZES}
                                 priority
                             />
                         )}

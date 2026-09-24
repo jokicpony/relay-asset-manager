@@ -1,5 +1,6 @@
 'use client';
 
+import SyncActivity from './SyncActivity';
 import { useState, useEffect, useCallback, useRef } from 'react';
 
 interface SyncLog {
@@ -161,14 +162,28 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
         return () => document.removeEventListener('mousedown', handleClick);
     }, [onClose]);
 
-    // Close on Escape
+    // Escape unwinds one layer at a time: an open inline edit (config field,
+    // chip input, rights field, pending chip removal) is cancelled first, and
+    // only a second Escape closes the modal. Previously any Escape closed the
+    // whole panel and silently discarded the in-progress edit. Inline inputs
+    // that handle Escape themselves call preventDefault(), which this
+    // document-level listener sees because React dispatches at the root first.
+    const inlineEditActive = editingField !== null || editingRightsField !== null || pendingDelete !== null;
     useEffect(() => {
         function handleKey(e: KeyboardEvent) {
-            if (e.key === 'Escape') onClose();
+            if (e.key !== 'Escape' || e.defaultPrevented) return;
+            if (inlineEditActive) {
+                setEditingField(null);
+                setEditingRightsField(null);
+                setPendingDelete(null);
+                setChipAddValue('');
+                return;
+            }
+            onClose();
         }
         document.addEventListener('keydown', handleKey);
         return () => document.removeEventListener('keydown', handleKey);
-    }, [onClose]);
+    }, [onClose, inlineEditActive]);
 
     const handleSync = async () => {
         setSyncing(true);
@@ -656,6 +671,12 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                             )}
                         </div>
 
+                        {/* ── Recent activity: scheduled syncs + in-app ingests ── */}
+                        <div id="sync-activity">
+                            <SectionHeader title="Recent Activity" />
+                            <SyncActivity />
+                        </div>
+
                         {/* ── Section 2: Master Folders ── */}
                         <SectionHeader title="Master Folders" />
                         <div style={{
@@ -1032,7 +1053,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                                     placeholder={sensitive ? 'Paste ID...' : 'Enter value...'}
                                                                     onKeyDown={async e => {
                                                                         if (e.key === 'Enter' && chipAddValue.trim()) { await saveConfigField(key, [...items, chipAddValue.trim()]); setChipAddValue(''); }
-                                                                        else if (e.key === 'Escape') { setEditingField(null); setChipAddValue(''); }
+                                                                        else if (e.key === 'Escape') { e.preventDefault(); setEditingField(null); setChipAddValue(''); }
                                                                     }}
                                                                     style={{ flex: 1, padding: '5px 10px', borderRadius: 6, border: '1px solid var(--ram-border)', background: 'var(--ram-bg-primary)', color: 'var(--ram-text-primary)', fontSize: 12, fontFamily: 'monospace', outline: 'none' }}
                                                                     onFocus={e => e.currentTarget.style.borderColor = 'var(--ram-accent)'}
@@ -1152,7 +1173,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                                                     if (e.key === 'Enter') {
                                                                                         const updated = { ...rc, fieldIds: { ...rc.fieldIds, [key]: rightsFieldEditValue.trim() } };
                                                                                         saveRightsConfig(updated);
-                                                                                    } else if (e.key === 'Escape') setEditingRightsField(null);
+                                                                                    } else if (e.key === 'Escape') { e.preventDefault(); setEditingRightsField(null); }
                                                                                 }}
                                                                                 style={{ flex: 1, padding: '4px 8px', borderRadius: 5, border: '1px solid var(--ram-border)', background: 'var(--ram-bg-primary)', color: 'var(--ram-text-primary)', fontSize: 11, fontFamily: 'monospace', outline: 'none' }}
                                                                                 autoFocus
@@ -1218,6 +1239,10 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                         <div style={{ display: 'flex', gap: 4, marginTop: 8, alignItems: 'center' }}>
                                                             <input type="text" value={newChoiceKey} onChange={e => setNewChoiceKey(e.target.value)}
                                                                 placeholder="Choice ID"
+                                                                onKeyDown={e => {
+                                                                    // First Escape clears a half-typed ID rather than closing the panel
+                                                                    if (e.key === 'Escape' && newChoiceKey) { e.preventDefault(); setNewChoiceKey(''); }
+                                                                }}
                                                                 style={{ width: 100, padding: '4px 8px', borderRadius: 5, border: '1px solid var(--ram-border)', background: 'var(--ram-bg-primary)', color: 'var(--ram-text-primary)', fontSize: 10, fontFamily: 'monospace', outline: 'none' }}
                                                             />
                                                             <span style={{ color: 'var(--ram-text-tertiary)', fontSize: 11 }}>→</span>
@@ -1301,7 +1326,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                                             const allIds = rightsId ? [rightsId, ...extraLabels, chipAddValue.trim()] : [...extraLabels, chipAddValue.trim()];
                                                                             await saveConfigField('namer_label_ids', allIds);
                                                                             setChipAddValue('');
-                                                                        } else if (e.key === 'Escape') { setEditingField(null); setChipAddValue(''); }
+                                                                        } else if (e.key === 'Escape') { e.preventDefault(); setEditingField(null); setChipAddValue(''); }
                                                                     }}
                                                                     style={{ flex: 1, padding: '5px 10px', borderRadius: 6, border: '1px solid var(--ram-border)', background: 'var(--ram-bg-primary)', color: 'var(--ram-text-primary)', fontSize: 12, fontFamily: 'monospace', outline: 'none' }}
                                                                     onFocus={e => e.currentTarget.style.borderColor = 'var(--ram-accent)'}

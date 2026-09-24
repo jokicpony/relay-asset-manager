@@ -40,7 +40,7 @@ export default function FolderSidebar({
     // Load folder path → Drive folder ID mapping (persisted during sync)
     useEffect(() => {
         fetch('/api/folders/drive-ids')
-            .then(res => res.json())
+            .then(res => (res.ok ? res.json() : null))
             .then(data => { if (data && typeof data === 'object') setFolderDriveIds(data); })
             .catch(() => {}); // silent fail — feature degrades gracefully
     }, []);

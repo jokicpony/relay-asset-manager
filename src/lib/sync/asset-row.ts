@@ -13,7 +13,10 @@ import type { DriveFile } from './types';
  * No app-alias imports here: scripts import this module by relative path
  * under tsx, same as src/lib/filename-utils.
  */
-export function buildAssetRow(file: DriveFile): Record<string, unknown> {
+export function buildAssetRow(
+    file: DriveFile,
+    opts: { labelsFetched?: boolean } = {},
+): Record<string, unknown> {
     const row: Record<string, unknown> = {
         drive_file_id: file.id,
         name: file.name,
@@ -47,12 +50,13 @@ export function buildAssetRow(file: DriveFile): Record<string, unknown> {
         row.preview_url = file.webViewLink;
     }
 
-    // Only write rights columns if the caller actually fetched label data.
-    // When labels weren't requested/available these are null — omit them so
-    // the upsert preserves values set by the other sync path.
+    // Rights columns: when the caller fetched Drive Labels (both sync paths
+    // do whenever a rights label is configured), write them even when null —
+    // that's how a label removed in Drive gets cleared here. Without label
+    // data, omit them so the upsert preserves the stored values.
     const hasRightsData = file.organicRights !== null || file.paidRights !== null
         || file.organicRightsExpiration !== null || file.paidRightsExpiration !== null;
-    if (hasRightsData) {
+    if (opts.labelsFetched || hasRightsData) {
         row.organic_rights = file.organicRights;
         row.organic_rights_expiration = file.organicRightsExpiration;
         row.paid_rights = file.paidRights;
@@ -65,4 +69,26 @@ export function buildAssetRow(file: DriveFile): Record<string, unknown> {
     if (file.projectDescription !== null) row.project_description = file.projectDescription;
 
     return row;
+}
+
+/**
+ * Split upsert rows into groups that share the exact same set of columns.
+ *
+ * postgrest-js sends a bulk upsert with `columns` = the union of every row's
+ * keys, and fills a key a row lacks with NULL — so "omit the column to
+ * preserve it" silently NULLs that column whenever any other row in the same
+ * batch includes it. (This had been wiping custom video-frame thumbnail URLs
+ * on every other sync.) Upserting each group separately makes omission mean
+ * what the row-building code intends. Rows almost always share one shape,
+ * so this rarely adds a request.
+ */
+export function groupRowsByColumns(rows: Record<string, unknown>[]): Record<string, unknown>[][] {
+    const groups = new Map<string, Record<string, unknown>[]>();
+    for (const row of rows) {
+        const signature = Object.keys(row).sort().join(',');
+        let group = groups.get(signature);
+        if (!group) groups.set(signature, (group = []));
+        group.push(row);
+    }
+    return [...groups.values()];
 }

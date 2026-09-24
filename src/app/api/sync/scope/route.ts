@@ -12,6 +12,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { google } from 'googleapis';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { getConfig } from '@/lib/config';
+import { normalizeSyncFolders, isInSyncScope } from '@/lib/sync/scope';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { getAdminClient } from '@/lib/supabase/admin';
 import { logger } from '@/lib/logger';
@@ -35,7 +36,7 @@ export async function GET(request: NextRequest) {
 
     try {
         const config = await getConfig();
-        const syncFolders = config.syncFolders.map(f => f.toLowerCase());
+        const syncFolders = normalizeSyncFolders(config.syncFolders);
 
         // No sync folders configured = everything is in scope
         if (syncFolders.length === 0) {
@@ -57,8 +58,7 @@ export async function GET(request: NextRequest) {
             // Invert: check if our folderId appears as a value
             for (const [path, id] of Object.entries(folderIdMap)) {
                 if (id === folderId) {
-                    const topFolder = path.split('/').filter(Boolean)[0]?.toLowerCase() ?? '';
-                    const inScope = syncFolders.some(f => topFolder === f);
+                    const inScope = isInSyncScope(path, syncFolders);
                     return NextResponse.json({ inScope, folderPath: path, source: 'cache' });
                 }
             }
@@ -93,8 +93,7 @@ export async function GET(request: NextRequest) {
         }
 
         const folderPath = '/' + pathParts.join('/');
-        const topFolder = pathParts[0]?.toLowerCase() ?? '';
-        const inScope = syncFolders.some(f => topFolder === f);
+        const inScope = isInSyncScope(folderPath, syncFolders);
 
         return NextResponse.json({ inScope, folderPath, source: 'drive-api' });
 

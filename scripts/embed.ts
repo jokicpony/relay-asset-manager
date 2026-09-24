@@ -26,7 +26,7 @@
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 import { createClient } from '@supabase/supabase-js';
-import { buildEmbedText } from '../src/lib/embedding-text';
+import { embedAssets, writeEmbeddings, EMBED_MODEL, EMBED_DIMENSIONS, type EmbeddableAsset } from '../src/lib/sync/embedder';
 
 // ---------------------------------------------------------------------------
 // Load environment
@@ -36,13 +36,6 @@ dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY!;
-
-const GEMINI_EMBED_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2-preview:batchEmbedContents';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function log(msg: string) {
     const ts = new Date().toLocaleTimeString();
@@ -57,128 +50,9 @@ function progress(current: number, total: number, label: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Build embedding text from asset metadata
-// ---------------------------------------------------------------------------
-interface AssetRow {
-    id: string;
-    drive_file_id: string;
-    name: string;
-    description: string | null;
-    asset_type: string;
-    folder_path: string;
-    parsed_creator: string | null;
-    parsed_shoot_description: string | null;
-    organic_rights: string | null;
-    paid_rights: string | null;
-    thumbnail_url: string | null;
-}
-
-// Embedding text comes from the shared builder (src/lib/embedding-text) so
-// sync.ts and embed.ts produce identical document text for the same asset.
-const buildEmbeddingText = buildEmbedText;
-
-// ---------------------------------------------------------------------------
-// Download thumbnail from Supabase Storage as base64
-// ---------------------------------------------------------------------------
-/**
- * Detect actual image format from magic bytes.
- * Thumbnails are stored as .webp but may contain JPEG/PNG data.
- * Gemini Embedding 2 only accepts image/jpeg and image/png.
- */
-function detectMimeType(buffer: Buffer): string {
-    const hex = buffer.slice(0, 4).toString('hex');
-    if (hex.startsWith('ffd8')) return 'image/jpeg';
-    if (hex.startsWith('8950')) return 'image/png';
-    // WebP files start with RIFF header — Gemini doesn't accept these,
-    // but we can try sending as JPEG as a fallback (the API may still decode it)
-    return 'image/jpeg';
-}
-
-async function downloadThumbnailBase64(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    supabase: any,
-    driveFileId: string,
-    thumbnailUrl: string | null
-): Promise<{ base64: string; mimeType: string } | null> {
-    if (!thumbnailUrl) return null;
-
-    // Try custom thumbnail first, then standard
-    const paths = [
-        `custom_${driveFileId}.webp`,
-        `${driveFileId}.webp`,
-    ];
-
-    for (const filePath of paths) {
-        try {
-            const { data, error } = await supabase.storage
-                .from('thumbnails')
-                .download(filePath);
-
-            if (error || !data) continue;
-
-            const arrayBuffer = await data.arrayBuffer();
-            const buffer = Buffer.from(arrayBuffer);
-            const base64 = buffer.toString('base64');
-            const mimeType = detectMimeType(buffer);
-            return { base64, mimeType };
-        } catch {
-            continue;
-        }
-    }
-
-    return null;
-}
-
-// ---------------------------------------------------------------------------
-// Build a multimodal embedding request (text + optional image)
-// ---------------------------------------------------------------------------
-interface EmbedPart {
-    text?: string;
-    inline_data?: { mime_type: string; data: string };
-}
-
-function buildEmbedRequest(text: string, thumbnail: { base64: string; mimeType: string } | null) {
-    const parts: EmbedPart[] = [{ text }];
-
-    if (thumbnail) {
-        parts.push({
-            inline_data: {
-                mime_type: thumbnail.mimeType,
-                data: thumbnail.base64,
-            },
-        });
-    }
-
-    return {
-        model: 'models/gemini-embedding-2-preview',
-        content: { parts },
-        outputDimensionality: 768,
-    };
-}
-
-// ---------------------------------------------------------------------------
-// Call Gemini batch embed API (multimodal)
-// ---------------------------------------------------------------------------
-async function batchEmbed(
-    requests: ReturnType<typeof buildEmbedRequest>[]
-): Promise<number[][]> {
-    const res = await fetch(GEMINI_EMBED_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-        body: JSON.stringify({ requests }),
-    });
-
-    if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`Gemini API error (${res.status}): ${errText}`);
-    }
-
-    const data = await res.json();
-    return (data.embeddings as { values: number[] }[]).map((e) => e.values);
-}
-
-// ---------------------------------------------------------------------------
-// Main
+// Main — batching, retries, image handling and the Gemini call itself live
+// in the shared embedder (src/lib/sync/embedder), same as the sync's
+// re-embed step.
 // ---------------------------------------------------------------------------
 async function main() {
     const args = process.argv.slice(2);
@@ -191,7 +65,6 @@ async function main() {
     console.log('╚══════════════════════════════════════════════════════╝');
     console.log('');
 
-    // Validate config
     if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
         throw new Error('Missing Supabase config in .env.local');
     }
@@ -205,184 +78,55 @@ async function main() {
     const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
     const startTime = Date.now();
 
-    log(`🧠 Model: gemini-embedding-2-preview (multimodal)`);
-    log(`📐 Dimensions: 768 (Matryoshka)`);
+    log(`🧠 Model: ${EMBED_MODEL} (multimodal)`);
+    log(`📐 Dimensions: ${EMBED_DIMENSIONS} (Matryoshka)`);
     if (textOnly) log(`⚠️  Text-only mode — skipping thumbnail images`);
-
-    // Fetch assets needing embeddings
     log(forceAll ? '🔄 Force mode — re-embedding ALL assets' : '🔍 Finding assets without embeddings...');
 
-    // Fetch in pages (Supabase limit is 1000 per query)
-    const allAssets: AssetRow[] = [];
-    const PAGE_SIZE = 1000;
-    let offset = 0;
-    let hasMore = true;
-
-    while (hasMore) {
+    // Fetch in pages (PostgREST caps a select at 1000 rows)
+    const allAssets: EmbeddableAsset[] = [];
+    for (let from = 0; ; from += 1000) {
         let query = supabase
             .from('assets')
-            .select('id, drive_file_id, name, description, asset_type, folder_path, parsed_creator, parsed_shoot_description, organic_rights, paid_rights, thumbnail_url')
+            .select('id, drive_file_id, name, description, asset_type, folder_path, parsed_creator, parsed_shoot_description, thumbnail_url')
             .eq('is_active', true)
             .order('id')
-            .range(offset, offset + PAGE_SIZE - 1);
-
-        if (!forceAll) {
-            query = query.is('embedding', null);
-        }
+            .range(from, from + 999);
+        if (!forceAll) query = query.is('embedding', null);
 
         const { data, error } = await query;
         if (error) throw new Error(`Supabase query failed: ${error.message}`);
-
-        allAssets.push(...(data as AssetRow[]));
-        hasMore = data.length === PAGE_SIZE;
-        offset += PAGE_SIZE;
+        allAssets.push(...(data ?? []));
+        if (!data || data.length < 1000) break;
     }
 
     if (allAssets.length === 0) {
         log('✅ All assets already have embeddings! Nothing to do.');
         return;
     }
-
     log(`  Found ${allAssets.length} assets to embed`);
 
-    // Count assets with thumbnails for reporting
-    const withThumbnails = allAssets.filter(a => a.thumbnail_url && !a.thumbnail_url.includes('googleusercontent.com')).length;
-    log(`  📷 ${withThumbnails} have thumbnails available for multimodal embedding`);
-    log(`  📝 ${allAssets.length - withThumbnails} will use text-only embedding (no thumbnail)`);
-
-    // Process in batches of 20 (smaller than before due to larger payloads with images)
-    const BATCH_SIZE = 20;
-    let embedded = 0;
-    let withImage = 0;
-    let textOnlyCount = 0;
-    let errors = 0;
-
-    for (let i = 0; i < allAssets.length; i += BATCH_SIZE) {
-        const batch = allAssets.slice(i, i + BATCH_SIZE);
-
-        try {
-            // Build multimodal requests: text + thumbnail for each asset
-            const requests = await Promise.all(
-                batch.map(async (asset) => {
-                    const text = buildEmbeddingText(asset);
-
-                    let thumbnail: { base64: string; mimeType: string } | null = null;
-                    if (!textOnly && asset.thumbnail_url && !asset.thumbnail_url.includes('googleusercontent.com')) {
-                        thumbnail = await downloadThumbnailBase64(supabase, asset.drive_file_id, asset.thumbnail_url);
-                    }
-
-                    if (thumbnail) {
-                        withImage++;
-                    } else {
-                        textOnlyCount++;
-                    }
-
-                    return buildEmbedRequest(text, thumbnail);
-                })
-            );
-
-            const embeddings = await batchEmbed(requests);
-
-            // Update assets with embeddings in parallel (groups of 10)
-            const UPDATE_CONCURRENCY = 10;
-            for (let j = 0; j < batch.length; j += UPDATE_CONCURRENCY) {
-                const updateBatch = batch.slice(j, j + UPDATE_CONCURRENCY);
-                const results = await Promise.allSettled(
-                    updateBatch.map((asset, idx) =>
-                        supabase
-                            .from('assets')
-                            .update({ embedding: JSON.stringify(embeddings[j + idx]) })
-                            .eq('id', asset.id)
-                    )
-                );
-                for (const result of results) {
-                    if (result.status === 'fulfilled' && !result.value.error) {
-                        embedded++;
-                    } else {
-                        errors++;
-                    }
-                }
-            }
-        } catch (err) {
-            // Rate limit — back off and retry the whole batch
-            const message = err instanceof Error ? err.message : String(err);
-            if (message.includes('429')) {
-                log('\n  ⏳ Rate limited — waiting 30s...');
-                await sleep(30000);
-                i -= BATCH_SIZE; // retry this batch
-                // Reset image/text counters for retried batch
-                withImage -= batch.filter(a => a.thumbnail_url && !a.thumbnail_url.includes('googleusercontent.com')).length;
-                textOnlyCount -= batch.filter(a => !a.thumbnail_url || a.thumbnail_url.includes('googleusercontent.com')).length;
-                continue;
-            }
-
-            // Batch failed (likely a bad thumbnail) — retry each asset individually
-            log(`\n  ⚠️  Batch failed, retrying ${batch.length} assets individually...`);
-            for (const asset of batch) {
-                try {
-                    const text = buildEmbeddingText(asset);
-                    let thumbnail: { base64: string; mimeType: string } | null = null;
-                    if (!textOnly && asset.thumbnail_url && !asset.thumbnail_url.includes('googleusercontent.com')) {
-                        thumbnail = await downloadThumbnailBase64(supabase, asset.drive_file_id, asset.thumbnail_url);
-                    }
-
-                    const req = buildEmbedRequest(text, thumbnail);
-                    const singleRes = await batchEmbed([req]);
-
-                    // If multimodal fails, fall back to text-only
-                    if (!singleRes || singleRes.length === 0) throw new Error('Empty response');
-
-                    const { error: updateErr } = await supabase
-                        .from('assets')
-                        .update({ embedding: JSON.stringify(singleRes[0]) })
-                        .eq('id', asset.id);
-                    if (!updateErr) {
-                        embedded++;
-                        if (thumbnail) withImage++; else textOnlyCount++;
-                    } else {
-                        errors++;
-                    }
-                } catch {
-                    // Multimodal failed for this asset — try text-only
-                    try {
-                        const text = buildEmbeddingText(asset);
-                        const textReq = buildEmbedRequest(text, null);
-                        const textRes = await batchEmbed([textReq]);
-                        if (textRes && textRes.length > 0) {
-                            const { error: updateErr } = await supabase
-                                .from('assets')
-                                .update({ embedding: JSON.stringify(textRes[0]) })
-                                .eq('id', asset.id);
-                            if (!updateErr) {
-                                embedded++;
-                                textOnlyCount++;
-                                log(`    ↳ ${asset.name}: text-only fallback ✓`);
-                            } else {
-                                errors++;
-                            }
-                        }
-                    } catch (e2) {
-                        errors++;
-                        log(`    ↳ ${asset.name}: failed entirely — ${e2 instanceof Error ? e2.message : String(e2)}`);
-                    }
-                }
-                await sleep(200); // Small delay between individual retries
-            }
-        }
-
-        progress(Math.min(i + BATCH_SIZE, allAssets.length), allAssets.length, 'embedded');
-
-        // Small delay between batches to stay under rate limits
-        if (i + BATCH_SIZE < allAssets.length) {
-            await sleep(500);
-        }
-    }
+    // Each batch is written as soon as it's embedded — an interrupted run
+    // keeps its progress, and a re-run only picks up what's left.
+    let written = 0;
+    const writeFailed: string[] = [];
+    const result = await embedAssets(supabase, GEMINI_API_KEY, allAssets, {
+        withImages: !textOnly,
+        log: (m) => log(`  ⚠️  ${m}`),
+        onBatch: async (vectors) => {
+            const w = await writeEmbeddings(supabase, vectors);
+            written += w.written;
+            writeFailed.push(...w.failed);
+        },
+        onProgress: (done, total) => progress(done, total, 'embedded'),
+    });
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.log('');
-    log(`🎉 Embedding complete! ${embedded} assets embedded, ${errors} errors in ${elapsed}s`);
-    log(`   📷 ${withImage} with thumbnail (multimodal)`);
-    log(`   📝 ${textOnlyCount} text-only (no thumbnail available)`);
+    log(`🎉 Embedding complete! ${written} assets embedded, ${result.failed.length + writeFailed.length} errors in ${elapsed}s`);
+    log(`   📷 ${result.withImage} with thumbnail (multimodal)`);
+    log(`   📝 ${result.textOnly} text-only`);
+    if (result.failed.length > 0) log('   Re-run to retry the failures.');
     console.log('');
 }
 

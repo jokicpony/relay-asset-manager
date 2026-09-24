@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { getAdminClient } from '@/lib/supabase/admin';
+import { logger } from '@/lib/logger';
 
 /**
  * GET /api/folders/drive-ids
@@ -22,14 +23,18 @@ export async function GET() {
             .from('app_settings')
             .select('value')
             .eq('key', 'folder_drive_ids')
-            .single();
+            .maybeSingle();
 
-        if (error || !data?.value) {
-            return NextResponse.json({});
+        // A real failure is an error, not an empty mapping — an empty 200
+        // made every "Open in Google Drive" link silently disappear.
+        if (error) {
+            logger.error('folders', 'Failed to load folder_drive_ids', { error: error.message });
+            return NextResponse.json({ error: 'Failed to load folder mapping' }, { status: 500 });
         }
-
-        return NextResponse.json(data.value);
-    } catch {
-        return NextResponse.json({});
+        // No mapping yet (fresh install, before the first sync) is legitimately empty
+        return NextResponse.json(data?.value ?? {});
+    } catch (err) {
+        logger.error('folders', 'Failed to load folder_drive_ids', { error: String(err) });
+        return NextResponse.json({ error: 'Failed to load folder mapping' }, { status: 500 });
     }
 }

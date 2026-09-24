@@ -13,8 +13,13 @@ import { getConfig } from '@/lib/config';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import type { NamerFile } from '@/lib/namer/types';
+import { DRIVE_CALL_TIMEOUT_MS, namerErrorResponse } from '@/lib/namer/route-errors';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
+
+// Scope check (≤10s) + metadata (≤15s) + paged listing (≤30s in total)
+export const maxDuration = 60;
+const LISTING_TIMEOUT_MS = 30_000;
 
 export async function POST(request: NextRequest) {
     // Auth check
@@ -41,7 +46,7 @@ export async function POST(request: NextRequest) {
         // First check if it's a folder or a file
         const metaRes = await fetch(
             `${DRIVE_API}/files/${folderId}?fields=id,name,mimeType,parents,thumbnailLink,imageMediaMetadata,videoMediaMetadata&supportsAllDrives=true`,
-            { headers: { Authorization: `Bearer ${token}` } }
+            { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DRIVE_CALL_TIMEOUT_MS) }
         );
 
         if (!metaRes.ok) {
@@ -69,12 +74,20 @@ export async function POST(request: NextRequest) {
         // It's a folder — list all media files inside
         const files: NamerFile[] = [];
         let pageToken: string | undefined;
+        // One deadline across all pages, so a huge folder can't outrun maxDuration
+        const listingSignal = AbortSignal.timeout(LISTING_TIMEOUT_MS);
 
         do {
             const params = new URLSearchParams({
                 q: `'${folderId}' in parents and trashed = false`,
                 fields: 'nextPageToken,files(id,name,mimeType,parents,thumbnailLink,imageMediaMetadata,videoMediaMetadata,size,createdTime)',
                 pageSize: '1000',
+                // The namer's counter numbers files in list order, so the order
+                // must be predictable. name_natural matches what people see in
+                // Drive/Finder and keeps camera sequences (IMG_2 < IMG_10) in
+                // shooting order. createdTime was the alternative, but in Drive
+                // it's the upload time — parallel uploads scramble it.
+                orderBy: 'name_natural',
                 supportsAllDrives: 'true',
                 includeItemsFromAllDrives: 'true',
             });
@@ -82,6 +95,7 @@ export async function POST(request: NextRequest) {
 
             const listRes = await fetch(`${DRIVE_API}/files?${params}`, {
                 headers: { Authorization: `Bearer ${token}` },
+                signal: listingSignal,
             });
 
             if (!listRes.ok) {
@@ -115,8 +129,6 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ files });
 
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.error('namer-files', 'Unexpected error', { error: message });
-        return NextResponse.json({ error: message }, { status: 500 });
+        return namerErrorResponse('namer-files', err, 'Listing the Drive folder');
     }
 }

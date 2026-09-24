@@ -1,133 +1,20 @@
-import { google } from 'googleapis';
 import { logger } from '@/lib/logger';
 import { getAdminClient } from '@/lib/supabase/admin';
-import { encodeThumbnail, THUMBNAIL_MAX_PX } from './thumbnail-encode';
+import { generateThumbnails, type StoredThumbnail } from './thumbnails';
+
+export type { StoredThumbnail };
 
 /**
- * Thumbnail processor for the sync pipeline.
+ * Thumbnails for the in-app ingest (after a Namer batch). Thin wrapper over
+ * the shared pipeline in ./thumbnails, differing from the cron sync only in
+ * policy:
+ * - regenerates even if a thumbnail exists (re-ingest after a rename/move),
+ *   with versioned URLs so the image optimizer doesn't serve the old one;
+ * - falls back to the original image when Drive hasn't generated a
+ *   thumbnail yet (common right after upload);
+ * - never overwrites a user-set custom video frame.
  *
- * Strategy:
- * - Uses Drive API's authenticated `files.get?alt=media` for small files
- *   or `thumbnailLink` with `=s800` for larger ones
- * - Processes in small batches (5 at a time) with delays to avoid throttling
- * - Uploads to Supabase Storage `thumbnails` bucket
- * - Returns a permanent, public URL for each thumbnail
- *
- * Fallback chain:
- * 1. Drive API export (for Google-native formats)
- * 2. thumbnailLink with size parameter
- * 3. Skip (asset gets no thumbnail — won't crash the UI)
- */
-
-const BATCH_SIZE = 5;              // Concurrent downloads per batch
-const BATCH_DELAY_MS = 500;        // Delay between batches
-const SINGLE_RETRY_DELAY_MS = 1000; // Delay before retrying a failed download
-const MAX_RETRIES = 2;             // Retries per thumbnail
-
-interface ThumbnailResult {
-    driveFileId: string;
-    publicUrl: string | null;
-    error?: string;
-}
-
-/**
- * Download a thumbnail from Google Drive using the authenticated API.
- * Falls back through multiple strategies.
- */
-async function downloadThumbnail(
-    accessToken: string,
-    fileId: string,
-    thumbnailLink: string | null,
-    mimeType: string,
-    retryCount = 0
-): Promise<Buffer | null> {
-    // Strategy 1: Use thumbnailLink with size parameter (most reliable for images/videos)
-    if (thumbnailLink) {
-        try {
-            // Google's thumbnailLink supports size parameter: append =s800
-            const sizedUrl = thumbnailLink.replace(/=s\d+$/, '') + `=s${THUMBNAIL_MAX_PX}`;
-            const res = await fetch(sizedUrl, {
-                headers: { Authorization: `Bearer ${accessToken}` },
-            });
-
-            if (res.ok) {
-                const arrayBuffer = await res.arrayBuffer();
-                return Buffer.from(arrayBuffer);
-            }
-
-            // If 429 (rate limited), wait and retry
-            if (res.status === 429 && retryCount < MAX_RETRIES) {
-                const backoff = SINGLE_RETRY_DELAY_MS * Math.pow(2, retryCount);
-                logger.info('thumbnail', `Rate limited for ${fileId}, retrying in ${backoff}ms`);
-                await new Promise((r) => setTimeout(r, backoff));
-                return downloadThumbnail(accessToken, fileId, thumbnailLink, mimeType, retryCount + 1);
-            }
-        } catch (err) {
-            logger.warn('thumbnail', `thumbnailLink failed for ${fileId}`, { error: String(err) });
-        }
-    }
-
-    // Strategy 2: Direct file download via Drive API (for images only, not videos)
-    if (mimeType.startsWith('image/')) {
-        try {
-            const auth = new google.auth.OAuth2();
-            auth.setCredentials({ access_token: accessToken });
-            const drive = google.drive({ version: 'v3', auth });
-
-            const res = await drive.files.get(
-                { fileId, alt: 'media', supportsAllDrives: true },
-                { responseType: 'arraybuffer' }
-            );
-
-            return Buffer.from(res.data as ArrayBuffer);
-        } catch (err) {
-            logger.warn('thumbnail', `Direct download failed for ${fileId}`, { error: String(err) });
-        }
-    }
-
-    return null;
-}
-
-/**
- * Upload a thumbnail buffer to Supabase Storage.
- * Returns the public URL.
- */
-async function uploadToStorage(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    supabase: any,
-    fileId: string,
-    imageBuffer: Buffer
-): Promise<string | null> {
-    const filePath = `${fileId}.webp`;
-
-    const { error } = await supabase.storage
-        .from('thumbnails')
-        .upload(filePath, imageBuffer, {
-            contentType: 'image/webp',
-            upsert: true, // Overwrite if exists (re-sync scenario)
-        });
-
-    if (error) {
-        logger.error('thumbnail', `Upload failed for ${fileId}`, { error: error.message });
-        return null;
-    }
-
-    // Get the public URL
-    const { data } = supabase.storage
-        .from('thumbnails')
-        .getPublicUrl(filePath);
-
-    return data.publicUrl;
-}
-
-/**
- * Process thumbnails for a batch of Drive files.
- * Downloads from Drive, uploads to Supabase Storage.
- *
- * @param accessToken  Google OAuth access token
- * @param files        Array of { driveFileId, thumbnailLink, mimeType }
- * @param onProgress   Optional progress callback
- * @returns Map of driveFileId → public thumbnail URL
+ * @returns Map of driveFileId → stored thumbnail (public URL + placeholder colour)
  */
 export async function processThumbnails(
     accessToken: string,
@@ -136,17 +23,12 @@ export async function processThumbnails(
         thumbnailLink: string | null;
         mimeType: string;
     }>,
-    onProgress?: (processed: number, total: number) => void
-): Promise<Map<string, string>> {
+    /** Stop starting new thumbnails after this time (ms) — see the ingest route */
+    deadline?: number,
+): Promise<Map<string, StoredThumbnail>> {
     const supabase = getAdminClient();
-    const urlMap = new Map<string, string>();
-    let processed = 0;
 
-    // Pre-check: find assets that already have a user-set custom thumbnail
-    // (custom_{driveFileId}.webp). We must never overwrite these with an
-    // auto-generated thumbnail. Looked up in the DB for just these IDs — the
-    // previous full storage-bucket listing grew with the library and ran on
-    // every ingest request.
+    // Assets with a user-set custom frame (custom_{id}.webp) keep it.
     const customThumbnailIds = new Set<string>();
     const ids = files.map(f => f.driveFileId);
     for (let i = 0; i < ids.length; i += 150) {
@@ -162,68 +44,22 @@ export async function processThumbnails(
         for (const row of data ?? []) customThumbnailIds.add(row.drive_file_id);
     }
 
-    // Filter out files that already have a custom thumbnail
-    const filesToProcess = customThumbnailIds.size > 0
-        ? files.filter(f => !customThumbnailIds.has(f.driveFileId))
-        : files;
-
-    const skippedCustom = files.length - filesToProcess.length;
-    if (skippedCustom > 0) {
-        logger.info('thumbnail', `Skipping ${skippedCustom} assets with custom thumbnails`);
+    const toProcess = files
+        .filter(f => !customThumbnailIds.has(f.driveFileId))
+        .map(f => ({ id: f.driveFileId, thumbnailLink: f.thumbnailLink, mimeType: f.mimeType }));
+    if (customThumbnailIds.size > 0) {
+        logger.info('thumbnail', `Skipping ${customThumbnailIds.size} assets with custom thumbnails`);
     }
 
-    // Process in small batches to avoid throttling
-    for (let i = 0; i < filesToProcess.length; i += BATCH_SIZE) {
-        const batch = filesToProcess.slice(i, i + BATCH_SIZE);
+    const { stored, failed, deferred } = await generateThumbnails(supabase, accessToken, toProcess, {
+        concurrency: 5,
+        allowOriginal: true,
+        versioned: true,
+        maxRetries: 2, // inside a 120s route: fail fast, the cron retries later
+        deadline,
+    });
 
-        const results = await Promise.allSettled(
-            batch.map(async (file): Promise<ThumbnailResult> => {
-                try {
-                    const buffer = await downloadThumbnail(
-                        accessToken,
-                        file.driveFileId,
-                        file.thumbnailLink,
-                        file.mimeType
-                    );
-
-                    if (!buffer) {
-                        return { driveFileId: file.driveFileId, publicUrl: null, error: 'Download failed' };
-                    }
-
-                    // Normalize to a real, bounded WebP — the fallback above can
-                    // return a full-resolution original.
-                    const webp = await encodeThumbnail(buffer);
-                    if (!webp) {
-                        return { driveFileId: file.driveFileId, publicUrl: null, error: 'Undecodable image' };
-                    }
-
-                    const publicUrl = await uploadToStorage(supabase, file.driveFileId, webp);
-                    return { driveFileId: file.driveFileId, publicUrl };
-                } catch (err) {
-                    const msg = err instanceof Error ? err.message : 'Unknown error';
-                    return { driveFileId: file.driveFileId, publicUrl: null, error: msg };
-                }
-            })
-        );
-
-        // Collect results
-        for (const result of results) {
-            if (result.status === 'fulfilled' && result.value.publicUrl) {
-                urlMap.set(result.value.driveFileId, result.value.publicUrl);
-            }
-        }
-
-        processed += batch.length;
-        if (onProgress) {
-            onProgress(processed, filesToProcess.length);
-        }
-
-        // Delay between batches to avoid rate limits
-        if (i + BATCH_SIZE < filesToProcess.length) {
-            await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
-        }
-    }
-
-    logger.info('thumbnail', `Processed ${urlMap.size}/${filesToProcess.length} thumbnails successfully${skippedCustom > 0 ? ` (${skippedCustom} custom skipped)` : ''}`);
-    return urlMap;
+    logger.info('thumbnail', `Processed ${stored.size}/${toProcess.length} thumbnails`
+        + `${failed > 0 ? ` (${failed} failed)` : ''}${deferred > 0 ? ` (${deferred} deferred to the next sync)` : ''}`);
+    return stored;
 }

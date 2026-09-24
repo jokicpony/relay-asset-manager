@@ -17,6 +17,10 @@ import { getDriveAccessToken } from '@/lib/google/auth';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import { getConfig } from '@/lib/config';
+import { DRIVE_CALL_TIMEOUT_MS, namerErrorResponse } from '@/lib/namer/route-errors';
+
+// Label fetches run in parallel, each ≤15s
+export const maxDuration = 30;
 
 const LABELS_API = 'https://drivelabels.googleapis.com/v2/labels';
 
@@ -45,6 +49,7 @@ export async function GET() {
                 const url = `${LABELS_API}/${labelId}?view=LABEL_VIEW_FULL`;
                 const res = await fetch(url, {
                     headers: { Authorization: `Bearer ${token}` },
+                    signal: AbortSignal.timeout(DRIVE_CALL_TIMEOUT_MS),
                 });
                 if (!res.ok) {
                     const errBody = await res.text();
@@ -71,8 +76,6 @@ export async function GET() {
         return NextResponse.json({ labels });
 
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.error('namer-labels', 'Unexpected error', { error: message });
-        return NextResponse.json({ error: message }, { status: 500 });
+        return namerErrorResponse('namer-labels', err, 'Fetching Drive labels');
     }
 }

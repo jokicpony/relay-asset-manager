@@ -47,3 +47,6 @@ next-env.d.ts
 
 # thumbnail re-encode backups (scripts/reencode-thumbnails.ts)
 /.thumb-backup/
+
+# sync dry-run plans (baseline comparisons) — contain asset metadata
+/.sync-plans/

@@ -16,16 +16,22 @@ import { isInSharedDrive } from '@/lib/google/drive-scope';
 import { getConfig } from '@/lib/config';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
+import { namerErrorResponse } from '@/lib/namer/route-errors';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const MAX_RETRIES = 5;
 const RETRY_DELAY_MS = 2000;
+
+// Scope check (≤10s) + modifyLabels with retries (≤40s in total)
+export const maxDuration = 60;
+const APPLY_TIMEOUT_MS = 40_000;
 
 async function applyLabelWithRetry(
     token: string,
     fileId: string,
     labelId: string,
     fieldValues: Record<string, { value: string | string[]; type: string }>,
+    signal: AbortSignal,
     retriesLeft: number = MAX_RETRIES
 ): Promise<Response> {
     // Build field modifications
@@ -94,16 +100,17 @@ async function applyLabelWithRetry(
             'Content-Type': 'application/json',
         },
         body: JSON.stringify(requestBody),
+        signal,
     });
 
-    // Retry on transient errors
-    if (!res.ok && retriesLeft > 0 && (res.status === 403 || res.status === 429)) {
+    // Retry on transient errors (the shared deadline still bounds the loop)
+    if (!res.ok && retriesLeft > 0 && !signal.aborted && (res.status === 403 || res.status === 429)) {
         const retryBody = await res.text();
         logger.warn('namer-labels-apply', `Retry applyLabel ${labelId} on ${fileId} (${retriesLeft - 1} left) status=${res.status}`, {
             errorBody: retryBody,
         });
         await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
-        return applyLabelWithRetry(token, fileId, labelId, fieldValues, retriesLeft - 1);
+        return applyLabelWithRetry(token, fileId, labelId, fieldValues, signal, retriesLeft - 1);
     }
 
     return res;
@@ -136,7 +143,9 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: 'File is outside the configured shared drive' }, { status: 403 });
         }
 
-        const res = await applyLabelWithRetry(token, fileId, labelId, fieldValues || {});
+        const res = await applyLabelWithRetry(
+            token, fileId, labelId, fieldValues || {}, AbortSignal.timeout(APPLY_TIMEOUT_MS)
+        );
 
         if (!res.ok) {
             const errBody = await res.text();
@@ -152,8 +161,6 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(result);
 
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.error('namer-labels-apply', 'Unexpected error', { error: message });
-        return NextResponse.json({ error: message }, { status: 500 });
+        return namerErrorResponse('namer-labels-apply', err, 'Applying the Drive label');
     }
 }

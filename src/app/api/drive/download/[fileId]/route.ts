@@ -64,7 +64,7 @@ export async function GET(
         const headers = new Headers();
         const contentType = driveRes.headers.get('content-type') || 'application/octet-stream';
         headers.set('Content-Type', contentType);
-        headers.set('Content-Disposition', `attachment; filename="${encodeURIComponent(name)}"`);
+        headers.set('Content-Disposition', contentDisposition(name));
 
         const contentLength = driveRes.headers.get('content-length');
         if (contentLength) headers.set('Content-Length', contentLength);
@@ -74,4 +74,17 @@ export async function GET(
         logger.error('download-stream', 'Stream error', { error: String(err), fileId });
         return NextResponse.json({ error: 'Failed to download file' }, { status: 500 });
     }
+}
+
+/**
+ * RFC 6266 attachment header. `name` comes from the request, so the plain
+ * `filename` is reduced to safe printable ASCII (no quotes, backslashes or
+ * control characters — nothing that could break out of the header), and
+ * `filename*` carries the real UTF-8 name. The old percent-encoded
+ * `filename="…"` made browsers save "My%20Photo.jpg".
+ */
+function contentDisposition(name: string): string {
+    const ascii = name.normalize('NFKD').replace(/[^\x20-\x7e]/g, '').replace(/["\\]/g, '_').trim() || 'download';
+    const utf8 = encodeURIComponent(name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+    return `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`;
 }

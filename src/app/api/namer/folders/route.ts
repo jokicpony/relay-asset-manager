@@ -12,8 +12,12 @@ import { isInSharedDrive } from '@/lib/google/drive-scope';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import { getConfig } from '@/lib/config';
+import { DRIVE_CALL_TIMEOUT_MS, namerErrorResponse } from '@/lib/namer/route-errors';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
+
+// Scope check (≤10s) + one Drive call (≤15s)
+export const maxDuration = 30;
 
 export async function GET(request: NextRequest) {
     const supabase = await createServerClient();
@@ -36,7 +40,7 @@ export async function GET(request: NextRequest) {
             }
             const res = await fetch(
                 `${DRIVE_API}/files/${folderId}?fields=id,name,mimeType&supportsAllDrives=true`,
-                { headers: { Authorization: `Bearer ${token}` } }
+                { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DRIVE_CALL_TIMEOUT_MS) }
             );
             if (!res.ok) {
                 return NextResponse.json({ error: `Drive API error: ${res.status}` }, { status: res.status });
@@ -68,6 +72,7 @@ export async function GET(request: NextRequest) {
 
         const res = await fetch(`${DRIVE_API}/files?${params}`, {
             headers: { Authorization: `Bearer ${token}` },
+            signal: AbortSignal.timeout(DRIVE_CALL_TIMEOUT_MS),
         });
 
         if (!res.ok) {
@@ -80,8 +85,6 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({ folders: data.files || [] });
 
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.error('namer-folders', 'Unexpected error', { error: message });
-        return NextResponse.json({ error: message }, { status: 500 });
+        return namerErrorResponse('namer-folders', err, 'Drive folder lookup');
     }
 }

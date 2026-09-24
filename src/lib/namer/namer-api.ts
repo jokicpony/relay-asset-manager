@@ -22,8 +22,17 @@ import type {
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     const res = await fetch(url, init);
     if (!res.ok) {
+        // Routes answer `{ error }` — surface that sentence (it's shown to the
+        // user in the queue), not the raw JSON body.
         const body = await res.text();
-        throw new Error(`API error ${res.status}: ${body}`);
+        let message = body;
+        try {
+            const parsed = JSON.parse(body) as { error?: unknown };
+            if (typeof parsed.error === 'string' && parsed.error) message = parsed.error;
+        } catch {
+            // Not JSON (e.g. a platform timeout page) — keep the raw text
+        }
+        throw new Error(`${message.slice(0, 300) || res.statusText} (HTTP ${res.status})`);
     }
     return res.json();
 }

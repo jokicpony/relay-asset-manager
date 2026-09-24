@@ -89,6 +89,15 @@ async function loadStaleFromServer(): Promise<PendingIngest[]> {
     }
 }
 
+/**
+ * An entry is identified by batchId + scheduledAt: re-scheduling a batch
+ * (namer "Retry failed") replaces its entry, and a still-running fire of the
+ * old entry must not overwrite the new one's status.
+ */
+function isSame(p: PendingIngest, ingest: PendingIngest): boolean {
+    return p.batchId === ingest.batchId && p.scheduledAt === ingest.scheduledAt;
+}
+
 // ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
@@ -97,13 +106,17 @@ export function useDeferredIngest(defaultDelayMs: number = 300000) {
     const [ingests, setIngests] = useState<PendingIngest[]>([]);
     const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
     const initializedRef = useRef(false);
+    // Latest ingests, for scheduleIngest's merge (it must not read state
+    // through a setState updater — those have to stay pure).
+    const ingestsRef = useRef<PendingIngest[]>([]);
+    useEffect(() => { ingestsRef.current = ingests; }, [ingests]);
 
     // ── Fire the actual ingest ──
     const fireIngest = useCallback(async (ingest: PendingIngest) => {
         // Mark as firing
         setIngests(prev => {
             const updated = prev.map(p =>
-                p.batchId === ingest.batchId ? { ...p, status: 'firing' as const } : p
+                isSame(p, ingest) ? { ...p, status: 'firing' as const } : p
             );
             saveToStorage(updated);
             return updated;
@@ -128,7 +141,7 @@ export function useDeferredIngest(defaultDelayMs: number = 300000) {
             // Mark complete
             setIngests(prev => {
                 const updated = prev.map(p =>
-                    p.batchId === ingest.batchId
+                    isSame(p, ingest)
                         ? {
                             ...p,
                             status: 'complete' as const,
@@ -153,13 +166,16 @@ export function useDeferredIngest(defaultDelayMs: number = 300000) {
                 }));
             }
 
-            // Clean up server-side pending record
-            removeFromServer(ingest.batchId);
+            // Clean up server-side pending record — unless the batch was
+            // re-scheduled meanwhile (that newer record must survive)
+            if (!ingestsRef.current.some(p => p.batchId === ingest.batchId && p.scheduledAt !== ingest.scheduledAt)) {
+                removeFromServer(ingest.batchId);
+            }
         } catch (err) {
             const message = err instanceof Error ? err.message : 'Unknown error';
             setIngests(prev => {
                 const updated = prev.map(p =>
-                    p.batchId === ingest.batchId
+                    isSame(p, ingest)
                         ? {
                             ...p,
                             status: 'error' as const,
@@ -172,8 +188,10 @@ export function useDeferredIngest(defaultDelayMs: number = 300000) {
             });
         }
 
-        // Clean up timer reference
-        timersRef.current.delete(ingest.batchId);
+        // Clean up timer reference (only if it's still this entry's timer)
+        if (!ingestsRef.current.some(p => p.batchId === ingest.batchId && p.scheduledAt !== ingest.scheduledAt)) {
+            timersRef.current.delete(ingest.batchId);
+        }
     }, []);
 
     // ── Start a timer for a pending ingest ──
@@ -264,20 +282,31 @@ export function useDeferredIngest(defaultDelayMs: number = 300000) {
         const delay = delayMs ?? defaultDelayMs;
         const now = Date.now();
 
+        // Scheduling a batch that already has an entry (namer "Retry failed")
+        // replaces it. The entry's files are folded in unless its ingest
+        // already completed — a pending, firing or failed entry still owes
+        // those files an ingest, and replacing it would drop them.
+        const existing = ingestsRef.current.find(p => p.batchId === batchId);
+        const mergedIds = existing && existing.status !== 'complete' && existing.status !== 'cancelled'
+            ? [...new Set([...existing.fileIds, ...fileIds])]
+            : fileIds;
+
         const ingest: PendingIngest = {
             batchId,
-            fileIds,
+            fileIds: mergedIds,
             destFolderId,
-            scheduledAt: now,
+            // Strictly newer than the entry it replaces (see isSame)
+            scheduledAt: existing && existing.scheduledAt >= now ? existing.scheduledAt + 1 : now,
             firesAt: now + delay,
             status: 'pending',
         };
 
         setIngests(prev => {
-            const updated = [...prev, ingest];
+            const updated = [...prev.filter(p => p.batchId !== batchId), ingest];
             saveToStorage(updated);
             return updated;
         });
+        ingestsRef.current = [...ingestsRef.current.filter(p => p.batchId !== batchId), ingest];
 
         // Start client-side timer
         startTimer(ingest);

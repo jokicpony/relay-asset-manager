@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { thumbnailColor } from '@/lib/sync/thumbnail-encode';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { getAdminClient } from '@/lib/supabase/admin';
 import { logger } from '@/lib/logger';
@@ -73,12 +74,15 @@ export async function POST(request: NextRequest) {
             .from('thumbnails')
             .getPublicUrl(filePath);
 
-        const publicUrl = urlData.publicUrl;
+        // Version the URL: the object is overwritten in place, so without a
+        // changing query string the Supabase CDN, the Next image optimizer
+        // and browsers would keep serving the previous frame.
+        const publicUrl = `${urlData.publicUrl}?v=${Date.now()}`;
 
         // Update the asset's thumbnail_url in the database
         const { error: updateError } = await supabase
             .from('assets')
-            .update({ thumbnail_url: publicUrl })
+            .update({ thumbnail_url: publicUrl, thumb_color: await thumbnailColor(buffer) })
             .eq('drive_file_id', driveFileId);
 
         if (updateError) {

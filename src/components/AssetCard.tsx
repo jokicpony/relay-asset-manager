@@ -12,6 +12,17 @@ import Image from 'next/image';
 const ROW_UNIT = 10;
 const CARD_GAP = 12; // must match .masonry-item margin-bottom in globals.css
 
+/** `sizes` for grid thumbnails (one card = one grid column). */
+export const GRID_IMAGE_SIZES = '(max-width: 480px) 100vw, (max-width: 768px) 50vw, (max-width: 1280px) 33vw, 25vw';
+
+/**
+ * `sizes` for the expanded view. Resolves to the 828w (1x) or 1920w (2x)
+ * candidate — both return the full ≤800px stored thumbnail — so every open
+ * of an asset maps to one of two stable optimizer URLs (shared across users
+ * and cached for 30 days) instead of a per-asset 3840w request.
+ */
+export const EXPANDED_IMAGE_SIZES = '800px';
+
 interface AssetCardProps {
     asset: Asset;
     selected: boolean;
@@ -23,9 +34,11 @@ interface AssetCardProps {
     isPinned?: boolean;
     onTogglePin?: (id: string) => void;
     colWidth?: number;
+    /** Above the fold: skip lazy-loading and fetch at high priority. */
+    eager?: boolean;
 }
 
-const AssetCard = memo(function AssetCard({ asset, selected, isExpired, similarity, textMatch, onSelect, onExpand, isPinned, onTogglePin, colWidth = 300 }: AssetCardProps) {
+const AssetCard = memo(function AssetCard({ asset, selected, isExpired, similarity, textMatch, onSelect, onExpand, isPinned, onTogglePin, colWidth = 300, eager = false }: AssetCardProps) {
     const [orgBadge, paidBadge] = getComplianceBadges(asset);
     const isVideo = asset.assetType === 'video';
     const creator = resolveCreator(asset);
@@ -75,7 +88,7 @@ const AssetCard = memo(function AssetCard({ asset, selected, isExpired, similari
     return (
         <div
             className={`asset-card masonry-item ${selected ? 'selected' : ''} ${isExpired ? 'expired-dimmed' : ''}`}
-            style={{ gridRow: `span ${rowSpan}` }}
+            style={{ gridRow: `span ${rowSpan}`, backgroundColor: asset.thumbColor }}
             onClick={handleClick}
         >
             {/* Selection checkbox */}
@@ -120,8 +133,14 @@ const AssetCard = memo(function AssetCard({ asset, selected, isExpired, similari
                 // Fill the card: the row span rounds up to 10px units, so a
                 // natural-height image would leave a sliver of background.
                 className="w-full h-full object-cover block"
-                sizes="(max-width: 480px) 100vw, (max-width: 768px) 50vw, (max-width: 1280px) 33vw, 25vw"
-                loading="lazy"
+                sizes={GRID_IMAGE_SIZES}
+                loading={eager ? 'eager' : 'lazy'}
+                fetchPriority={eager ? 'high' : 'auto'}
+                decoding="async"
+                // Fade in once decoded instead of popping over the grey card
+                onLoad={(e) => { e.currentTarget.dataset.loaded = 'true'; }}
+                // Reveal on error too, so a broken image shows its alt text
+                onError={(e) => { e.currentTarget.dataset.loaded = 'true'; }}
             />
 
             {/* Video indicator */}

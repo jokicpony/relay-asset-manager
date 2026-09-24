@@ -67,6 +67,11 @@ export default function FolderPickerModal({
     const [creatingFolder, setCreatingFolder] = useState(false);
     const [newFolderName, setNewFolderName] = useState('');
     const [createError, setCreateError] = useState<string | null>(null);
+    // A ref (not just state) guards the POST: a fast double-click or
+    // Enter+click lands both handlers before a state update re-renders the
+    // disabled button, which used to create duplicate Drive folders.
+    const createInFlightRef = useRef(false);
+    const [submittingFolder, setSubmittingFolder] = useState(false);
 
     // Relay progress
     const [relaying, setRelaying] = useState(false);
@@ -119,27 +124,39 @@ export default function FolderPickerModal({
 
         setSearching(true);
 
+        // Each query gets its own controller; the cleanup below aborts it when
+        // the user types further, clears the box, or navigates. Without this a
+        // slow earlier response could land after a newer one (or after
+        // returning to browse mode) and overwrite the visible results.
+        const controller = new AbortController();
+
         if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
         searchTimerRef.current = setTimeout(async () => {
             try {
                 const res = await fetch(
-                    `/api/drive/folders?search=${encodeURIComponent(searchQuery.trim())}`
+                    `/api/drive/folders?search=${encodeURIComponent(searchQuery.trim())}`,
+                    { signal: controller.signal }
                 );
                 if (!res.ok) {
                     const data = await res.json().catch(() => ({}));
                     throw new Error(data.error || `HTTP ${res.status}`);
                 }
                 const data = await res.json();
+                // Belt-and-braces: the body can finish parsing in the same
+                // tick the effect is torn down, before the abort is observed.
+                if (controller.signal.aborted) return;
                 setSearchResults(data.folders || []);
             } catch (err) {
+                if (controller.signal.aborted) return; // superseded — not an error
                 logger.error('folder-picker-modal', 'Folder search error', { error: err instanceof Error ? err.message : String(err) });
                 setSearchResults([]);
             } finally {
-                setSearching(false);
+                if (!controller.signal.aborted) setSearching(false);
             }
         }, 350);
 
         return () => {
+            controller.abort();
             if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
         };
     }, [searchQuery]);
@@ -164,7 +181,9 @@ export default function FolderPickerModal({
     }, [recentFolders, onRecentFoldersChange]);
 
     const handleCreateFolder = async () => {
-        if (!newFolderName.trim()) return;
+        if (!newFolderName.trim() || createInFlightRef.current) return;
+        createInFlightRef.current = true;
+        setSubmittingFolder(true);
         setCreateError(null);
         try {
             const res = await fetch('/api/drive/folders', {
@@ -188,6 +207,9 @@ export default function FolderPickerModal({
             setBreadcrumbs((prev) => [...prev, { id: created.id, name: created.name }]);
         } catch (err) {
             setCreateError(err instanceof Error ? err.message : 'Failed to create folder');
+        } finally {
+            createInFlightRef.current = false;
+            setSubmittingFolder(false);
         }
     };
 
@@ -676,26 +698,29 @@ export default function FolderPickerModal({
                                         type="text"
                                         value={newFolderName}
                                         onChange={(e) => setNewFolderName(e.target.value)}
-                                        onKeyDown={(e) => { if (e.key === 'Enter') handleCreateFolder(); if (e.key === 'Escape') setCreatingFolder(false); }}
+                                        onKeyDown={(e) => { if (e.key === 'Enter') handleCreateFolder(); if (e.key === 'Escape' && !submittingFolder) setCreatingFolder(false); }}
                                         placeholder="Folder name"
                                         autoFocus
+                                        readOnly={submittingFolder}
                                         className="flex-1 bg-transparent text-sm outline-none"
                                         style={{ color: 'var(--ram-text-primary)' }}
                                     />
                                 </div>
                                 <button
                                     onClick={handleCreateFolder}
-                                    disabled={!newFolderName.trim()}
+                                    disabled={!newFolderName.trim() || submittingFolder}
                                     className="px-3 py-2 rounded-lg text-xs font-medium transition-all"
                                     style={{
-                                        background: newFolderName.trim() ? 'var(--ram-accent)' : 'var(--ram-bg-tertiary)',
-                                        color: newFolderName.trim() ? 'var(--ram-bg-primary)' : 'var(--ram-text-tertiary)',
+                                        background: newFolderName.trim() && !submittingFolder ? 'var(--ram-accent)' : 'var(--ram-bg-tertiary)',
+                                        color: newFolderName.trim() && !submittingFolder ? 'var(--ram-bg-primary)' : 'var(--ram-text-tertiary)',
+                                        cursor: submittingFolder ? 'wait' : undefined,
                                     }}
                                 >
-                                    Create
+                                    {submittingFolder ? 'Creating…' : 'Create'}
                                 </button>
                                 <button
                                     onClick={() => { setCreatingFolder(false); setNewFolderName(''); setCreateError(null); }}
+                                    disabled={submittingFolder}
                                     className="p-2 rounded-lg hover:bg-[var(--ram-bg-hover)] transition-colors"
                                 >
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--ram-text-tertiary)" strokeWidth="2">

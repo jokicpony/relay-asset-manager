@@ -41,3 +41,29 @@ export function buildEmbedText(asset: EmbeddableAssetRow): string {
 
     return parts.join(' | ');
 }
+
+/** The stored columns an asset's embedding text is built from. */
+export interface EmbedInputs {
+    name: string;
+    description: string | null;
+    folder_path: string | null;
+    parsed_creator: string | null;
+    parsed_shoot_description: string | null;
+}
+
+/** Columns to select when checking embedding staleness (see embedInputsChanged). */
+export const EMBED_INPUT_COLUMNS = 'name, description, folder_path, parsed_creator, parsed_shoot_description';
+
+/**
+ * Whether an asset's embedding is stale: any field buildEmbedText reads has
+ * changed. (asset_type is fixed per file.) Used by the cron's re-embed step
+ * and the in-app ingest — both must agree, or a change one path makes is
+ * never re-embedded by the other.
+ */
+export function embedInputsChanged(before: EmbedInputs, after: EmbedInputs): boolean {
+    return before.name !== after.name
+        || (before.description ?? null) !== (after.description ?? null)
+        || (before.folder_path ?? null) !== (after.folder_path ?? null)
+        || (before.parsed_creator ?? null) !== (after.parsed_creator ?? null)
+        || (before.parsed_shoot_description ?? null) !== (after.parsed_shoot_description ?? null);
+}

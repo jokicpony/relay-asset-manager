@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { resolveFolderPathById } from '@/lib/google/folder-path';
+import { isInSharedDrive, DriveScopeUnavailableError } from '@/lib/google/drive-scope';
 import { getConfig } from '@/lib/config';
 import { logger } from '@/lib/logger';
 
@@ -30,6 +31,10 @@ export async function GET(request: NextRequest) {
 
         const accessToken = await getDriveAccessToken();
         const config = await getConfig();
+        // Only resolve names for folders inside the library's shared drive
+        if (!(await isInSharedDrive(accessToken, folderId, config.sharedDriveId))) {
+            return NextResponse.json({ error: 'Folder is outside the shared drive' }, { status: 403 });
+        }
         const { path, breadcrumbs } = await resolveFolderPathById(
             accessToken,
             folderId,
@@ -38,6 +43,11 @@ export async function GET(request: NextRequest) {
 
         return NextResponse.json({ path, breadcrumbs });
     } catch (err) {
+        if (err instanceof DriveScopeUnavailableError) {
+            // Drive couldn't confirm the folder is in the shared drive (rate
+            // limit / outage) — retryable, not a permissions problem
+            return NextResponse.json({ error: err.message }, { status: 503 });
+        }
         logger.error('drive', 'Folder path resolution error', { error: String(err) });
         return NextResponse.json({ error: 'Failed to resolve folder path' }, { status: 500 });
     }

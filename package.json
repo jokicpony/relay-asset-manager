@@ -10,13 +10,15 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "sync": "npx tsx scripts/sync.ts",
-    "embed": "npx tsx scripts/embed.ts"
+    "sync": "tsx scripts/sync.ts",
+    "embed": "tsx scripts/embed.ts",
+    "test": "node --import tsx --test 'tests/**/*.test.ts'"
   },
   "dependencies": {
     "@supabase/ssr": "^0.8.0",
     "@supabase/supabase-js": "^2.95.3",
     "@vercel/oidc": "^3.2.0",
+    "client-zip": "^2.5.1",
     "dotenv": "^17.2.4",
     "google-auth-library": "^10.6.1",
     "googleapis": "^171.4.0",
@@ -33,6 +35,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5"
   }
 }

@@ -15,6 +15,10 @@ on:
         description: 'Allow trashing a large number of missing assets (only for a real bulk deletion)'
         type: boolean
         default: false
+      dry_run:
+        description: 'Dry run — read everything, write nothing; the planned changes are uploaded as an artifact'
+        type: boolean
+        default: false
 
 permissions:
   id-token: write   # Required for WIF OIDC token
@@ -53,7 +57,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install dependencies
         run: npm ci
@@ -75,4 +79,29 @@ jobs:
           if [ "${{ inputs.allow_mass_orphan }}" = "true" ]; then
             FLAGS="$FLAGS --allow-mass-orphan"
           fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            FLAGS="$FLAGS --dry-run --dry-run-out=sync-plan.json"
+          fi
           npx tsx scripts/sync.ts $FLAGS
+
+      # Failed, cancelled or timed-out runs: make sure the run is recorded in
+      # sync_logs (the sync's own crash handler can't run if the job is
+      # killed). No-op if the sync already wrote a row for this run.
+      - name: Record failed run
+        if: ${{ (failure() || cancelled()) && !inputs.dry_run }}
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          JOB_STATUS: ${{ job.status }}
+        run: npx tsx scripts/record-sync-failure.ts
+
+      # Dry runs only: the planned changes, for review or for diffing two
+      # versions of the sync against the same data. Contains asset metadata —
+      # kept briefly, and only in this (private) repository.
+      - name: Upload dry-run plan
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-plan-${{ github.sha }}
+          path: sync-plan.json
+          retention-days: 3

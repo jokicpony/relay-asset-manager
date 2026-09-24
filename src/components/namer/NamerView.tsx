@@ -9,9 +9,26 @@ import type {
     SchemaField,
     DriveLabel,
     AIMetadata,
+    BatchInfo,
+    BatchFile,
+    BatchStep,
+    LabelFieldValue,
 } from '@/lib/namer/types';
 import { PASSTHROUGH_SCHEMA_KEY } from '@/lib/namer/types';
-import { sanitizeNameToken } from '@/lib/namer/name-token';
+import {
+    buildProposedName,
+    counterTokenIndex,
+    dedupeName,
+    findFreeCounterStart,
+} from '@/lib/namer/naming';
+import {
+    batchProgress,
+    hiddenSourceFileIds,
+    isMoved,
+    isRetryable,
+    revertTargets,
+    statusOnCancel,
+} from '@/lib/namer/batch-utils';
 import SchemaSelector from './SchemaSelector';
 import FolderPicker from './FolderPicker';
 import NamingBuilder from './NamingBuilder';
@@ -19,7 +36,6 @@ import LabelSelector from './LabelSelector';
 import FilePreviewTable from './FilePreviewTable';
 import type { PreviewViewMode, TileSize } from './FilePreviewTable';
 import NamerQueue from './NamerQueue';
-import type { BatchInfo } from './NamerQueue';
 import NamerSettingsPanel from './NamerSettings';
 import BatchConfirmModal from './BatchConfirmModal';
 import { useDeferredIngest } from '@/hooks/useDeferredIngest';
@@ -27,6 +43,12 @@ import { useDeferredIngest } from '@/hooks/useDeferredIngest';
 // LocalStorage keys for the file-preview view preference
 const LS_PREVIEW_VIEW = 'ram_namer_preview_view';
 const LS_TILE_SIZE = 'ram_namer_tile_size';
+
+const errMessage = (err: unknown) => err instanceof Error ? err.message : String(err);
+
+/** Batches the header's Clear Completed removes (nothing left to run). */
+const isClearable = (b: BatchInfo) =>
+    b.status === 'completed' || b.status === 'reverted' || b.status === 'revert-failed';
 
 // ---------------------------------------------------------------------------
 // NamerView — Top-level orchestrator for the Ingest workflow.
@@ -75,15 +97,28 @@ export default function NamerView() {
     }, [isProcessing]);
     const processingRef = useRef(false);
     const batchFileIdsRef = useRef<Set<string>>(new Set());
+    // Batch IDs whose Cancel was clicked — the runner checks before each file
+    const cancelRequestsRef = useRef<Set<string>>(new Set());
 
-    // Keep batchFileIdsRef in sync so loadFiles can filter without re-creating
+    // Keep batchFileIdsRef in sync so loadFiles can filter without re-creating.
+    // Only files a batch still owns are hidden; cancelled and reverted files
+    // reappear in the source list (see hiddenSourceFileIds).
     useEffect(() => {
-        const ids = new Set<string>();
-        for (const b of batches) {
-            for (const f of b.files) ids.add(f.id);
-        }
-        batchFileIdsRef.current = ids;
+        batchFileIdsRef.current = hiddenSourceFileIds(batches);
     }, [batches]);
+
+    /** Patch one file of a batch; progress is re-derived from file statuses. */
+    const patchFile = useCallback((batchId: string, fileId: string, patch: Partial<BatchFile>) => {
+        setBatches(prev => prev.map(b => {
+            if (b.id !== batchId) return b;
+            const files = b.files.map(f => f.id === fileId ? { ...f, ...patch } : f);
+            return { ...b, files, progress: batchProgress(files) };
+        }));
+    }, []);
+
+    const patchBatch = useCallback((batchId: string, patch: Partial<BatchInfo>) => {
+        setBatches(prev => prev.map(b => b.id === batchId ? { ...b, ...patch } : b));
+    }, []);
 
     // ─── Deferred ingest (namer → DAM pipeline) ───────────────
     const { pendingIngests, scheduleIngest, cancelIngest, triggerNow, retryIngest } = useDeferredIngest();
@@ -196,6 +231,13 @@ export default function NamerView() {
     const loadSeqRef = useRef(0);
     const [filesError, setFilesError] = useState<string | null>(null);
     const [loadedFolderId, setLoadedFolderId] = useState('');
+    // Folder the counter was last reset for. Reloads of the same folder (e.g.
+    // right after queueing a batch) keep counting, so the next batch to the
+    // same destination doesn't reuse 001… and collide.
+    const counterFolderRef = useRef('');
+    // Current source folder, for async flows that outlive a folder switch
+    const sourceFolderRef = useRef(sourceFolderId);
+    useEffect(() => { sourceFolderRef.current = sourceFolderId; }, [sourceFolderId]);
 
     const loadFiles = useCallback(async () => {
         if (!sourceFolderId) return;
@@ -217,7 +259,10 @@ export default function NamerView() {
             setFiles(previews);
             setLoadedFolderId(sourceFolderId);
             setLoadCount(c => c + 1);
-            setCounter(1); // Reset counter for new folder
+            if (counterFolderRef.current !== sourceFolderId) {
+                counterFolderRef.current = sourceFolderId;
+                setCounter(1); // New source folder — start numbering over
+            }
         } catch (err) {
             if (seq !== loadSeqRef.current) return;
             logger.error('namer', 'Failed to load files', { error: err instanceof Error ? err.message : String(err) });
@@ -238,29 +283,7 @@ export default function NamerView() {
     const buildName = useCallback((file: NamerFilePreview, index: number): string => {
         // Passthrough — keep original filename unchanged
         if (isPassthrough) return file.originalName;
-        if (schemaFields.length === 0) return file.originalName;
-
-        const parts: string[] = [];
-        for (const field of schemaFields) {
-            if (field.type === 'counter') {
-                const num = counter + index;
-                parts.push(String(num).padStart(3, '0'));
-            } else {
-                // Text/select/date, and constants (fixed tokens from Settings).
-                // Skip values that sanitize to nothing, or the name gets "__".
-                const token = field.value ? sanitizeNameToken(field.value) : '';
-                if (token) parts.push(token);
-            }
-        }
-
-        if (parts.length === 0) return file.originalName;
-
-        // Preserve original extension
-        const ext = file.originalName.includes('.')
-            ? file.originalName.substring(file.originalName.lastIndexOf('.'))
-            : '';
-
-        return parts.join('_') + ext;
+        return buildProposedName(schemaFields, file.originalName, counter + index);
     }, [schemaFields, counter, isPassthrough]);
 
     // Proposed names are derived, never stored. They used to be written into
@@ -365,76 +388,124 @@ export default function NamerView() {
     }, []);
 
     // ==========================================================
-    // Enqueue batch — creates batch and returns immediately
+    // Enqueue batch — checks the destination for name collisions, then
+    // creates the batch; the queue runner picks it up.
     // ==========================================================
-    const enqueueBatch = useCallback(() => {
-        const pendingFiles = namedFiles.filter(f => f.status === 'pending');
+    const enqueueingRef = useRef(false);
+    const [enqueueing, setEnqueueing] = useState(false);
+
+    const enqueueBatch = useCallback(async () => {
+        if (enqueueingRef.current) return;
+        // Snapshot what the user confirmed — state can change during the await
+        const pendingFiles = files.filter(f => f.status === 'pending');
         if (pendingFiles.length === 0 || !destFolderId) return;
+        const batchSourceFolderId = sourceFolderId;
+        const batchDestFolderId = destFolderId;
+        const fields = schemaFields;
+        const passthrough = isPassthrough;
+        const counterIndex = passthrough ? null : counterTokenIndex(fields);
+        const nameAt = (num: number, i: number) => passthrough
+            ? pendingFiles[i].originalName
+            : buildProposedName(fields, pendingFiles[i].originalName, num);
 
-        const batchId = `batch-${Date.now()}`;
-
-        // Build labels summary for the batch card
-        const labelParts: string[] = [];
-        for (const labelId of selectedLabelIds) {
-            const label = labels.find(l => l.id === labelId);
-            const fv = labelFieldValues[labelId] || {};
-            const fieldItems = Object.entries(fv)
-                .filter(([, v]) => Array.isArray(v.value) ? v.value.length > 0 : !!v.value)
-                .map(([fId, v]) => {
-                    const field = label?.fields?.find(f => f.id === fId);
-                    const name = field?.properties?.displayName || fId;
-                    const rawValues = Array.isArray(v.value) ? v.value : [v.value];
-                    let val: string;
-                    if (field?.selectionOptions?.choices) {
-                        val = rawValues.map(id => {
-                            const choice = field.selectionOptions!.choices.find(c => c.id === id);
-                            return choice?.properties?.displayName || id;
-                        }).join(', ');
-                    } else {
-                        val = rawValues.join(', ');
-                    }
-                    return `${name}: ${val}`;
-                });
-            if (fieldItems.length > 0) {
-                const labelName = label?.properties?.title || labelId;
-                labelParts.push(`${labelName} (${fieldItems.join('; ')})`);
+        enqueueingRef.current = true;
+        setEnqueueing(true);
+        try {
+            // Start the counter past names already in the destination (an
+            // earlier batch, or files named elsewhere), so the batch doesn't
+            // fall back to per-file dedupe. Only the schema's counter can move.
+            let start = counter;
+            if (counterIndex !== null) {
+                try {
+                    const batchIds = new Set(pendingFiles.map(f => f.id));
+                    const taken = new Set(
+                        (await namerApi.listFiles(batchDestFolderId))
+                            .filter(f => !batchIds.has(f.id)) // renaming in place
+                            .map(f => f.name)
+                    );
+                    start = findFreeCounterStart(counter, pendingFiles.length, nameAt, n => taken.has(n));
+                } catch (err) {
+                    // Not fatal — the batch still dedupes each name against
+                    // the destination before renaming
+                    logger.warn('namer', 'Destination name check failed', { error: err instanceof Error ? err.message : String(err) });
+                }
             }
-        }
 
-        const batch: BatchInfo = {
-            id: batchId,
-            files: pendingFiles.map(f => ({
+            const batchId = `batch-${Date.now()}`;
+
+            // Build labels summary for the batch card
+            const labelParts: string[] = [];
+            for (const labelId of selectedLabelIds) {
+                const label = labels.find(l => l.id === labelId);
+                const fv = labelFieldValues[labelId] || {};
+                const fieldItems = Object.entries(fv)
+                    .filter(([, v]) => Array.isArray(v.value) ? v.value.length > 0 : !!v.value)
+                    .map(([fId, v]) => {
+                        const field = label?.fields?.find(f => f.id === fId);
+                        const name = field?.properties?.displayName || fId;
+                        const rawValues = Array.isArray(v.value) ? v.value : [v.value];
+                        let val: string;
+                        if (field?.selectionOptions?.choices) {
+                            val = rawValues.map(id => {
+                                const choice = field.selectionOptions!.choices.find(c => c.id === id);
+                                return choice?.properties?.displayName || id;
+                            }).join(', ');
+                        } else {
+                            val = rawValues.join(', ');
+                        }
+                        return `${name}: ${val}`;
+                    });
+                if (fieldItems.length > 0) {
+                    const labelName = label?.properties?.title || labelId;
+                    labelParts.push(`${labelName} (${fieldItems.join('; ')})`);
+                }
+            }
+
+            const batchFiles: BatchFile[] = pendingFiles.map((f, i) => ({
                 id: f.id,
                 name: f.name,
-                proposedName: f.proposedName,
+                proposedName: nameAt(start + i, i),
                 status: 'queued',
-                finalName: null as string | null,
+                finalName: null,
                 imageMediaMetadata: f.imageMediaMetadata,
                 videoMediaMetadata: f.videoMediaMetadata,
-            })),
-            progress: { completed: 0, total: pendingFiles.length, errors: 0 },
-            status: 'queued' as const,
-            timestamp: Date.now(),
-            labelsSummary: labelParts.length > 0 ? `Content Tags (${labelParts.join(' | ')})` : undefined,
-            sourceFolderId: sourceFolderId,
-            destFolderId: destFolderId,
-            // Snapshot the current settings so they're preserved even if the user
-            // changes labels/AI/schema between queueing and processing
-            _snapshot: {
-                selectedLabelIds: [...selectedLabelIds],
-                labelFieldValues: JSON.parse(JSON.stringify(labelFieldValues)),
-                aiEnabled,
-                labels: labels,
-                settings,
-            },
-        };
+            }));
+            const batch: BatchInfo = {
+                id: batchId,
+                files: batchFiles,
+                progress: batchProgress(batchFiles),
+                status: 'queued',
+                timestamp: Date.now(),
+                labelsSummary: labelParts.length > 0 ? `Content Tags (${labelParts.join(' | ')})` : undefined,
+                sourceFolderId: batchSourceFolderId,
+                destFolderId: batchDestFolderId,
+                // Snapshot the current settings so they're preserved even if the user
+                // changes labels/AI/schema between queueing and processing
+                _snapshot: {
+                    selectedLabelIds: [...selectedLabelIds],
+                    labelFieldValues: JSON.parse(JSON.stringify(labelFieldValues)),
+                    aiEnabled,
+                    labels: labels,
+                    settings,
+                    counterIndex,
+                },
+            };
 
-        setBatches(prev => [...prev, batch]);
+            setBatches(prev => [...prev, batch]);
 
-        // Eagerly add file IDs so loadFiles filters them out, then reload
-        for (const f of batch.files) batchFileIdsRef.current.add(f.id);
-        if (sourceFolderId) loadFiles();
-    }, [namedFiles, destFolderId, sourceFolderId, selectedLabelIds, labelFieldValues, labels, aiEnabled, settings, loadFiles]);
+            // Continue numbering after this batch (the reload below no longer
+            // resets it), so the next batch to this destination doesn't collide
+            if (counterIndex !== null) setCounter(start + pendingFiles.length);
+
+            // Eagerly add file IDs so loadFiles filters them out, then reload —
+            // unless the user switched source folders while we checked names
+            for (const f of batch.files) batchFileIdsRef.current.add(f.id);
+            if (batchSourceFolderId && sourceFolderRef.current === batchSourceFolderId) loadFiles();
+        } finally {
+            enqueueingRef.current = false;
+            setEnqueueing(false);
+        }
+    }, [files, destFolderId, sourceFolderId, schemaFields, isPassthrough, counter, selectedLabelIds, labelFieldValues, labels, aiEnabled, settings, loadFiles]);
 
     // ==========================================================
     // Process one batch — runs the file-by-file processing loop
@@ -481,54 +552,99 @@ export default function NamerView() {
         }
 
         // Mark batch as processing
-        setBatches(prev => prev.map(b => b.id === batchId ? { ...b, status: 'processing' } : b));
+        patchBatch(batchId, { status: 'processing' });
 
-        // Fetch existing names in destination for duplicate checking
-        let existingNames: Set<string>;
+        // Destination listing: names for collision checks, and file IDs so a
+        // retry can tell a move that actually landed (response lost) from one
+        // that didn't — a retry must never rename or move a file twice.
+        const nameOwner = new Map<string, string>();  // name → file id
+        const destNameById = new Map<string, string>(); // file id → name
         try {
-            existingNames = await namerApi.listFileNames(batchDestFolderId);
-        } catch {
-            existingNames = new Set();
+            for (const f of await namerApi.listFiles(batchDestFolderId)) {
+                nameOwner.set(f.name, f.id);
+                destNameById.set(f.id, f.name);
+            }
+        } catch (err) {
+            logger.warn('namer-batch', 'Could not list destination for duplicate checks', { error: errMessage(err) });
         }
+        const counterIndex = snap?.counterIndex ?? null;
 
+        // First run: every file is queued. "Retry failed" re-queues only the
+        // failed ones; their doneSteps say what to skip.
+        const toRun = batch.files.filter(f => f.status === 'queued');
         const succeededIds: string[] = [];
-        for (let i = 0; i < batch.files.length; i++) {
-            const file = batch.files[i];
 
-            // Update batch: mark file as processing
-            setBatches(prev => prev.map(b => {
-                if (b.id !== batchId) return b;
-                return {
-                    ...b,
-                    files: b.files.map(f => f.id === file.id ? { ...f, status: 'processing' } : f),
-                };
-            }));
+        for (let i = 0; i < toRun.length; i++) {
+            const file = toRun[i];
+
+            // Cancel is checked before each file starts: the current file
+            // finishes, the rest are marked cancelled (not failed)
+            if (cancelRequestsRef.current.has(batchId)) {
+                const remaining = new Set(toRun.slice(i).map(f => f.id));
+                setBatches(prev => prev.map(b => {
+                    if (b.id !== batchId) return b;
+                    const files = b.files.map(f => remaining.has(f.id) && f.status === 'queued'
+                        ? { ...f, status: statusOnCancel(f) }
+                        : f);
+                    return { ...b, files, progress: batchProgress(files) };
+                }));
+                break;
+            }
+
+            patchFile(batchId, file.id, { status: 'processing', error: undefined, warnings: undefined });
+
+            const done = new Set<BatchStep>(file.doneSteps ?? []);
+            const warnings: string[] = [];
+            let finalName = file.finalName;
 
             try {
-                // Duplicate check
-                let finalName = file.proposedName;
-                if (existingNames.has(finalName)) {
-                    let version = 2;
-                    const dotIdx = finalName.lastIndexOf('.');
-                    const baseName = dotIdx !== -1 ? finalName.substring(0, dotIdx) : finalName;
-                    const extension = dotIdx !== -1 ? finalName.substring(dotIdx) : '';
-                    while (existingNames.has(`${baseName}_v${version}${extension}`)) version++;
-                    finalName = `${baseName}_v${version}${extension}`;
+                // 1. Rename + Move — the one fatal step
+                if (!done.has('move')) {
+                    const takenByOther = (name: string) => {
+                        const owner = nameOwner.get(name);
+                        return owner !== undefined && owner !== file.id;
+                    };
+                    if (file.targetName && destNameById.get(file.id) === file.targetName) {
+                        // An earlier attempt landed even though it reported failure
+                        finalName = file.targetName;
+                    } else {
+                        // Reuse an earlier attempt's target so the name can't drift
+                        const target = file.targetName && !takenByOther(file.targetName)
+                            ? file.targetName
+                            : dedupeName(file.proposedName, takenByOther, counterIndex);
+                        nameOwner.set(target, file.id); // reserve for later files
+                        patchFile(batchId, file.id, { targetName: target });
+                        try {
+                            await namerApi.updateFile(file.id, target, batchDestFolderId, batchSourceFolderId || undefined);
+                        } catch (moveErr) {
+                            const reason = errMessage(moveErr);
+                            logger.error('namer-batch', `Rename/move failed on ${file.name}`, { error: reason });
+                            patchFile(batchId, file.id, {
+                                status: 'error',
+                                error: `Rename/move failed: ${reason}`,
+                                doneSteps: [...done],
+                            });
+                            continue;
+                        }
+                        finalName = target;
+                    }
+                    done.add('move');
                 }
-                existingNames.add(finalName);
-
-                // 1. Rename + Move
-                await namerApi.updateFile(file.id, finalName, batchDestFolderId, batchSourceFolderId || undefined);
+                const name = finalName ?? file.proposedName;
 
                 // 2. Apply labels (with throttle to avoid Drive Labels API rate limits)
                 for (const labelId of batchLabelIds) {
+                    const step: BatchStep = `label:${labelId}`;
+                    if (done.has(step)) continue;
                     try {
                         const fv = batchLabelFieldValues[labelId] || {};
-                        await namerApi.applyLabel(file.id, labelId, fv as Record<string, import('@/lib/namer/types').LabelFieldValue>);
+                        await namerApi.applyLabel(file.id, labelId, fv as Record<string, LabelFieldValue>);
+                        done.add(step);
                         await new Promise(r => setTimeout(r, 500));
                     } catch (labelErr: unknown) {
-                        const errMsg = labelErr instanceof Error ? labelErr.message : String(labelErr);
-                        logger.error('namer-batch', `Label ${labelId} failed on ${file.name}`, { error: errMsg });
+                        const title = batchLabels.find(l => l.id === labelId)?.properties?.title || labelId;
+                        warnings.push(`Label "${title}": ${errMessage(labelErr)}`);
+                        logger.error('namer-batch', `Label ${labelId} failed on ${file.name}`, { error: errMessage(labelErr) });
                     }
                 }
 
@@ -536,9 +652,11 @@ export default function NamerView() {
                 let orientationValue: 'Horizontal' | 'Vertical' | 'Square' | undefined;
                 const meta = file.imageMediaMetadata || file.videoMediaMetadata;
                 if (meta?.width && meta?.height) {
+                    const ratio = meta.width / meta.height;
+                    orientationValue = ratio > 1.05 ? 'Horizontal' : ratio < 0.95 ? 'Vertical' : 'Square';
+                }
+                if (orientationValue && meta && !done.has('orientation')) {
                     try {
-                        const ratio = meta.width / meta.height;
-                        orientationValue = ratio > 1.05 ? 'Horizontal' : ratio < 0.95 ? 'Vertical' : 'Square';
                         await namerApi.setAppProperties(file.id, {
                             orientation: orientationValue,
                             width: String(meta.width),
@@ -565,28 +683,25 @@ export default function NamerView() {
                                 }
                             }
                         }
+                        done.add('orientation');
                     } catch (oErr) {
-                        logger.error('namer-batch', `Orientation failed on ${file.name}`, { error: oErr instanceof Error ? oErr.message : String(oErr) });
+                        warnings.push(`Orientation: ${errMessage(oErr)}`);
+                        logger.error('namer-batch', `Orientation failed on ${file.name}`, { error: errMessage(oErr) });
                     }
                 }
 
                 // Inter-file delay
-                if (i < batch.files.length - 1) {
+                if (i < toRun.length - 1) {
                     await new Promise(r => setTimeout(r, 500));
                 }
 
                 // 4. AI Analysis (photos only)
-                let aiMetadata: AIMetadata | null = null;
+                let aiMetadata: AIMetadata | null = file.aiMetadata ?? null;
+                let aiRanNow = false;
                 const isPhoto = file.name?.match(/\.(jpg|jpeg|png|webp|gif|tiff|heic|heif)$/i);
-                if (isPhoto && batchAiEnabled && batchSettings?.aiSettings) {
+                if (isPhoto && batchAiEnabled && batchSettings?.aiSettings && !done.has('ai')) {
                     try {
-                        setBatches(prev => prev.map(b => {
-                            if (b.id !== batchId) return b;
-                            return {
-                                ...b,
-                                files: b.files.map(f => f.id === file.id ? { ...f, status: 'analyzing' } : f),
-                            };
-                        }));
+                        patchFile(batchId, file.id, { status: 'analyzing' });
 
                         aiMetadata = await namerApi.analyzeImage(file.id, batchSettings.aiSettings);
 
@@ -605,75 +720,91 @@ export default function NamerView() {
                                 ai_colors: toTruncated(aiMetadata.color_palette, 30),
                             });
                         }
+                        done.add('ai');
+                        aiRanNow = true;
 
                         const delayMs = batchSettings.aiSettings.delayMs || 500;
                         if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
 
                     } catch (aiErr) {
-                        logger.error('namer-batch', `AI analysis failed on ${file.name}`, { error: aiErr instanceof Error ? aiErr.message : String(aiErr) });
+                        warnings.push(`AI analysis: ${errMessage(aiErr)}`);
+                        logger.error('namer-batch', `AI analysis failed on ${file.name}`, { error: errMessage(aiErr) });
                     }
                 }
 
-                // 5. Build semantic description
-                try {
-                    const descParts: string[] = [];
+                // 5. Build semantic description — redone after a fresh AI
+                // result so a retried analysis reaches the description too
+                if (!done.has('description') || aiRanNow) {
+                    try {
+                        const descParts: string[] = [];
 
-                    if (aiMetadata) {
-                        const semParts: string[] = [];
-                        if (aiMetadata.human_experience) {
-                            const exp = Array.isArray(aiMetadata.human_experience)
-                                ? aiMetadata.human_experience.join(', ')
-                                : aiMetadata.human_experience;
-                            semParts.push(exp);
+                        if (aiMetadata) {
+                            const semParts: string[] = [];
+                            if (aiMetadata.human_experience) {
+                                const exp = Array.isArray(aiMetadata.human_experience)
+                                    ? aiMetadata.human_experience.join(', ')
+                                    : aiMetadata.human_experience;
+                                semParts.push(exp);
+                            }
+                            const ctxParts = [aiMetadata.context_environment, aiMetadata.seasonality, aiMetadata.lighting_mood].filter(Boolean);
+                            if (ctxParts.length) semParts.push(ctxParts.join(', '));
+                            if (semParts.length) descParts.push(semParts.join(' | '));
                         }
-                        const ctxParts = [aiMetadata.context_environment, aiMetadata.seasonality, aiMetadata.lighting_mood].filter(Boolean);
-                        if (ctxParts.length) semParts.push(ctxParts.join(', '));
-                        if (semParts.length) descParts.push(semParts.join(' | '));
+
+                        const nameNoExt = name.includes('.') ? name.substring(0, name.lastIndexOf('.')) : name;
+                        const nameParts = nameNoExt.split('_').filter(p => !/^\d+$/.test(p)).map(p => p.replace(/-/g, ' '));
+                        descParts.push(nameParts.join(', '));
+
+                        if (aiMetadata?.label_csv) descParts.push(`Keywords: ${aiMetadata.label_csv}`);
+                        if (labelParts.length > 0) descParts.push(`Labels: ${labelParts.join('; ')}`);
+
+                        await namerApi.setDescription(file.id, descParts.join(' — '));
+                        done.add('description');
+                    } catch (descErr) {
+                        warnings.push(`Description: ${errMessage(descErr)}`);
+                        logger.error('namer-batch', `Description failed on ${file.name}`, { error: errMessage(descErr) });
                     }
-
-                    const nameNoExt = finalName.includes('.') ? finalName.substring(0, finalName.lastIndexOf('.')) : finalName;
-                    const nameParts = nameNoExt.split('_').filter(p => !/^\d+$/.test(p)).map(p => p.replace(/-/g, ' '));
-                    descParts.push(nameParts.join(', '));
-
-                    if (aiMetadata?.label_csv) descParts.push(`Keywords: ${aiMetadata.label_csv}`);
-                    if (labelParts.length > 0) descParts.push(`Labels: ${labelParts.join('; ')}`);
-
-                    await namerApi.setDescription(file.id, descParts.join(' — '));
-                } catch (descErr) {
-                    logger.error('namer-batch', `Description failed on ${file.name}`, { error: descErr instanceof Error ? descErr.message : String(descErr) });
                 }
 
-                // Mark success
+                // Moved = success; failed later steps ride along as warnings
                 succeededIds.push(file.id);
-                setBatches(prev => prev.map(b => {
-                    if (b.id !== batchId) return b;
-                    const updatedFiles = b.files.map(f => f.id === file.id ? { ...f, status: 'success', finalName, orientation: orientationValue } : f);
-                    const completed = updatedFiles.filter(f => f.status === 'success' || f.status === 'error').length;
-                    return { ...b, files: updatedFiles, progress: { ...b.progress, completed } };
-                }));
+                patchFile(batchId, file.id, {
+                    status: 'success',
+                    finalName: name,
+                    orientation: orientationValue,
+                    warnings: warnings.length > 0 ? warnings : undefined,
+                    doneSteps: [...done],
+                    aiMetadata,
+                });
 
             } catch (err) {
-                logger.error('namer-batch', `Failed to process ${file.name}`, { error: err instanceof Error ? err.message : String(err) });
-                setBatches(prev => prev.map(b => {
-                    if (b.id !== batchId) return b;
-                    const updatedFiles = b.files.map(f => f.id === file.id ? { ...f, status: 'error' } : f);
-                    const completed = updatedFiles.filter(f => f.status === 'success' || f.status === 'error').length;
-                    const errors = updatedFiles.filter(f => f.status === 'error').length;
-                    return { ...b, files: updatedFiles, progress: { ...b.progress, completed, errors } };
-                }));
+                // Nothing above should throw past its own catch — this guards
+                // against a bug leaving a file stuck on "processing"
+                logger.error('namer-batch', `Failed to process ${file.name}`, { error: errMessage(err) });
+                patchFile(batchId, file.id, {
+                    status: done.has('move') ? 'success' : 'error',
+                    finalName: finalName ?? null,
+                    ...(done.has('move')
+                        ? { warnings: [...warnings, `Unexpected error: ${errMessage(err)}`] }
+                        : { error: `Unexpected error: ${errMessage(err)}` }),
+                    doneSteps: [...done],
+                });
+                if (done.has('move')) succeededIds.push(file.id);
             }
         }
 
         // Mark batch complete
-        setBatches(prev => prev.map(b => b.id === batchId ? { ...b, status: 'completed' } : b));
+        cancelRequestsRef.current.delete(batchId);
+        patchBatch(batchId, { status: 'completed', cancelRequested: false });
 
         // Schedule deferred ingest into DAM. Called directly — it used to run
         // inside a setBatches updater, which must be pure (StrictMode runs
-        // updaters twice → duplicate pending-ingest records).
+        // updaters twice → duplicate pending-ingest records). On a retry this
+        // re-schedules the batch's entry with the retried files.
         if (succeededIds.length > 0) {
             scheduleIngest(batchId, succeededIds, batchDestFolderId);
         }
-    }, [selectedLabelIds, labelFieldValues, labels, aiEnabled, settings, scheduleIngest]);
+    }, [selectedLabelIds, labelFieldValues, labels, aiEnabled, settings, scheduleIngest, patchFile, patchBatch]);
 
     // ==========================================================
     // Queue runner — processes batches one at a time
@@ -700,45 +831,105 @@ export default function NamerView() {
     }, [batches, processOneBatch]);
 
     // ==========================================================
-    // Revert batch
+    // Retry failed files / cancel a batch
+    // ==========================================================
+    const retryFailed = useCallback((batchId: string) => {
+        const batch = batches.find(b => b.id === batchId);
+        if (!batch || batch.status !== 'completed') return;
+        const ids = new Set(batch.files.filter(isRetryable).map(f => f.id));
+        if (ids.size === 0) return;
+        cancelRequestsRef.current.delete(batchId);
+        // Back to 'queued' — the runner picks it up and processes only the
+        // re-queued files, skipping each one's doneSteps
+        setBatches(prev => prev.map(b => {
+            if (b.id !== batchId) return b;
+            const files = b.files.map(f => ids.has(f.id)
+                // error/warnings are kept until the file actually starts (so a
+                // cancel can restore them — see statusOnCancel)
+                ? { ...f, status: 'queued' as const }
+                : f);
+            return { ...b, files, status: 'queued', cancelRequested: false, progress: batchProgress(files) };
+        }));
+    }, [batches]);
+
+    const cancelBatch = useCallback((batchId: string) => {
+        const batch = batches.find(b => b.id === batchId);
+        if (!batch || (batch.status !== 'queued' && batch.status !== 'processing')) return;
+        cancelRequestsRef.current.add(batchId);
+        if (batch.status === 'processing') {
+            // The runner stops before its next file
+            patchBatch(batchId, { cancelRequested: true });
+            return;
+        }
+        // Not started yet — nothing to wait for
+        setBatches(prev => prev.map(b => {
+            if (b.id !== batchId) return b;
+            const files = b.files.map(f => f.status === 'queued' ? { ...f, status: statusOnCancel(f) } : f);
+            return { ...b, files, status: 'completed', progress: batchProgress(files) };
+        }));
+        // Cancelled files are listed again on the next Load/Reload Files — not
+        // reloaded here, which would reset the selection the user is building
+    }, [batches, patchBatch]);
+
+    // ==========================================================
+    // Revert batch (also retries a partially failed revert)
     // ==========================================================
     const revertBatch = useCallback(async (batchId: string) => {
         const batch = batches.find(b => b.id === batchId);
-        if (!batch || batch.status !== 'completed') return;
+        if (!batch || (batch.status !== 'completed' && batch.status !== 'revert-failed')) return;
+        // Files reported failed whose move actually landed (e.g. the request
+        // timed out after Drive applied it) are in the destination under their
+        // target name — revert those too, or "Reverted" would leave them there.
+        const landed = new Set<string>();
+        if (batch.destFolderId) {
+            try {
+                const destById = new Map((await namerApi.listFiles(batch.destFolderId)).map(f => [f.id, f.name]));
+                for (const f of batch.files) {
+                    if (!isMoved(f) && f.targetName && f.revert !== 'done' && destById.get(f.id) === f.targetName) landed.add(f.id);
+                }
+            } catch (err) {
+                logger.warn('namer-batch', 'Could not list destination before revert', { error: errMessage(err) });
+            }
+        }
+        const targets = [...revertTargets(batch), ...batch.files.filter(f => landed.has(f.id))];
+        if (targets.length === 0) return;
 
-        // One click moves and renames every file in the batch — confirm first.
-        const count = batch.files.filter(f => f.status === 'success').length;
-        if (!window.confirm(`Revert ${count} file${count === 1 ? '' : 's'}? They'll be renamed with a "revert_" prefix and moved back to the source folder.`)) {
+        // One click moves and renames every file in the batch — confirm first
+        // (a retry of the failed remainder was already confirmed).
+        const count = targets.length;
+        if (batch.status === 'completed'
+            && !window.confirm(`Revert ${count} file${count === 1 ? '' : 's'}? They'll be renamed with a "revert_" prefix and moved back to the source folder.`)) {
             return;
         }
 
         // Cancel any pending deferred ingest for this batch
         cancelIngest(batchId);
 
-        // Mark reverting
-        setBatches(prev => prev.map(b => b.id === batchId ? { ...b, status: 'reverting' } : b));
+        patchBatch(batchId, { status: 'reverting' });
 
-        const successFiles = batch.files.filter(f => f.status === 'success' && f.finalName);
-
-        for (const file of successFiles) {
+        let failed = 0;
+        for (const file of targets) {
             try {
                 // Rename with revert_ prefix + original name, move back to source
                 const revertName = `revert_${file.name}`;
                 await namerApi.updateFile(file.id, revertName, batch.sourceFolderId, batch.destFolderId || undefined);
+                patchFile(batchId, file.id, { revert: 'done', revertError: undefined });
             } catch (err) {
-                logger.error('namer-batch', `Failed to revert ${file.name}`, { error: err instanceof Error ? err.message : String(err) });
+                failed++;
+                logger.error('namer-batch', `Failed to revert ${file.name}`, { error: errMessage(err) });
+                patchFile(batchId, file.id, { revert: 'failed', revertError: errMessage(err) });
             }
         }
 
-        // Mark reverted
-        setBatches(prev => prev.map(b => b.id === batchId ? { ...b, status: 'reverted' } : b));
+        // "Reverted" only when every moved file made it back; otherwise the
+        // failures stay visible with a Retry revert action
+        patchBatch(batchId, { status: failed === 0 ? 'reverted' : 'revert-failed' });
 
-        // Remove reverted file IDs from the filter so they reappear in the file list
-        for (const f of batch.files) batchFileIdsRef.current.delete(f.id);
+        // Reverted files reappear in the source list (hiddenSourceFileIds)
         if (batch.sourceFolderId) {
             setTimeout(() => loadFiles(), 1500); // Small delay for Drive propagation
         }
-    }, [batches, cancelIngest, loadFiles]);
+    }, [batches, cancelIngest, loadFiles, patchBatch, patchFile]);
 
     // ==========================================================
     // Render
@@ -755,7 +946,7 @@ export default function NamerView() {
         .filter(f => f.required && !f.value)
         .map(f => f.label);
     if (missingRequired.length > 0) validationWarnings.push(`Required naming fields empty: ${missingRequired.join(', ')}`);
-    const canExecute = pendingCount > 0 && !!destFolderId && !!selectedSchema && missingRequired.length === 0;
+    const canExecute = pendingCount > 0 && !!destFolderId && !!selectedSchema && missingRequired.length === 0 && !enqueueing;
 
     if (settingsLoading) {
         return (
@@ -976,7 +1167,13 @@ export default function NamerView() {
                                     label="Destination Folder"
                                     folderId={destFolderId}
                                     folderName={destFolderName}
-                                    onSelect={(id: string, name: string) => { setDestFolderId(id); setDestFolderName(name); }}
+                                    onSelect={(id: string, name: string) => {
+                                        // Numbering continues within a destination; a new one
+                                        // starts over (the confirm-time check still skips taken names)
+                                        if (id !== destFolderId) setCounter(1);
+                                        setDestFolderId(id);
+                                        setDestFolderName(name);
+                                    }}
                                 />
                                 <button
                                     onClick={loadFiles}
@@ -1445,11 +1642,11 @@ export default function NamerView() {
                         )}
 
                         {/* Clear Completed — right side of header */}
-                        {batches.some(b => b.status === 'completed' || b.status === 'reverted') && (
+                        {batches.some(isClearable) && (
                             <button
                                 onClick={(e) => {
                                     e.stopPropagation();
-                                    setBatches(prev => prev.filter(b => b.status !== 'completed' && b.status !== 'reverted'));
+                                    setBatches(prev => prev.filter(b => !isClearable(b)));
                                 }}
                                 style={{
                                     fontSize: '11px',
@@ -1480,8 +1677,10 @@ export default function NamerView() {
                     <div style={{ flex: 1, overflowY: 'auto', borderTop: '1px solid var(--ram-border)' }}>
                         <NamerQueue
                             batches={batches}
-                            onClearCompleted={() => setBatches(prev => prev.filter(b => b.status !== 'completed' && b.status !== 'reverted'))}
+                            onClearCompleted={() => setBatches(prev => prev.filter(b => !isClearable(b)))}
                             onRevertBatch={revertBatch}
+                            onRetryFailed={retryFailed}
+                            onCancelBatch={cancelBatch}
                             pendingIngests={pendingIngests}
                             onCancelIngest={cancelIngest}
                             onTriggerIngestNow={triggerNow}
@@ -1514,9 +1713,10 @@ export default function NamerView() {
                     selectedLabelIds={selectedLabelIds}
                     labelFieldValues={labelFieldValues}
                     destFolderName={destFolderName}
+                    counterStart={counter}
                     onConfirm={() => {
                         setShowConfirmModal(false);
-                        enqueueBatch();
+                        void enqueueBatch();
                     }}
                     onCancel={() => setShowConfirmModal(false)}
                 />

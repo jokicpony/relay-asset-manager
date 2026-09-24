@@ -51,14 +51,14 @@ export interface ParsedFilename {
  * // }
  *
  * @example
- * parseFilename('$Torch_BirdieCelebration_Golf-Background_$Flex_$Experience_$darkroast_1.mp4')
+ * parseFilename('$Acme_TrailRun_Mountain-Background_$Lifestyle_$Social_$blue_1.mp4')
  * // => {
  * //   shootDate: null,
- * //   creator: 'Torch',
- * //   shootDescription: 'Birdie Celebration / Golf Background',
+ * //   creator: 'Acme',
+ * //   shootDescription: 'TrailRun / Mountain Background',
  * //   sequence: '1',
  * //   parsed: true,
- * //   tags: ['Flex', 'Experience', 'darkroast'],
+ * //   tags: ['Lifestyle', 'Social', 'blue'],
  * // }
  */
 export function parseFilename(filename: string): ParsedFilename {

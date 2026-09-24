@@ -1,68 +1,88 @@
+import { fetchWithDriveRetry } from '../sync/drive-retry';
+
 /**
- * Resolve a Drive folder ID to its canonical path (e.g. "/A/B/C").
+ * Resolve a Drive folder ID to its canonical path (e.g. "/A/B/C") by walking
+ * the parent chain, and report whether it sits under a `[relay-ignore]`
+ * folder. Used by the in-app ingest (per-file scope + ignore checks), relays
+ * (shortcut target path), and the folder-path API. The cron sync resolves
+ * paths from a bulk folder-tree prefetch instead — at library scale that's
+ * a few list calls rather than one lookup per folder.
  *
- * Walks the parent chain via the Drive API. Uses the shared-drive root
- * (`driveId`) as the terminator. Caller-supplied `pathCache` lets multiple
- * lookups in the same request share intermediate results.
+ * `cache` is caller-owned and request-scoped (never module-level: concurrent
+ * requests would share and clear each other's entries); every folder walked
+ * is cached with its full path and inherited ignore flag.
  *
  * Returns "/" for the drive root, "/unknown" if the chain can't be resolved
- * (e.g. permission denied on an ancestor).
+ * (e.g. permission denied on an ancestor) — which callers treat as out of
+ * scope.
  */
+
+export interface FolderInfo {
+    path: string;
+    /** This folder or an ancestor has [relay-ignore] in its description */
+    ignored: boolean;
+}
+
+export const RELAY_IGNORE_TAG = '[relay-ignore]';
+
 export async function resolveFolderPathById(
     accessToken: string,
     folderId: string,
     driveId: string,
-    pathCache: Map<string, string> = new Map()
-): Promise<{ path: string; breadcrumbs: { id: string; name: string }[] }> {
+    cache: Map<string, FolderInfo> = new Map(),
+): Promise<FolderInfo & { breadcrumbs: { id: string; name: string }[] }> {
     if (!folderId || folderId === driveId) {
-        return { path: '/', breadcrumbs: [] };
+        return { path: '/', ignored: false, breadcrumbs: [] };
     }
 
-    // Walk up by repeatedly fetching the current folder's metadata.
-    const chain: { id: string; name: string }[] = [];
+    // Walk up until the drive root or a cached ancestor.
+    const chain: { id: string; name: string; tagged: boolean }[] = [];
+    let base: FolderInfo = { path: '/', ignored: false };
+    let baseNames: string[] = [];
     let currentId: string | undefined = folderId;
 
     while (currentId && currentId !== driveId) {
-        if (pathCache.has(currentId)) {
-            // Cache stores full path of `currentId`; prepend its breadcrumbs.
-            const cachedPath = pathCache.get(currentId)!;
-            const cachedNames = cachedPath.split('/').filter(Boolean);
-            // We can't recover IDs from the cached path string, so for the
-            // breadcrumb structure we only return what we walked. Path is correct
-            // either way — that's the field used for `project_folder_path`.
-            const path = `${cachedPath}${chain.length > 0 ? '/' + chain.map(c => c.name).join('/') : ''}`;
-            return {
-                path,
-                // Best-effort breadcrumbs: cached ancestors lose their IDs.
-                breadcrumbs: [
-                    ...cachedNames.map((name) => ({ id: '', name })),
-                    ...chain,
-                ],
-            };
+        const cached = cache.get(currentId);
+        if (cached) {
+            base = cached;
+            baseNames = cached.path.split('/').filter(Boolean);
+            break;
         }
 
-        const res = await fetch(
-            `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(currentId)}?fields=id,name,parents&supportsAllDrives=true`,
-            { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-
-        if (!res.ok) {
-            return { path: '/unknown', breadcrumbs: chain };
+        const unresolved = { path: '/unknown', ignored: false, breadcrumbs: chain.map(({ id, name }) => ({ id, name })) };
+        let data: { id: string; name: string; parents?: string[]; description?: string };
+        try {
+            const res = await fetchWithDriveRetry(
+                `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(currentId)}?fields=id,name,parents,description&supportsAllDrives=true`,
+                { headers: { Authorization: `Bearer ${accessToken}` } },
+                2, // callers run inside request time limits
+            );
+            if (!res.ok) return unresolved;
+            data = await res.json();
+        } catch {
+            return unresolved; // network error — treated as out of scope, as before
         }
-
-        const data = (await res.json()) as { id: string; name: string; parents?: string[] };
-        chain.unshift({ id: data.id, name: data.name });
+        if (chain.some((n) => n.id === data.id)) return unresolved; // parent cycle guard
+        chain.unshift({ id: data.id, name: data.name, tagged: Boolean(data.description?.includes(RELAY_IGNORE_TAG)) });
         currentId = data.parents?.[0];
     }
 
-    const path = '/' + chain.map((c) => c.name).join('/');
-
-    // Populate the cache for every prefix along the chain.
-    for (let i = 0; i < chain.length; i++) {
-        const node = chain[i];
-        const prefix = '/' + chain.slice(0, i + 1).map((c) => c.name).join('/');
-        if (!pathCache.has(node.id)) pathCache.set(node.id, prefix);
+    // Cache every walked folder with its full path and inherited ignore flag.
+    let info = base;
+    for (const node of chain) {
+        info = {
+            path: info.path === '/' ? `/${node.name}` : `${info.path}/${node.name}`,
+            ignored: info.ignored || node.tagged,
+        };
+        cache.set(node.id, info);
     }
 
-    return { path, breadcrumbs: chain };
+    return {
+        ...info,
+        // Best-effort: ancestors that came from the cache lose their IDs.
+        breadcrumbs: [
+            ...baseNames.map((name) => ({ id: '', name })),
+            ...chain.map(({ id, name }) => ({ id, name })),
+        ],
+    };
 }

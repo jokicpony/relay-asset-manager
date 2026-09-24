@@ -1,5 +1,5 @@
 import type { DriveFile } from './types';
-import { buildAssetRow } from './asset-row';
+import { buildAssetRow, groupRowsByColumns } from './asset-row';
 import { getAdminClient } from '@/lib/supabase/admin';
 
 /**
@@ -10,7 +10,8 @@ import { getAdminClient } from '@/lib/supabase/admin';
  * @returns Number of rows upserted
  */
 export async function upsertAssets(
-    files: DriveFile[]
+    files: DriveFile[],
+    opts: { labelsFetched?: boolean } = {},
 ): Promise<{ upserted: number; errors: string[] }> {
     const supabase = getAdminClient();
 
@@ -22,19 +23,22 @@ export async function upsertAssets(
 
     for (let i = 0; i < files.length; i += BATCH_SIZE) {
         const batch = files.slice(i, i + BATCH_SIZE);
-        const rows = batch.map(buildAssetRow);
+        const rows = batch.map((f) => buildAssetRow(f, opts));
 
-        const { error, count } = await supabase
-            .from('assets')
-            .upsert(rows, {
-                onConflict: 'drive_file_id',
-                ignoreDuplicates: false,
-            });
+        // Same-shape groups: an omitted column must be preserved, not NULLed
+        for (const group of groupRowsByColumns(rows)) {
+            const { error } = await supabase
+                .from('assets')
+                .upsert(group, {
+                    onConflict: 'drive_file_id',
+                    ignoreDuplicates: false,
+                });
 
-        if (error) {
-            errors.push(`Batch ${i / BATCH_SIZE + 1}: ${error.message}`);
-        } else {
-            upserted += count ?? batch.length;
+            if (error) {
+                errors.push(`Batch ${i / BATCH_SIZE + 1}: ${error.message}`);
+            } else {
+                upserted += group.length;
+            }
         }
     }
 

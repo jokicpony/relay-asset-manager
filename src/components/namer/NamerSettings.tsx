@@ -574,8 +574,12 @@ export default function NamerSettingsPanel({ settings, onSave, onClose }: NamerS
                                                                     if (newType !== 'select') updates.source = undefined;
                                                                     // Constants always fill, so they're always required
                                                                     if (newType === 'constant') updates.required = true;
-                                                                    // Don't carry a fixed value over as a hidden default
-                                                                    if (field.type === 'constant' && newType !== 'constant') updates.value = '';
+                                                                    // Don't carry a value across the constant boundary in
+                                                                    // either direction: a fixed value would linger as a hidden
+                                                                    // default, and an old default would silently become the
+                                                                    // fixed token. Switching TO constant starts empty so the
+                                                                    // user sets it deliberately (save rejects empty constants).
+                                                                    if ((field.type === 'constant') !== (newType === 'constant')) updates.value = '';
                                                                     updateField(name, idx, updates);
                                                                 }}
                                                                 disabled={field.frozen}

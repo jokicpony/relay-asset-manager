@@ -8,6 +8,10 @@ const supabaseHostname = process.env.NEXT_PUBLIC_SUPABASE_URL
 
 const nextConfig: NextConfig = {
   images: {
+    // Optimized thumbnails are cached for 30 days. Safe because rewritten
+    // thumbnails get a new URL: custom frames and in-app ingest uploads are
+    // versioned (?v=); the cron sync only writes thumbnails that don't exist.
+    minimumCacheTTL: 60 * 60 * 24 * 30,
     remotePatterns: [
       {
         protocol: 'https',

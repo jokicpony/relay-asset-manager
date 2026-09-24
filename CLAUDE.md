@@ -21,7 +21,9 @@ src/
   lib/           — Shared utilities and business logic
     google/      — Drive auth (WIF + OAuth + ADC)
     supabase/    — Client, server, middleware helpers
-    sync/        — Sync pipeline (crawler, upsert, thumbnails)
+    sync/        — Shared sync engine: scope, drive-retry, drive-file, thumbnails,
+                   embedder, asset-row (used by scripts/sync.ts, scripts/embed.ts,
+                   /api/sync/ingest and search — don't re-implement in callers)
     namer/       — Namer types and utilities
   types/         — TypeScript interfaces
 supabase/
@@ -44,9 +46,11 @@ scripts/
 npm run dev        # Start dev server
 npm run build      # Production build
 npm run lint       # ESLint check
+npm test           # Unit tests (node:test + tsx) for pure logic in tests/
 npx tsx scripts/sync.ts              # Run sync pipeline
 npx tsx scripts/sync.ts --skip-thumbnails  # Sync without thumbnail processing
 npx tsx scripts/sync.ts --allow-mass-orphan # Let a run trash >max(100, 10%) missing assets
+npx tsx scripts/sync.ts --dry-run --dry-run-out=plan.json  # Read everything, write nothing, emit the plan
 npx tsx scripts/embed.ts             # Generate embeddings for assets missing them
 npx tsx scripts/embed.ts --force     # Regenerate all embeddings
 ```
@@ -67,15 +71,21 @@ Things that aren't obvious from the code but cost time when forgotten.
 - **Three trash reasons, two purge behaviors.** `orphaned` (file gone from Drive) and `ignored` (`[relay-ignore]` folder) hard-purge after 14 days. `out-of-scope` (top-level folder removed from `sync_folders`) is exempt from the purge — the Drive files still exist, so rows/embeddings/thumbnails are kept and auto-restore on the next sync if the folder is re-scoped.
 - **The sync refuses to mass-trash.** If one run would mark more than max(100, 10% of active) assets `orphaned`, it skips that soft-delete and logs a `partial` run with an explanation in Settings. The usual cause is a renamed top-level folder: scope is matched by folder *name*, so a rename makes every file under it look deleted. Rename it back (or update `sync_folders`); only use `--allow-mass-orphan` (or the "Allow mass orphan" checkbox on a manual GitHub Actions run) for a real bulk deletion.
 - **Thumbnails are time-boxed per sync** (`SYNC_THUMBNAIL_BUDGET_MIN`, default 15) so a big backlog can't starve the upsert/orphan/embed steps; leftovers are picked up next run. Every stored thumbnail goes through `encodeThumbnail` (`src/lib/sync/thumbnail-encode.ts`) — real WebP, ≤800px — in both the cron and the in-app ingest.
+- **Verify sync changes with a dry run before they write.** Actions → Daily Sync → Run workflow with `dry_run` checked uploads the planned changes as an artifact (`sync-plan-<sha>`). Run it on the old and new code and diff the two JSON files — the 2026-09-24 engine consolidation shipped only after the plans matched exactly. Dry runs can't exercise thumbnail/embedding/trash paths when the data has nothing to do there; those rely on `tests/`.
+- **`sync_logs` is the activity log for both ingestion paths.** `source` is `cron` (scheduled sync) or `ingest` (in-app, per Namer batch); `details` holds structured problems, the GitHub run URL, and for ingests the user and per-file errors/skips. Anything that goes wrong without stopping a run should go through `problem()` in `scripts/sync.ts` so the run is marked `partial` and the reason is recorded. Killed/timed-out runs are recorded by the workflow's last step (`scripts/record-sync-failure.ts`). Settings' "latest sync" filters `source = 'cron'`; Settings → Recent activity and the header indicator read `/api/sync/activity`.
+- **One embedding model, one place.** `src/lib/sync/embedder.ts` defines the Gemini model and dimensions for documents *and* search queries. If they ever differ, semantic search silently compares incompatible vectors. Changing the model means re-embedding everything (`scripts/embed.ts --force`).
 - **`parseFilename` is shared** — `src/lib/filename-utils.ts` is the single parser used by the app, the namer ingest, and `scripts/sync.ts`. Don't fork it: divergent parsed values trigger mass re-embeds on the next sync (embedding text includes the parsed description).
 
 ### Caching
 
-- **`/api/assets` returns `Cache-Control: private, max-age=60, stale-while-revalidate=300`.** In-app mutation flows (relay, trash, namer ingest, sync-complete) call `fetchAllAssets({ fresh: true })`, which bypasses the cache via `cache: 'reload'`. Changes made *outside* your session (another user's relay, the cron sync) can still appear up to 60s stale until reload.
+- **`/api/assets` returns `Cache-Control: private, max-age=60, stale-while-revalidate=300`.** In-app mutation flows (relay, trash, namer ingest, sync-complete) call `refreshAssets()` in `page.tsx`, which fetches with `cache: 'reload'`. Changes made *outside* your session (another user's relay, the cron sync) can still appear up to 60s stale until reload.
+- **The asset list is also cached in IndexedDB** (`src/lib/asset-cache.ts`) and painted immediately on load, then replaced by the network response. Asset-list fetches are sequence-guarded in `page.tsx` — only the newest response is applied and cached. If you change the `AssetListPayload` shape, bump the cache `KEY`.
+- **Shortcut clones are built client-side.** `/api/assets` returns `{ assets, shortcuts: [assetId, folderPath][] }`; `expandAssetList` creates the `::sc::` clone entries.
 
 ### Supabase RLS
 
 - **`assets`, `shortcuts`, and `app_settings` are read-only for the user's anon-key client; all writes are service-role-only.** Authenticated clients get SELECT (the `/api/assets` route reads via the user session); every INSERT/UPDATE/DELETE goes through a server route or the sync pipeline using the service-role client from `getAdminClient()` (`src/lib/supabase/admin.ts`) — use it rather than hand-rolling `createClient`; it throws when the key is missing instead of falling back to the anon key, whose writes silently no-op under RLS. Mutating these tables from the browser will be denied by RLS. (Migrations: `supabase/migrations/2026-06-08_lockdown_write_rls.sql`, `2026-06-10_drop_authenticated_thumbnail_upload.sql` — both applied manually in the SQL Editor.)
+- **Bulk upserts NULL any column a row omits if another row in the batch includes it.** postgrest-js sends the union of keys as `columns`. "Omit the column to preserve it" only works when every row in the request has the same keys — use `groupRowsByColumns` (`src/lib/sync/asset-row.ts`). This silently wiped custom thumbnail URLs on alternate syncs until 2026-09-24.
 - **Supabase silently no-ops RLS-filtered updates** — no error returned, just zero rows affected. Always chain `.select('id')` after `.update()` if you need to verify rows actually changed.
 
 ### Configuration

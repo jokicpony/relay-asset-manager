@@ -24,6 +24,7 @@ create table public.assets (
     asset_type      text not null check (asset_type in ('photo', 'video')),
     folder_path     text not null,
     thumbnail_url   text,
+    thumb_color     text,                                  -- dominant colour placeholder (#rrggbb)
     preview_url     text,                                         -- video stream URL
     width           int not null default 0,
     height          int not null default 0,
@@ -79,8 +80,10 @@ create index idx_assets_embedding_hnsw on public.assets
 create index idx_assets_shoot_date on public.assets (parsed_shoot_date);
 create index idx_assets_creator    on public.assets (parsed_creator);
 create index idx_assets_folder     on public.assets (folder_path);
-create index idx_assets_active     on public.assets (is_active);
-create index idx_assets_drive_id   on public.assets (drive_file_id);
+-- Serves /api/assets: active rows ordered by (folder_path, name, id).
+-- (drive_file_id is indexed by its UNIQUE constraint.)
+create index idx_assets_active_folder_name on public.assets (folder_path, name, id)
+    where is_active;
 
 -- Partial index: only index rows in the trash queue
 create index idx_assets_deleted_at on public.assets (deleted_at)
@@ -142,10 +145,17 @@ create table public.sync_logs (
                          check (status in ('success', 'partial', 'failed')),
     error_message        text,
 
+    -- Activity log for both ingestion paths: 'cron' (scheduled sync) or
+    -- 'ingest' (in-app, after a Namer batch). details holds structured
+    -- problems + context (GitHub run URL, triggering user, per-file errors).
+    source               text not null default 'cron',
+    details              jsonb,
+
     created_at           timestamptz default now()
 );
 
 create index idx_sync_logs_finished on public.sync_logs (finished_at desc);
+create index idx_sync_logs_source_finished on public.sync_logs (source, finished_at desc);
 
 
 -- ────────────────────────────────────────────────────────────

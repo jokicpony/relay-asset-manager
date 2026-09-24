@@ -20,6 +20,7 @@ import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import type { AIMetadata } from '@/lib/namer/types';
 import { DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT } from '@/lib/namer/ai-defaults';
+import { isTimeoutError, namerErrorResponse } from '@/lib/namer/route-errors';
 import sharp from 'sharp';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
@@ -29,6 +30,13 @@ const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/
 const MAX_DIMENSION = 1024;
 const JPEG_QUALITY = 80;
 
+// Budget: scope check (≤10s) + Drive download (≤20s) + resize + Gemini (≤25s)
+export const maxDuration = 60;
+// Budgets leave ~15s of the 60s maxDuration for the scope check, token,
+// config and sharp on a large original.
+const DOWNLOAD_TIMEOUT_MS = 17_000;
+const GEMINI_TIMEOUT_MS = 22_000;
+
 /**
  * Fetch image from Drive and resize with sharp for cost optimization.
  * Converts to JPEG at 1024px max dimension / 0.80 quality.
@@ -37,17 +45,27 @@ async function fetchAndPrepareImage(
     fileId: string,
     token: string
 ): Promise<{ base64: string; mimeType: string }> {
-    // Fetch image content from Drive
-    const res = await fetch(
-        `${DRIVE_API}/files/${fileId}?alt=media&supportsAllDrives=true`,
-        { headers: { Authorization: `Bearer ${token}` } }
-    );
-
-    if (!res.ok) {
-        throw new Error(`Failed to fetch file from Drive: ${res.status} ${res.statusText}`);
+    // Fetch image content from Drive. The timeout also covers reading the
+    // body — a large original on a slow link is the likely stall.
+    let buffer: Buffer;
+    try {
+        const res = await fetch(
+            `${DRIVE_API}/files/${fileId}?alt=media&supportsAllDrives=true`,
+            { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) }
+        );
+        if (!res.ok) {
+            throw new Error(`Failed to fetch file from Drive: ${res.status} ${res.statusText}`);
+        }
+        buffer = Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+        if (isTimeoutError(err)) {
+            // Keep the TimeoutError name so namerErrorResponse answers 504, not 500
+            const timeout = new Error(`Downloading the image from Drive timed out after ${DOWNLOAD_TIMEOUT_MS / 1000}s`);
+            timeout.name = 'TimeoutError';
+            throw timeout;
+        }
+        throw err;
     }
-
-    const buffer = Buffer.from(await res.arrayBuffer());
     const originalKB = (buffer.length / 1024).toFixed(0);
 
     // Resize with sharp: 1024px max, JPEG 80% quality
@@ -117,8 +135,10 @@ export async function POST(request: NextRequest) {
         const userPrompt = aiSettings?.userPrompt || DEFAULT_USER_PROMPT;
 
         // API key goes in a header — keys in query strings leak into logs/traces
+        // (the timeout also covers reading the body)
         const geminiRes = await fetch(GEMINI_API_URL, {
             method: 'POST',
+            signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
             headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
             body: JSON.stringify({
                 contents: [{
@@ -166,8 +186,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(metadata);
 
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.error('namer-analyze', 'Unexpected error', { error: message });
-        return NextResponse.json({ error: message }, { status: 500 });
+        // Timeouts reaching here are Gemini's (the download maps its own)
+        return namerErrorResponse('namer-analyze', err, 'Gemini analysis');
     }
 }

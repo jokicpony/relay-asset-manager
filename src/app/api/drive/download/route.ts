@@ -1,29 +1,87 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { makeZip } from 'client-zip';
 import { createClient } from '@/lib/supabase/server';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { logger } from '@/lib/logger';
+import {
+    MAX_ZIP_BYTES,
+    MAX_ZIP_FILES,
+    createEntryNamer,
+    formatBytes,
+    type DownloadPreflightResponse,
+    type DownloadRequestFile,
+    type SkippedDownloadFile,
+} from '@/lib/download/shared';
+import {
+    checkDriveFile,
+    logStreamFailure,
+    mapWithConcurrency,
+    zipEntries,
+    type DriveCheck,
+} from '@/lib/download/drive-zip';
+
+export const runtime = 'nodejs';
+// A zip streams for as long as Drive keeps sending bytes. 300s is the
+// ceiling every Vercel plan accepts with fluid compute; MAX_ZIP_BYTES /
+// MAX_ZIP_FILES keep requests inside it.
+export const maxDuration = 300;
+
+/** Ids per `.in()` query — keeps the PostgREST URL well under proxy limits. */
+const SCOPE_QUERY_CHUNK = 100;
+/** Parallel Drive metadata lookups during preflight. */
+const PREFLIGHT_CONCURRENCY = 8;
+
+const OUT_OF_SCOPE_REASON = 'Not in the library (removed or outside the synced folders)';
+
+type SupabaseServerClient = Awaited<ReturnType<typeof createClient>>;
 
 /**
  * POST /api/drive/download
  *
- * Downloads multiple Google Drive files as a streaming zip archive.
- * Unlike the old approach, this streams data to the browser as each file
- * is fetched — no buffering everything in memory first.
+ * Body: { files: { driveFileId, name }[], mode?: 'zip' | 'preflight' }
+ * sent as JSON, or form-encoded as a single `payload` field holding that
+ * JSON (the download queue submits a hidden form so the browser streams the
+ * zip straight to disk instead of buffering it in a Blob).
  *
- * For a single file, redirects to the GET streaming endpoint instead.
+ * - mode 'preflight': JSON report of which files can be downloaded and why
+ *   the others can't (scope check + Drive metadata). Nothing is streamed.
+ * - mode 'zip' (default), 2+ files: streaming zip (client-zip — data
+ *   descriptors, UTF-8 names, ZIP64 when needed). Each Drive file is piped
+ *   through without buffering. Files that are out of scope or fail in Drive
+ *   are listed in a `_relay-download-report.txt` entry so the archive never
+ *   silently drops anything.
+ * - mode 'zip', 1 file: 303 redirect to the streaming GET endpoint.
  *
  * Uses a service account (via WIF) for Drive access.
- *
- * Body: { files: { driveFileId: string, name: string }[] }
  */
 export async function POST(request: NextRequest) {
     try {
-        const { files } = await request.json() as {
-            files: { driveFileId: string; name: string }[];
-        };
+        const contentType = request.headers.get('content-type') ?? '';
+        const isForm = contentType.includes('application/x-www-form-urlencoded')
+            || contentType.includes('multipart/form-data');
 
-        if (!files || files.length === 0) {
+        // Form posts are "simple" cross-site requests. The Supabase session
+        // cookie is SameSite=Lax so a cross-site post is unauthenticated
+        // anyway; this is defense in depth for browsers that send the header.
+        const fetchSite = request.headers.get('sec-fetch-site');
+        if (isForm && fetchSite && fetchSite !== 'same-origin') {
+            return NextResponse.json({ error: 'Cross-site download requests are not allowed' }, { status: 403 });
+        }
+
+        const body = await parseBody(request, isForm);
+        if (!body) {
+            return NextResponse.json({ error: 'Invalid download request' }, { status: 400 });
+        }
+        const { files, mode } = body;
+
+        if (files.length === 0) {
             return NextResponse.json({ error: 'No files specified' }, { status: 400 });
+        }
+        if (files.length > MAX_ZIP_FILES) {
+            return NextResponse.json(
+                { error: `Too many files (${files.length}) — downloads are limited to ${MAX_ZIP_FILES} files at a time.` },
+                { status: 413 }
+            );
         }
 
         // Verify user is authenticated
@@ -34,29 +92,34 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
         }
 
-        // Single file — redirect to the streaming GET endpoint
-        if (files.length === 1) {
+        // Single file — redirect to the streaming GET endpoint (which runs its
+        // own scope check). 303 so the follow-up request is a GET; the old 307
+        // replayed the POST against a GET-only route.
+        if (files.length === 1 && mode === 'zip') {
             const file = files[0];
             const url = new URL(
-                `/api/drive/download/${file.driveFileId}`,
+                `/api/drive/download/${encodeURIComponent(file.driveFileId)}`,
                 request.nextUrl.origin
             );
             url.searchParams.set('name', file.name);
-            return NextResponse.redirect(url);
+            return NextResponse.redirect(url, 303);
         }
 
-        // Authorization: restrict the zip to in-scope library files. The
+        // Authorization: restrict downloads to in-scope library files. The
         // service account can read the entire shared drive, so filter the
         // request down to files that actually exist as active assets
-        // (confused-deputy / IDOR).
-        const requestedIds = files.map((f) => f.driveFileId);
-        const { data: scopedRows } = await supabase
-            .from('assets')
-            .select('drive_file_id')
-            .in('drive_file_id', requestedIds)
-            .eq('is_active', true);
-        const inScope = new Set((scopedRows ?? []).map((r) => r.drive_file_id));
+        // (confused-deputy / IDOR). Applies to preflight and zip alike — the
+        // preflight is advisory, the zip re-checks.
+        const inScope = await findInScopeIds(supabase, files.map((f) => f.driveFileId));
         const allowedFiles = files.filter((f) => inScope.has(f.driveFileId));
+        const outOfScope: SkippedDownloadFile[] = files
+            .filter((f) => !inScope.has(f.driveFileId))
+            .map((f) => ({ ...f, reason: OUT_OF_SCOPE_REASON }));
+
+        if (mode === 'preflight') {
+            return await preflight(files, allowedFiles, inScope, request.signal);
+        }
+
         if (allowedFiles.length === 0) {
             return NextResponse.json({ error: 'No in-scope files to download' }, { status: 400 });
         }
@@ -64,102 +127,16 @@ export async function POST(request: NextRequest) {
         // Get Drive access token via WIF service account
         const accessToken = await getDriveAccessToken();
 
-        // Build a streaming zip response
-        const stream = new ReadableStream({
-            async start(controller) {
-                const encoder = new TextEncoder();
-                const centralDirectory: Uint8Array[] = [];
-                let offset = 0;
-
-                for (const file of allowedFiles) {
-                    try {
-                        const driveUrl = `https://www.googleapis.com/drive/v3/files/${file.driveFileId}?alt=media&supportsAllDrives=true`;
-                        const driveRes = await fetch(driveUrl, {
-                            headers: { Authorization: `Bearer ${accessToken}` },
-                        });
-
-                        if (!driveRes.ok) {
-                            logger.warn('download-zip', `Skipping ${file.name}: Drive ${driveRes.status}`);
-                            continue;
-                        }
-
-                        // We need the full data for CRC-32 calculation
-                        // For files within a zip, we fetch them individually (they're photos, not huge videos)
-                        const data = new Uint8Array(await driveRes.arrayBuffer());
-                        const fileName = encoder.encode(file.name);
-                        const crc = crc32(data);
-
-                        // Local file header (30 bytes + filename)
-                        const localHeader = new Uint8Array(30 + fileName.length);
-                        const lv = new DataView(localHeader.buffer);
-                        lv.setUint32(0, 0x04034b50, true);   // signature
-                        lv.setUint16(4, 20, true);             // version needed
-                        lv.setUint16(6, 0, true);              // flags
-                        lv.setUint16(8, 0, true);              // compression: stored
-                        lv.setUint16(10, 0, true);             // mod time
-                        lv.setUint16(12, 0, true);             // mod date
-                        lv.setUint32(14, crc, true);           // CRC-32
-                        lv.setUint32(18, data.length, true);   // compressed size
-                        lv.setUint32(22, data.length, true);   // uncompressed size
-                        lv.setUint16(26, fileName.length, true);
-                        lv.setUint16(28, 0, true);             // extra field length
-                        localHeader.set(fileName, 30);
-
-                        // Central directory entry (46 bytes + filename)
-                        const cdEntry = new Uint8Array(46 + fileName.length);
-                        const cv = new DataView(cdEntry.buffer);
-                        cv.setUint32(0, 0x02014b50, true);
-                        cv.setUint16(4, 20, true);
-                        cv.setUint16(6, 20, true);
-                        cv.setUint16(8, 0, true);
-                        cv.setUint16(10, 0, true);
-                        cv.setUint16(12, 0, true);
-                        cv.setUint16(14, 0, true);
-                        cv.setUint32(16, crc, true);
-                        cv.setUint32(20, data.length, true);
-                        cv.setUint32(24, data.length, true);
-                        cv.setUint16(28, fileName.length, true);
-                        cv.setUint16(30, 0, true);
-                        cv.setUint16(32, 0, true);
-                        cv.setUint16(34, 0, true);
-                        cv.setUint16(36, 0, true);
-                        cv.setUint32(38, 0, true);
-                        cv.setUint32(42, offset, true);
-                        cdEntry.set(fileName, 46);
-                        centralDirectory.push(cdEntry);
-
-                        // Enqueue the local header + data immediately (streaming!)
-                        controller.enqueue(localHeader);
-                        controller.enqueue(data);
-                        offset += localHeader.length + data.length;
-                    } catch (err) {
-                        logger.warn('download-zip', `Skipping ${file.name}: ${String(err)}`);
-                        continue;
-                    }
-                }
-
-                // Write central directory
-                for (const cd of centralDirectory) {
-                    controller.enqueue(cd);
-                }
-
-                // End of central directory record (22 bytes)
-                const cdSize = centralDirectory.reduce((sum, e) => sum + e.length, 0);
-                const eocd = new Uint8Array(22);
-                const ev = new DataView(eocd.buffer);
-                ev.setUint32(0, 0x06054b50, true);
-                ev.setUint16(4, 0, true);
-                ev.setUint16(6, 0, true);
-                ev.setUint16(8, centralDirectory.length, true);
-                ev.setUint16(10, centralDirectory.length, true);
-                ev.setUint32(12, cdSize, true);
-                ev.setUint32(16, offset, true);
-                ev.setUint16(20, 0, true);
-                controller.enqueue(eocd);
-
-                controller.close();
-            },
-        });
+        const nameFor = createEntryNamer();
+        const entries = allowedFiles.map((file) => ({ file, entryName: nameFor(file.name) }));
+        const skipped = [...outOfScope];
+        // Aborted by the request going away *or* by the response stream being
+        // cancelled (see logStreamFailure) — whichever the runtime reports.
+        const streamAbort = new AbortController();
+        const signal = AbortSignal.any([request.signal, streamAbort.signal]);
+        const zip = makeZip(
+            zipEntries(entries, skipped, files.length, accessToken, nameFor, signal)
+        );
 
         // Timestamp the zip so browsers don't block successive downloads as duplicates
         const now = new Date();
@@ -174,9 +151,11 @@ export async function POST(request: NextRequest) {
         const headers = new Headers();
         headers.set('Content-Type', 'application/zip');
         headers.set('Content-Disposition', `attachment; filename="relay-assets-${ts}.zip"`);
+        headers.set('Cache-Control', 'no-store');
+        headers.set('X-Content-Type-Options', 'nosniff');
         // No Content-Length — we're streaming and don't know total size upfront
 
-        return new NextResponse(stream, { status: 200, headers });
+        return new NextResponse(logStreamFailure(zip, entries.length, () => streamAbort.abort()), { status: 200, headers });
     } catch (err) {
         logger.error('download-zip', 'Download error', { error: String(err) });
         return NextResponse.json({ error: 'Failed to download files' }, { status: 500 });
@@ -184,15 +163,107 @@ export async function POST(request: NextRequest) {
 }
 
 // -----------------------------------------------------------------------
-// CRC-32 implementation (needed for zip file format)
+// Request parsing + scope
 // -----------------------------------------------------------------------
-function crc32(data: Uint8Array): number {
-    let crc = 0xFFFFFFFF;
-    for (let i = 0; i < data.length; i++) {
-        crc ^= data[i];
-        for (let j = 0; j < 8; j++) {
-            crc = (crc >>> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
+
+async function parseBody(
+    request: NextRequest,
+    isForm: boolean
+): Promise<{ files: DownloadRequestFile[]; mode: 'zip' | 'preflight' } | null> {
+    let raw: unknown;
+    try {
+        if (isForm) {
+            const payload = (await request.formData()).get('payload');
+            if (typeof payload !== 'string') return null;
+            raw = JSON.parse(payload);
+        } else {
+            raw = await request.json();
+        }
+    } catch {
+        return null;
+    }
+
+    const { files, mode } = (raw ?? {}) as { files?: unknown; mode?: unknown };
+    if (!Array.isArray(files)) return null;
+    if (mode !== undefined && mode !== 'zip' && mode !== 'preflight') return null;
+
+    const parsed: DownloadRequestFile[] = [];
+    for (const f of files) {
+        const { driveFileId, name } = (f ?? {}) as { driveFileId?: unknown; name?: unknown };
+        if (typeof driveFileId !== 'string' || driveFileId.length === 0 || driveFileId.length > 256) return null;
+        parsed.push({ driveFileId, name: typeof name === 'string' && name ? name : driveFileId });
+    }
+    return { files: parsed, mode: mode ?? 'zip' };
+}
+
+/** Same filter as before (`drive_file_id in (...) and is_active`), chunked. */
+async function findInScopeIds(supabase: SupabaseServerClient, ids: string[]): Promise<Set<string>> {
+    const unique = [...new Set(ids)];
+    const inScope = new Set<string>();
+    for (let i = 0; i < unique.length; i += SCOPE_QUERY_CHUNK) {
+        const { data, error } = await supabase
+            .from('assets')
+            .select('drive_file_id')
+            .in('drive_file_id', unique.slice(i, i + SCOPE_QUERY_CHUNK))
+            .eq('is_active', true);
+        // Fail closed, but loudly: an error used to read as "nothing in scope"
+        if (error) throw new Error(`Scope check failed: ${error.message}`);
+        for (const row of data ?? []) inScope.add(row.drive_file_id);
+    }
+    return inScope;
+}
+
+// -----------------------------------------------------------------------
+// Preflight
+// -----------------------------------------------------------------------
+
+async function preflight(
+    files: DownloadRequestFile[],
+    allowedFiles: DownloadRequestFile[],
+    inScope: Set<string>,
+    signal: AbortSignal
+): Promise<NextResponse> {
+    const checks = new Map<string, DriveCheck>();
+    if (allowedFiles.length > 0) {
+        const accessToken = await getDriveAccessToken();
+        const uniqueIds = [...new Set(allowedFiles.map((f) => f.driveFileId))];
+        const results = await mapWithConcurrency(uniqueIds, PREFLIGHT_CONCURRENCY,
+            (id) => checkDriveFile(id, accessToken, signal));
+        uniqueIds.forEach((id, i) => checks.set(id, results[i]));
+    }
+
+    // Walk the original request so `ready` / `skipped` keep the user's order
+    const ready: DownloadRequestFile[] = [];
+    const skipped: SkippedDownloadFile[] = [];
+    let totalBytes = 0;
+    for (const file of files) {
+        if (!inScope.has(file.driveFileId)) {
+            skipped.push({ ...file, reason: OUT_OF_SCOPE_REASON });
+            continue;
+        }
+        const check = checks.get(file.driveFileId)!;
+        if (check.ok) {
+            ready.push(file);
+            totalBytes += check.size;
+        } else {
+            skipped.push({ ...file, reason: check.reason });
         }
     }
-    return (crc ^ 0xFFFFFFFF) >>> 0;
+
+    if (skipped.length > 0) {
+        logger.warn('download-preflight', `${skipped.length} of ${files.length} files not downloadable`, {
+            reasons: [...new Set(skipped.map((s) => s.reason))],
+        });
+    }
+
+    // Single files stream Drive → browser directly; only zips are capped.
+    if (ready.length > 1 && totalBytes > MAX_ZIP_BYTES) {
+        return NextResponse.json(
+            { error: `Selection is ${formatBytes(totalBytes)} — zip downloads are limited to ${formatBytes(MAX_ZIP_BYTES)}. Select fewer files or download from Google Drive.` },
+            { status: 413 }
+        );
+    }
+
+    const response: DownloadPreflightResponse = { ready, skipped, totalBytes };
+    return NextResponse.json(response, { headers: { 'Cache-Control': 'no-store' } });
 }

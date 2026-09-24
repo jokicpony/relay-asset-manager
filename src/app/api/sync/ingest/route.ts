@@ -17,10 +17,14 @@ import { google } from 'googleapis';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { upsertAssets } from '@/lib/sync/upsert';
 import { processThumbnails } from '@/lib/sync/thumbnail-processor';
-import { IMAGE_MIMES, VIDEO_MIMES } from '@/lib/sync/mime';
+import { isAssetMime } from '@/lib/sync/mime';
+import { DRIVE_FILE_FIELDS, toDriveFile } from '@/lib/sync/drive-file';
+import { withDriveRetry } from '@/lib/sync/drive-retry';
+import { embedInputsChanged, EMBED_INPUT_COLUMNS, type EmbedInputs } from '@/lib/embedding-text';
+import { resolveFolderPathById, type FolderInfo } from '@/lib/google/folder-path';
 import { parseLabelFields, emptyRightsFields } from '@/lib/sync/rights-labels';
-import { parseFilename } from '@/lib/filename-utils';
 import { getConfig } from '@/lib/config';
+import { normalizeSyncFolders, isInSyncScope } from '@/lib/sync/scope';
 import { logger } from '@/lib/logger';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { getAdminClient } from '@/lib/supabase/admin';
@@ -31,64 +35,38 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 120; // 2 min max — targeted ingest is fast
 
 // ---------------------------------------------------------------------------
-// Folder path resolution
-//
-// pathCache is request-scoped (passed in by the handler) — never module-level.
-// A shared module cache would be corrupted by concurrent ingests, and the
-// end-of-request clear() would wipe another in-flight request's entries.
-//
-// Alongside the path, each folder carries an `ignored` flag: [relay-ignore]
-// in a folder's Drive description excludes it and all descendants, matching
-// the crawler in scripts/sync.ts. Without this check here, ingested assets
-// bounce — inserted now, soft-deleted as 'ignored' by the next cron sync.
+// Activity log — every ingest writes a sync_logs row (source 'ingest') so
+// failures are traceable in Settings → Recent activity, not only in the
+// requesting browser's Namer queue or Vercel's short-lived logs.
 // ---------------------------------------------------------------------------
-interface FolderInfo {
-    path: string;
-    ignored: boolean;
-}
-
-async function resolveFolderPath(
-    drive: ReturnType<typeof google.drive>,
-    parentId: string,
-    driveId: string,
-    pathCache: Map<string, FolderInfo>,
-): Promise<FolderInfo> {
-    if (parentId === driveId) return { path: '/', ignored: false };
-    if (pathCache.has(parentId)) return pathCache.get(parentId)!;
-
-    try {
-        const res = await drive.files.get({
-            fileId: parentId,
-            fields: 'id,name,parents,description',
-            supportsAllDrives: true,
-        });
-
-        const parent = res.data.parents?.[0]
-            ? await resolveFolderPath(drive, res.data.parents[0], driveId, pathCache)
-            : { path: '/', ignored: false };
-
-        const fullPath = parent.path === '/'
-            ? `/${res.data.name}`
-            : `${parent.path}/${res.data.name}`;
-
-        const info: FolderInfo = {
-            path: fullPath,
-            ignored: parent.ignored || Boolean(res.data.description?.includes('[relay-ignore]')),
-        };
-        pathCache.set(parentId, info);
-        return info;
-    } catch {
-        return { path: '/unknown', ignored: false };
-    }
-}
-
-/**
- * Check if a folder path is within the syncFolders scope.
- */
-function isInSyncScope(folderPath: string, syncFolders: string[]): boolean {
-    if (syncFolders.length === 0) return true; // No filter = everything is in scope
-    const topFolder = folderPath.split('/').filter(Boolean)[0]?.toLowerCase() ?? '';
-    return syncFolders.some(f => topFolder === f.toLowerCase());
+async function recordIngest(entry: {
+    startedAt: number;
+    status: 'success' | 'partial' | 'failed';
+    requested: number;
+    upserted: number;
+    upsertErrors: number;
+    thumbnails: number;
+    thumbnailErrors: number;
+    errorMessage: string | null;
+    details: Record<string, unknown>;
+}) {
+    const finished = Date.now();
+    const { error } = await getAdminClient().from('sync_logs').insert({
+        started_at: new Date(entry.startedAt).toISOString(),
+        finished_at: new Date(finished).toISOString(),
+        duration_secs: (finished - entry.startedAt) / 1000,
+        assets_found: entry.requested,
+        assets_upserted: entry.upserted,
+        upsert_errors: entry.upsertErrors,
+        thumbnails_uploaded: entry.thumbnails,
+        thumbnail_errors: entry.thumbnailErrors,
+        status: entry.status,
+        error_message: entry.errorMessage?.slice(0, 1000) ?? null,
+        source: 'ingest',
+        details: entry.details,
+    });
+    // Never fail the ingest over its own log entry
+    if (error) logger.warn('ingest', 'Could not write activity log', { error: error.message });
 }
 
 // ---------------------------------------------------------------------------
@@ -103,8 +81,18 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
     }
 
+    // Thumbnails stop starting new work at this point, leaving time for the
+    // DB updates and folder-map merge before the 120s limit. Anything
+    // deferred has no thumbnail row yet, so the cron picks it up.
+    const startedAt = Date.now();
+    const thumbnailDeadline = startedAt + 80_000;
+    let requestedCount = 0;
+    let destFolderForLog: string | null = null;
+
     try {
         const { fileIds, destFolderId } = await request.json();
+        requestedCount = Array.isArray(fileIds) ? fileIds.length : 0;
+        destFolderForLog = typeof destFolderId === 'string' ? destFolderId : null;
 
         if (!Array.isArray(fileIds) || fileIds.length === 0 || !destFolderId) {
             return NextResponse.json(
@@ -128,20 +116,11 @@ export async function POST(request: NextRequest) {
         auth.setCredentials({ access_token: accessToken });
         const drive = google.drive({ version: 'v3', auth });
 
-        // Request-scoped folder path cache (see resolveFolderPath note above).
+        // Request-scoped folder cache (path + inherited [relay-ignore] flag)
         const pathCache = new Map<string, FolderInfo>();
 
-        const syncFolders = config.syncFolders.map(f => f.toLowerCase());
+        const syncFolders = normalizeSyncFolders(config.syncFolders);
         const labelId = config.driveLabelId;
-
-        // Fields to request — full metadata including labels and dimensions
-        const fileFields = [
-            'id', 'name', 'mimeType', 'size', 'description', 'parents',
-            'thumbnailLink', 'webViewLink', 'createdTime', 'modifiedTime',
-            'imageMediaMetadata(width,height)',
-            'videoMediaMetadata(width,height,durationMillis)',
-            'labelInfo',
-        ].join(',');
 
         const driveFiles: DriveFile[] = [];
         const skipped: { fileId: string; reason: string }[] = [];
@@ -155,12 +134,14 @@ export async function POST(request: NextRequest) {
             const chunk = fileIds.slice(chunkStart, chunkStart + FETCH_CHUNK);
             const fetched = await Promise.all(chunk.map(async (fileId: string) => {
                 try {
-                    const res = await drive.files.get({
+                    // One retry layer: the client's built-in retry is off so
+                    // attempts don't multiply past the route's time limit.
+                    const res = await withDriveRetry(() => drive.files.get({
                         fileId,
-                        fields: fileFields,
+                        fields: DRIVE_FILE_FIELDS,
                         supportsAllDrives: true,
                         includeLabels: labelId || undefined,
-                    });
+                    }, { retry: false }), `files.get ${fileId}`, (m) => logger.warn('ingest', m), 3);
                     return { fileId, file: res.data };
                 } catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
@@ -182,9 +163,7 @@ export async function POST(request: NextRequest) {
 
                 try {
                     // Check it's a supported asset type
-                    const isImage = IMAGE_MIMES.has(file.mimeType);
-                    const isVideo = VIDEO_MIMES.has(file.mimeType);
-                    if (!isImage && !isVideo) {
+                    if (!isAssetMime(file.mimeType)) {
                         skipped.push({ fileId, reason: `Unsupported mime type: ${file.mimeType}` });
                         continue;
                     }
@@ -198,7 +177,7 @@ export async function POST(request: NextRequest) {
                         continue;
                     }
 
-                    const { path: folderPath, ignored } = await resolveFolderPath(drive, parentId, driveId, pathCache);
+                    const { path: folderPath, ignored } = await resolveFolderPathById(accessToken, parentId, driveId, pathCache);
 
                     if (ignored) {
                         skipped.push({ fileId, reason: `Folder tagged [relay-ignore]: ${folderPath}` });
@@ -212,50 +191,11 @@ export async function POST(request: NextRequest) {
                         continue;
                     }
 
-                    // Parse rights labels
+                    // Rights labels + the shared Drive → DriveFile mapping
                     const rights = labelId
                         ? parseLabelFields(file, labelId, config.rightsLabelConfig)
                         : emptyRightsFields();
-
-                    // Extract dimensions
-                    const width = isImage
-                        ? file.imageMediaMetadata?.width ?? 0
-                        : file.videoMediaMetadata?.width ?? 0;
-                    const height = isImage
-                        ? file.imageMediaMetadata?.height ?? 0
-                        : file.videoMediaMetadata?.height ?? 0;
-                    const duration = isVideo && file.videoMediaMetadata?.durationMillis
-                        ? Number(file.videoMediaMetadata.durationMillis) / 1000
-                        : null;
-
-                    // Parse filename for structured metadata
-                    const parsed = parseFilename(file.name);
-
-                    driveFiles.push({
-                        id: file.id,
-                        name: file.name,
-                        mimeType: file.mimeType,
-                        description: file.description ?? null,
-                        folderPath,
-                        thumbnailLink: file.thumbnailLink ?? null,
-                        webViewLink: file.webViewLink ?? null,
-                        width,
-                        height,
-                        duration,
-                        assetType: isVideo ? 'video' : 'photo',
-                        createdTime: file.createdTime ?? file.modifiedTime ?? new Date().toISOString(),
-                        modifiedTime: file.modifiedTime ?? new Date().toISOString(),
-                        organicRights: rights.organicRights,
-                        organicRightsExpiration: rights.organicRightsExpiration,
-                        paidRights: rights.paidRights,
-                        paidRightsExpiration: rights.paidRightsExpiration,
-                        creator: null,
-                        projectDescription: null,
-                        parsedCreator: parsed.creator,
-                        parsedShootDate: parsed.shootDate?.toISOString().split('T')[0] ?? null,
-                        parsedShootDescription: parsed.shootDescription,
-                        fileSize: file.size ? Number(file.size) : null,
-                    });
+                    driveFiles.push(toDriveFile(file, folderPath, rights));
                 } catch (err) {
                     // Per-file isolation — one malformed file must not fail the batch
                     const msg = err instanceof Error ? err.message : String(err);
@@ -272,6 +212,13 @@ export async function POST(request: NextRequest) {
 
         if (driveFiles.length === 0) {
             logger.info('ingest', 'No files to ingest after re-validation', { skipped: skipped.length });
+            await recordIngest({
+                startedAt, status: errors.length > 0 ? 'failed' : 'partial',
+                requested: fileIds.length, upserted: 0, upsertErrors: 0, thumbnails: 0, thumbnailErrors: 0,
+                errorMessage: `Nothing ingested: ${skipped.length} skipped, ${errors.length} errors`
+                    + (errors[0] ? ` (first error: ${errors[0]})` : skipped[0] ? ` (first skip: ${skipped[0].reason})` : ''),
+                details: { user: user.email ?? null, destFolderId, errors, skipped },
+            });
             return NextResponse.json({
                 ingested: 0,
                 thumbnails: 0,
@@ -280,9 +227,49 @@ export async function POST(request: NextRequest) {
             });
         }
 
+        // Embedding inputs of files already in the library, before this upsert.
+        // The ingest doesn't embed; if a re-ingest changes what the embedding
+        // is built from (rename, move, new description), the embedding is
+        // cleared below so the scheduled sync regenerates it. The sync can't
+        // detect this itself — by then its snapshot already has the new values.
+        const adminClient = getAdminClient();
+        const before = new Map<string, EmbedInputs>();
+        const ids = driveFiles.map(f => f.id);
+        for (let i = 0; i < ids.length; i += 150) {
+            const { data } = await adminClient
+                .from('assets')
+                .select(`drive_file_id, ${EMBED_INPUT_COLUMNS}`)
+                .in('drive_file_id', ids.slice(i, i + 150));
+            for (const { drive_file_id, ...inputs } of (data ?? []) as unknown as (EmbedInputs & { drive_file_id: string })[]) {
+                before.set(drive_file_id, inputs);
+            }
+        }
+
         // ── Upsert assets into the database ──
         logger.info('ingest', `Upserting ${driveFiles.length} assets`);
-        const { upserted, errors: upsertErrors } = await upsertAssets(driveFiles);
+        const { upserted, errors: upsertErrors } = await upsertAssets(driveFiles, { labelsFetched: !!labelId });
+
+        const staleEmbeddings = driveFiles.filter(f => {
+            const prev = before.get(f.id);
+            return prev && embedInputsChanged(prev, {
+                name: f.name,
+                description: f.description,
+                folder_path: f.folderPath,
+                parsed_creator: f.parsedCreator,
+                parsed_shoot_description: f.parsedShootDescription,
+            });
+        }).map(f => f.id);
+        for (let i = 0; i < staleEmbeddings.length; i += 150) {
+            const chunk = staleEmbeddings.slice(i, i + 150);
+            const { error: clearErr } = await adminClient
+                .from('assets')
+                .update({ embedding: null })
+                .in('drive_file_id', chunk);
+            if (clearErr) errors.push(`Could not mark ${chunk.length} embeddings for refresh: ${clearErr.message}`);
+        }
+        if (staleEmbeddings.length > 0) {
+            logger.info('ingest', `Marked ${staleEmbeddings.length} changed assets for re-embedding`);
+        }
 
         if (upsertErrors.length > 0) {
             errors.push(...upsertErrors);
@@ -296,16 +283,15 @@ export async function POST(request: NextRequest) {
             mimeType: f.mimeType,
         }));
 
-        const urlMap = await processThumbnails(accessToken, thumbFiles);
+        const urlMap = await processThumbnails(accessToken, thumbFiles, thumbnailDeadline);
 
         // Update thumbnail URLs in the database
-        const adminClient = getAdminClient();
 
         let thumbnailsUpdated = 0;
-        for (const [driveFileId, publicUrl] of urlMap) {
+        for (const [driveFileId, { url, color }] of urlMap) {
             const { error } = await adminClient
                 .from('assets')
-                .update({ thumbnail_url: publicUrl })
+                .update({ thumbnail_url: url, ...(color ? { thumb_color: color } : {}) })
                 .eq('drive_file_id', driveFileId);
             if (!error) thumbnailsUpdated++;
         }
@@ -339,6 +325,24 @@ export async function POST(request: NextRequest) {
             errors: errors.length,
         });
 
+        const missingThumbs = driveFiles.length - urlMap.size;
+        const summary = [
+            errors.length > 0 && `${errors.length} errors (first: ${errors[0]})`,
+            skipped.length > 0 && `${skipped.length} skipped (first: ${skipped[0].reason})`,
+            missingThumbs > 0 && `${missingThumbs} without a thumbnail yet — the scheduled sync retries`,
+        ].filter(Boolean).join(' · ');
+        await recordIngest({
+            startedAt,
+            status: summary ? 'partial' : 'success',
+            requested: fileIds.length,
+            upserted,
+            upsertErrors: upsertErrors.length,
+            thumbnails: thumbnailsUpdated,
+            thumbnailErrors: missingThumbs,
+            errorMessage: summary || null,
+            details: { user: user.email ?? null, destFolderId, errors, skipped },
+        });
+
         return NextResponse.json({
             ingested: upserted,
             thumbnails: thumbnailsUpdated,
@@ -349,6 +353,12 @@ export async function POST(request: NextRequest) {
     } catch (err) {
         const message = err instanceof Error ? err.message : 'Unknown error';
         logger.error('ingest', 'Targeted ingest failed', { error: message });
+        await recordIngest({
+            startedAt, status: 'failed', requested: requestedCount,
+            upserted: 0, upsertErrors: 0, thumbnails: 0, thumbnailErrors: 0,
+            errorMessage: `Ingest failed: ${message}`,
+            details: { user: user.email ?? null, destFolderId: destFolderForLog, stack: err instanceof Error ? err.stack?.slice(0, 2000) : null },
+        });
         return NextResponse.json({ error: message }, { status: 500 });
     }
 }

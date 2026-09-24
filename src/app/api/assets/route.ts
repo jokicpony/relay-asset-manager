@@ -1,17 +1,20 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
-import { Asset } from '@/types';
+import type { Asset, AssetListPayload } from '@/types';
 import { logger } from '@/lib/logger';
 
-// Columns to fetch — excludes `embedding`, `deleted_at`, `deleted_reason`
+// Columns to fetch — only what the client reads. Excludes `embedding`,
+// the trash fields, and preview_url / is_active / updated_at (never used by
+// the browser; the list is ~8k entries, so every field counts).
 const ASSET_COLUMNS = [
     'id', 'drive_file_id', 'name', 'description', 'mime_type', 'asset_type',
-    'folder_path', 'thumbnail_url', 'preview_url', 'width', 'height', 'duration',
+    'folder_path', 'thumbnail_url', 'thumb_color', 'width', 'height', 'duration',
     'organic_rights', 'organic_rights_expiration', 'paid_rights', 'paid_rights_expiration',
-    'creator', 'project_description', 'parsed_creator', 'parsed_shoot_date',
-    'parsed_shoot_description', 'tags', 'created_at', 'updated_at',
-    'drive_created_at', 'drive_modified_at', 'file_size', 'is_active',
+    'creator', 'project_description', 'tags', 'created_at',
+    'drive_created_at', 'file_size',
 ].join(', ');
+
+const PAGE_SIZE = 1000; // PostgREST's max rows per select
 
 interface DbAsset {
     id: string;
@@ -22,7 +25,7 @@ interface DbAsset {
     asset_type: 'photo' | 'video';
     folder_path: string;
     thumbnail_url: string | null;
-    preview_url: string | null;
+    thumb_color: string | null;
     width: number;
     height: number;
     duration: number | null;
@@ -32,19 +35,13 @@ interface DbAsset {
     paid_rights_expiration: string | null;
     creator: string | null;
     project_description: string | null;
-    parsed_creator: string | null;
-    parsed_shoot_date: string | null;
-    parsed_shoot_description: string | null;
     tags: string[];
     created_at: string;
-    updated_at: string;
     drive_created_at: string | null;
-    drive_modified_at: string | null;
     file_size: number | null;
-    is_active: boolean;
 }
 
-function mapDbAsset(row: DbAsset, shortcutFolders?: string[]): Asset {
+function mapDbAsset(row: DbAsset): Asset {
     return {
         id: row.id,
         driveFileId: row.drive_file_id,
@@ -54,7 +51,7 @@ function mapDbAsset(row: DbAsset, shortcutFolders?: string[]): Asset {
         assetType: row.asset_type,
         folderPath: row.folder_path,
         thumbnailUrl: row.thumbnail_url || '/placeholder-thumb.svg',
-        previewUrl: row.preview_url ?? undefined,
+        thumbColor: row.thumb_color ?? undefined,
         width: row.width || 400,
         height: row.height || 300,
         duration: row.duration ?? undefined,
@@ -67,17 +64,15 @@ function mapDbAsset(row: DbAsset, shortcutFolders?: string[]): Asset {
         projectDescription: row.project_description,
         tags: row.tags ?? [],
         createdAt: row.drive_created_at ?? row.created_at,
-        updatedAt: row.drive_modified_at ?? row.updated_at,
-        isActive: row.is_active,
-        shortcutFolders,
     };
 }
 
 /**
  * GET /api/assets
  *
- * Returns all active assets with shortcut enrichment.
- * Runs server-side for lower latency to Supabase + automatic gzip compression.
+ * Returns all active assets plus shortcut links as an AssetListPayload.
+ * Shortcut clone entries are built client-side (expandAssetList) rather
+ * than serialized here.
  */
 export async function GET() {
     const supabase = await createClient();
@@ -87,90 +82,84 @@ export async function GET() {
     }
 
     try {
-        // Fetch shortcuts (paginated — PostgREST caps a select at 1000 rows,
-        // which silently dropped relay badges and virtual project folders
-        // once the table grew past that) alongside the asset pages.
-        const shortcutMap = new Map<string, string[]>();
-        const shortcutPromise = (async () => {
-            for (let from = 0; ; from += 1000) {
+        const assetPage = (from: number) => supabase
+            .from('assets')
+            .select(ASSET_COLUMNS)
+            .eq('is_active', true)
+            .order('folder_path', { ascending: true })
+            .order('name', { ascending: true })
+            // Unique tie-breaker: Drive allows duplicate names in a folder,
+            // and offset paging over non-unique sort keys can skip or
+            // repeat rows at page boundaries.
+            .order('id', { ascending: true })
+            .range(from, from + PAGE_SIZE - 1);
+
+        // Shortcuts, paginated — PostgREST caps a select at 1000 rows.
+        const shortcutsPromise = (async () => {
+            const pairs: [string, string][] = [];
+            for (let from = 0; ; from += PAGE_SIZE) {
                 const { data, error } = await supabase
                     .from('shortcuts')
                     .select('target_asset_id, project_folder_path')
                     .order('id')
-                    .range(from, from + 999);
+                    .range(from, from + PAGE_SIZE - 1);
                 if (error) {
                     logger.warn('shortcuts', 'Query error', { error: error.message });
-                    return;
+                    break;
                 }
-                for (const s of data ?? []) {
-                    const existing = shortcutMap.get(s.target_asset_id) || [];
-                    existing.push(s.project_folder_path);
-                    shortcutMap.set(s.target_asset_id, existing);
-                }
-                if (!data || data.length < 1000) return;
+                for (const s of data ?? []) pairs.push([s.target_asset_id, s.project_folder_path]);
+                if (!data || data.length < PAGE_SIZE) break;
             }
+            return pairs;
         })();
 
-        // Fetch all asset pages while the shortcuts query runs concurrently
-        const PAGE_SIZE = 1000;
-        const allRows: DbAsset[] = [];
-        let offset = 0;
-        let hasMore = true;
+        // Count first, then fetch every page concurrently — the pages used to
+        // be fetched one after another (~7 round trips at the current size).
+        const { count, error: countErr } = await supabase
+            .from('assets')
+            .select('id', { count: 'exact', head: true })
+            .eq('is_active', true);
+        if (countErr) {
+            logger.error('assets', 'Failed to count assets', { error: countErr.message });
+            return NextResponse.json({ error: 'Failed to fetch assets' }, { status: 500 });
+        }
 
-        while (hasMore) {
-            const { data, error } = await supabase
-                .from('assets')
-                .select(ASSET_COLUMNS)
-                .eq('is_active', true)
-                .order('folder_path', { ascending: true })
-                .order('name', { ascending: true })
-                // Unique tie-breaker: Drive allows duplicate names in a folder,
-                // and offset paging over non-unique sort keys can skip or
-                // repeat rows at page boundaries.
-                .order('id', { ascending: true })
-                .range(offset, offset + PAGE_SIZE - 1);
+        const pageCount = Math.max(1, Math.ceil((count ?? 0) / PAGE_SIZE));
+        const pages = await Promise.all(
+            Array.from({ length: pageCount }, (_, i) => assetPage(i * PAGE_SIZE))
+        );
 
+        const rows: DbAsset[] = [];
+        for (const { data, error } of pages) {
             if (error) {
                 logger.error('assets', 'Failed to fetch assets', { error: error.message });
                 return NextResponse.json({ error: 'Failed to fetch assets' }, { status: 500 });
             }
-
-            allRows.push(...(data as unknown as DbAsset[]));
-            hasMore = data.length === PAGE_SIZE;
-            offset += PAGE_SIZE;
+            rows.push(...(data as unknown as DbAsset[]));
+        }
+        // Rows inserted after the count: keep reading past the last page.
+        for (let from = pageCount * PAGE_SIZE, last = pages[pages.length - 1].data?.length ?? 0;
+            last === PAGE_SIZE; from += PAGE_SIZE) {
+            const { data, error } = await assetPage(from);
+            if (error || !data) break;
+            rows.push(...(data as unknown as DbAsset[]));
+            last = data.length;
         }
 
-        // Shortcut map must be complete before enrichment
-        await shortcutPromise;
-
-        // Map to frontend Asset type with shortcut enrichment
-        const allAssets: Asset[] = allRows.map((row) =>
-            mapDbAsset(row, shortcutMap.get(row.id))
-        );
-
-        // Create shortcut clone entries
-        if (shortcutMap.size > 0) {
-            const assetById = new Map(allAssets.map(a => [a.id, a]));
-            for (const [assetId, folders] of shortcutMap) {
-                const master = assetById.get(assetId);
-                if (!master) continue;
-                const uniqueFolders = [...new Set(folders)];
-                for (const folder of uniqueFolders) {
-                    allAssets.push({
-                        ...master,
-                        id: `${assetId}::sc::${folder}`,
-                        folderPath: folder,
-                        isShortcut: true,
-                        originalFolderPath: master.folderPath,
-                        shortcutFolders: undefined,
-                    });
-                }
-            }
+        // A concurrent insert/delete can shift offsets between pages — dedupe.
+        const seen = new Set<string>();
+        const assets: Asset[] = [];
+        for (const row of rows) {
+            if (seen.has(row.id)) continue;
+            seen.add(row.id);
+            assets.push(mapDbAsset(row));
         }
 
-        logger.info('assets', `Served ${allAssets.length} assets (${allRows.length} real + ${allAssets.length - allRows.length} shortcuts)`);
+        const shortcuts = await shortcutsPromise;
+        logger.info('assets', `Served ${assets.length} assets + ${shortcuts.length} shortcut links`);
 
-        return NextResponse.json(allAssets, {
+        const payload: AssetListPayload = { assets, shortcuts };
+        return NextResponse.json(payload, {
             headers: {
                 'Cache-Control': 'private, max-age=60, stale-while-revalidate=300',
             },

@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
+import { useState, useMemo, useCallback, useEffect, useRef, useDeferredValue } from 'react';
 import { Asset, SearchFilters, FolderNode } from '@/types';
-import { fetchAllAssets, buildFolderTree } from '@/lib/supabase/queries';
+import { fetchAssetPayload, expandAssetList, loadCachedAssets, writeCachedAssetList, buildFolderTree } from '@/lib/supabase/queries';
 import { parseFilename, resolveCreator } from '@/lib/filename-utils';
 import { isAssetFullyExpired, isAnyRightExpired, getComplianceBadges } from '@/lib/badge-utils';
 import AssetCard from '@/components/AssetCard';
@@ -18,6 +18,14 @@ import RelayHistory, { useRelayHistory } from '@/components/RelayHistory';
 import NamerView from '@/components/namer/NamerView';
 
 const PAGE_SIZE = 48;
+
+// Ascending by days remaining; Infinity (no expiry) last. Plain subtraction
+// gives NaN for Infinity - Infinity, which breaks sort stability.
+const compareDays = (a: number, b: number) => (a === b ? 0 : a < b ? -1 : 1);
+const LS_HIDDEN_FOLDERS = 'ram_hidden_folders';
+// Roughly the first screen of cards: loaded eagerly at high priority rather
+// than waiting on lazy-loading's intersection check.
+const EAGER_CARDS = 12;
 
 // True when `path` is `parent` itself or nested inside it. Plain startsWith
 // would also match sibling folders sharing a name prefix ("/Studio Archive"
@@ -119,10 +127,40 @@ export default function Home() {
   const [pinboardIds, setPinboardIds] = useState<Set<string>>(new Set());
   const [pinboardActive, setPinboardActive] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
+
+  // Scheduled-sync health for the header indicator (see /api/sync/activity).
+  // Checked on load, every 15 minutes, and when Settings closes (a sync may
+  // have just been run from there).
+  const [syncHealth, setSyncHealth] = useState<{
+    issue: 'failed' | 'stale' | null; latestError: string | null; staleAfterHours: number;
+  } | null>(null);
+  const checkSyncHealth = useCallback(() => {
+    fetch('/api/sync/activity?limit=0', { cache: 'no-store' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(body => { if (body?.health) setSyncHealth(body.health); })
+      .catch(() => { /* indicator is best-effort */ });
+  }, []);
+  useEffect(() => {
+    checkSyncHealth();
+    const t = setInterval(checkSyncHealth, 15 * 60_000);
+    return () => clearInterval(t);
+  }, [checkSyncHealth]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [semanticResults, setSemanticResults] = useState<Map<string, number> | null>(null); // null = not searching
   const [semanticLoading, setSemanticLoading] = useState(false);
-  const [hiddenFolders, setHiddenFolders] = useState<string[]>([]);
+  // Seeded from localStorage so a cached asset list (painted before
+  // /api/settings/config returns) doesn't briefly show hidden folders.
+  const [hiddenFolders, setHiddenFolders] = useState<string[]>(() => {
+    try {
+      const v = typeof window !== 'undefined' ? JSON.parse(localStorage.getItem(LS_HIDDEN_FOLDERS) ?? '[]') : [];
+      return Array.isArray(v) ? v : [];
+    } catch {
+      return [];
+    }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(LS_HIDDEN_FOLDERS, JSON.stringify(hiddenFolders)); } catch { /* storage blocked */ }
+  }, [hiddenFolders]);
 
 
   const [userInitials, setUserInitials] = useState('?');
@@ -209,11 +247,24 @@ export default function Home() {
   // Refresh the asset list + folder tree from the server. Single source of
   // truth for the flows that re-pull after a mutation (ingest, relay, trash) —
   // fresh:true bypasses the 60s browser cache so the change shows immediately.
-  const refreshAssets = useCallback(async () => {
-    const data = await fetchAllAssets({ fresh: true });
+  // Every asset-list fetch takes a sequence number; a response is applied
+  // (and cached) only if no newer fetch has started since. Otherwise a slow
+  // first load could land after a post-mutation refresh and revert it.
+  const assetFetchSeqRef = useRef(0);
+  const loadAssetList = useCallback(async (fresh: boolean): Promise<Asset[] | null> => {
+    const seq = ++assetFetchSeqRef.current;
+    const payload = await fetchAssetPayload({ fresh });
+    if (seq !== assetFetchSeqRef.current) return null; // superseded
+    const data = expandAssetList(payload);
     setAssets(data);
     setFolderTree(buildFolderTree(data));
+    void writeCachedAssetList(payload);
+    return data;
   }, []);
+
+  const refreshAssets = useCallback(async () => {
+    await loadAssetList(true);
+  }, [loadAssetList]);
 
   // Fetch trash queue
   const fetchTrash = useCallback(async () => {
@@ -287,23 +338,35 @@ export default function Home() {
     }
   }, []);
 
+  // The debounce timer pending for the current query, so Enter can fire the
+  // search immediately instead of also letting the timer fire a duplicate.
+  const pendingSearchRef = useRef<{ timer: ReturnType<typeof setTimeout>; controller: AbortController } | null>(null);
+
   // Debounced semantic search on query change (800ms pause)
   useEffect(() => {
     const query = filters.query.trim();
     if (query.length < 2) {
+      // Invalidate any in-flight search and clear its spinner — a timer
+      // cancelled before it fired never reaches runSemanticSearch's finally,
+      // which left the loading indicator pulsing forever.
+      searchCounterRef.current++;
       setSemanticResults(null);
+      setSemanticLoading(false);
       return;
     }
 
     setSemanticLoading(true);
-    const abortController = new AbortController();
+    const controller = new AbortController();
     const timer = setTimeout(() => {
-      runSemanticSearch(query, abortController.signal);
+      pendingSearchRef.current = null;
+      runSemanticSearch(query, controller.signal);
     }, 800);
+    pendingSearchRef.current = { timer, controller };
 
     return () => {
       clearTimeout(timer);
-      abortController.abort();
+      controller.abort();
+      pendingSearchRef.current = null;
       // Don't reset semanticLoading here — the finally block in
       // runSemanticSearch handles it. Resetting here caused flicker
       // on every keystroke.
@@ -314,8 +377,15 @@ export default function Home() {
   const triggerSemanticSearch = useCallback(() => {
     const query = filters.query.trim();
     if (query.length < 2) return;
+    // Take over the pending debounce (its abort signal still cancels this
+    // search if the query changes) rather than searching twice.
+    const pending = pendingSearchRef.current;
+    if (pending) {
+      clearTimeout(pending.timer);
+      pendingSearchRef.current = null;
+    }
     setSemanticLoading(true);
-    runSemanticSearch(query);
+    runSemanticSearch(query, pending?.controller.signal);
   }, [filters.query, runSemanticSearch]);
 
   // Load assets from Supabase on mount + fetch hidden folders config
@@ -323,23 +393,41 @@ export default function Home() {
     let cancelled = false;
 
     async function loadAssets() {
+      setLoading(true);
+      setError(null);
+
+      // Start the network fetch right away, then paint the last-known list
+      // from IndexedDB while it's in flight (stale-while-revalidate): a
+      // returning visit shows the library immediately instead of a skeleton.
+      let freshApplied = false;
+      const freshPromise = loadAssetList(false).then((r) => { freshApplied = true; return r; });
+      const mySeq = assetFetchSeqRef.current; // loadAssetList bumps it synchronously
+
+      // Hidden folders apply independently of the asset fetch's outcome
+      fetch('/api/settings/config')
+        .then(r => r.ok ? r.json() : null)
+        .then(configRes => {
+          if (!cancelled && Array.isArray(configRes?.hiddenFolders)) setHiddenFolders(configRes.hiddenFolders);
+        })
+        .catch(() => { /* keep the locally cached hidden folders */ });
+
+      let showedCache = false;
+      const cached = await loadCachedAssets();
+      // Only if the network hasn't already delivered (or been superseded)
+      if (!cancelled && cached && cached.length > 0 && assetFetchSeqRef.current === mySeq && !freshApplied) {
+        setAssets(cached);
+        setFolderTree(buildFolderTree(cached));
+        setLoading(false);
+        showedCache = true;
+      }
+
       try {
-        setLoading(true);
-        setError(null);
-        const [data, configRes] = await Promise.all([
-          fetchAllAssets(),
-          fetch('/api/settings/config').then(r => r.ok ? r.json() : null).catch(() => null),
-        ]);
-        if (!cancelled) {
-          setAssets(data);
-          setFolderTree(buildFolderTree(data));
-          if (configRes?.hiddenFolders) {
-            setHiddenFolders(configRes.hiddenFolders);
-          }
-          setLoading(false);
-        }
+        await freshPromise;
+        if (!cancelled) setLoading(false);
       } catch (err) {
-        if (!cancelled) {
+        // With a cached list on screen, a failed refresh isn't fatal — keep
+        // showing it rather than replacing the library with an error.
+        if (!cancelled && !showedCache) {
           setError(err instanceof Error ? err.message : 'Failed to load assets');
           setLoading(false);
         }
@@ -348,7 +436,7 @@ export default function Home() {
 
     loadAssets();
     return () => { cancelled = true; };
-  }, []);
+  }, [loadAssetList]); // stable (useCallback with no deps) — runs once
 
   // Re-fetch assets when a deferred ingest completes (namer → DAM pipeline)
   useEffect(() => {
@@ -380,8 +468,37 @@ export default function Home() {
     return idx;
   }, [assets]);
 
+  // Per-asset values the filter/sort pass needs, computed once per asset list.
+  // They used to be recomputed inside the filter and the sort comparator on
+  // every keystroke — Date parsing and full compliance-badge evaluation,
+  // O(n log n) times for the "expiring" sorts.
+  const derived = useMemo(() => {
+    const map = new Map<string, {
+      createdMs: number; orgDays: number; paidDays: number;
+      fullyExpired: boolean; anyExpired: boolean; ratio: number;
+    }>();
+    for (const asset of assets) {
+      const [orgBadge, paidBadge] = getComplianceBadges(asset);
+      map.set(asset.id, {
+        createdMs: new Date(asset.createdAt).getTime() || 0,
+        orgDays: orgBadge.daysRemaining ?? Infinity,
+        paidDays: paidBadge.daysRemaining ?? Infinity,
+        fullyExpired: isAssetFullyExpired(asset),
+        anyExpired: isAnyRightExpired(asset),
+        ratio: asset.width / asset.height,
+      });
+    }
+    return map;
+  }, [assets]);
+
+  // Typing updates `filters` immediately (the input stays responsive); the
+  // grid recomputes from this deferred copy, which React can interrupt.
+  const deferredFilters = useDeferredValue(filters);
+
   // Filter and sort assets based on current filters
   const { filteredAssets, textMatchIds } = useMemo((): { filteredAssets: Asset[]; textMatchIds: Set<string> } => {
+    const filters = deferredFilters;
+    const d = (asset: Asset) => derived.get(asset.id)!;
     const textMatchIds = new Set<string>();
     const filtered = assets.filter((asset) => {
       // Folder scope
@@ -403,7 +520,7 @@ export default function Home() {
 
       // Orientation
       if (filters.orientation !== 'all') {
-        const ratio = asset.width / asset.height;
+        const ratio = d(asset).ratio;
         if (filters.orientation === 'landscape' && ratio <= 1.1) return false;
         if (filters.orientation === 'portrait' && ratio >= 0.9) return false;
         if (filters.orientation === 'square' && (ratio < 0.9 || ratio > 1.1)) return false;
@@ -412,8 +529,8 @@ export default function Home() {
       // Expired mode filter
       // 'hide' = fully expired (both sides dead) — still shows assets with one valid side
       // 'only' = any expired (either side) — surfaces everything needing attention
-      if (filters.expiredMode === 'hide' && isAssetFullyExpired(asset)) return false;
-      if (filters.expiredMode === 'only' && !isAnyRightExpired(asset)) return false;
+      if (filters.expiredMode === 'hide' && d(asset).fullyExpired) return false;
+      if (filters.expiredMode === 'only' && !d(asset).anyExpired) return false;
 
       // Text query — hybrid approach:
       // Include assets matching EITHER semantic IDs OR client-side text search.
@@ -467,23 +584,13 @@ export default function Home() {
       filtered.sort((a: Asset, b: Asset) => {
         switch (filters.sortBy) {
           case 'newest':
-            return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+            return d(b).createdMs - d(a).createdMs;
           case 'oldest':
-            return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
-          case 'expiring-organic': {
-            const getOrgDays = (asset: Asset) => {
-              const [orgBadge] = getComplianceBadges(asset);
-              return orgBadge.daysRemaining ?? Infinity;
-            };
-            return getOrgDays(a) - getOrgDays(b);
-          }
-          case 'expiring-paid': {
-            const getPaidDays = (asset: Asset) => {
-              const [, paidBadge] = getComplianceBadges(asset);
-              return paidBadge.daysRemaining ?? Infinity;
-            };
-            return getPaidDays(a) - getPaidDays(b);
-          }
+            return d(a).createdMs - d(b).createdMs;
+          case 'expiring-organic':
+            return compareDays(d(a).orgDays, d(b).orgDays);
+          case 'expiring-paid':
+            return compareDays(d(a).paidDays, d(b).paidDays);
           default:
             return 0;
         }
@@ -491,7 +598,7 @@ export default function Home() {
     }
 
     return { filteredAssets: filtered, textMatchIds };
-  }, [assets, filters, shuffleSeed, semanticResults, hiddenFolders, searchIndex]);
+  }, [assets, deferredFilters, derived, shuffleSeed, semanticResults, hiddenFolders, searchIndex]);
 
   // When pinboard is active, scope to only pinned assets
   const scopedAssets = useMemo(() => {
@@ -878,6 +985,21 @@ export default function Home() {
             </button>
           </div>
 
+          {/* Sync health — shown only when the scheduled sync failed or
+              hasn't succeeded recently; opens Settings → Recent activity */}
+          {syncHealth?.issue && (
+            <button
+              onClick={() => setSettingsOpen(true)}
+              className="text-[11px] font-medium px-2.5 py-1 rounded-full transition-opacity hover:opacity-80"
+              style={{ color: 'var(--ram-red)', background: 'var(--ram-red-bg)', border: 'none', cursor: 'pointer' }}
+              title={syncHealth.issue === 'failed'
+                ? `Last scheduled sync failed${syncHealth.latestError ? `: ${syncHealth.latestError}` : ''}`
+                : `No successful sync in over ${syncHealth.staleAfterHours} hours`}
+            >
+              {syncHealth.issue === 'failed' ? '⚠ Sync failed' : '⚠ Sync overdue'}
+            </button>
+          )}
+
           {/* User menu dropdown */}
           <div className="relative" ref={userMenuRef}>
             <button
@@ -1037,14 +1159,15 @@ export default function Home() {
           ) : (
             <>
               <div className="masonry-grid" ref={setGridEl}>
-                {visibleAssets.map((asset) => (
+                {visibleAssets.map((asset, i) => (
                   <AssetCard
                     key={asset.id}
                     asset={asset}
+                    eager={i < EAGER_CARDS}
                     selected={selectedIds.has(asset.id)}
-                    isExpired={isAnyRightExpired(asset)}
+                    isExpired={derived.get(asset.id)?.anyExpired ?? isAnyRightExpired(asset)}
                     similarity={semanticResults?.get(asset.id)}
-                    textMatch={filters.query ? textMatchIds.has(asset.id) : undefined}
+                    textMatch={deferredFilters.query ? textMatchIds.has(asset.id) : undefined}
                     onSelect={handleSelect}
                     onExpand={setExpandedAsset}
                     isPinned={pinboardIds.has(asset.id)}
@@ -1111,7 +1234,7 @@ export default function Home() {
 
       {settingsOpen && (
         <SettingsPanel
-          onClose={() => setSettingsOpen(false)}
+          onClose={() => { setSettingsOpen(false); checkSyncHealth(); }}
           onSyncComplete={async () => {
             await refreshAssets();
           }}

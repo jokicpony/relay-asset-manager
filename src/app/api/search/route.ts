@@ -3,11 +3,10 @@ import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import { getConfig } from '@/lib/config';
 import { getAdminClient } from '@/lib/supabase/admin';
+import { embedQuery } from '@/lib/sync/embedder';
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
-const GEMINI_EMBED_URL =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2-preview:embedContent';
 
 /**
  * GET /api/search?q=campfire+flask&limit=50
@@ -52,27 +51,17 @@ export async function GET(request: NextRequest) {
         // Text queries stay text-only — cross-modal search means a text query
         // automatically matches image-augmented document embeddings.
         // API key goes in a header — keys in query strings leak into logs/traces
-        const embedRes = await fetch(GEMINI_EMBED_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-            body: JSON.stringify({
-                model: 'models/gemini-embedding-2-preview',
-                content: { parts: [{ text: query }] },
-                outputDimensionality: 768,
-            }),
-        });
-
-        if (!embedRes.ok) {
-            const errText = await embedRes.text();
-            logger.error('search', 'Gemini embed error', { response: errText });
+        let queryEmbedding: number[];
+        try {
+            // Same model + dimensions as the document embeddings (shared embedder)
+            queryEmbedding = await embedQuery(GEMINI_API_KEY, query);
+        } catch (err) {
+            logger.error('search', 'Gemini embed error', { error: err instanceof Error ? err.message : String(err) });
             return NextResponse.json(
                 { error: 'Failed to embed query' },
                 { status: 502 }
             );
         }
-
-        const embedData = await embedRes.json();
-        const queryEmbedding = embedData.embedding.values;
 
         // Step 2: Search Supabase using cosine similarity (RPC function)
         const supabase = getAdminClient();

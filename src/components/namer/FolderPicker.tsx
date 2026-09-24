@@ -32,48 +32,66 @@ export default function FolderPicker({ label, folderId, folderName, onSelect }: 
     const [isOpen, setIsOpen] = useState(false);
     const [loading, setLoading] = useState(false);
     const [resolving, setResolving] = useState(false);
+    // Why the last search / URL resolve failed — shown instead of "No folders found"
+    const [error, setError] = useState<string | null>(null);
     const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const containerRef = useRef<HTMLDivElement>(null);
+    // Sequence guard: every keystroke/paste bumps it, and a response is only
+    // applied if it's still the latest request (slow searches arrive late).
+    const requestSeqRef = useRef(0);
 
     // Search folders with debounce
     const searchFolders = useCallback(async (q: string) => {
+        const seq = ++requestSeqRef.current;
         if (q.length < 2) {
             setResults([]);
+            setLoading(false);
             return;
         }
         setLoading(true);
         try {
             const folders = await namerApi.searchFolders(q);
+            if (seq !== requestSeqRef.current) return;
             setResults(folders.map(f => ({ id: f.id, name: f.name })));
         } catch (err) {
-            logger.error('folder-picker', 'Search error', { error: err instanceof Error ? err.message : String(err) });
+            if (seq !== requestSeqRef.current) return;
+            const message = err instanceof Error ? err.message : String(err);
+            logger.error('folder-picker', 'Search error', { error: message });
             setResults([]);
+            setError(`Search failed: ${message}`);
         } finally {
-            setLoading(false);
+            if (seq === requestSeqRef.current) setLoading(false);
         }
     }, []);
 
     // Handle URL paste → parse folder ID and resolve name
     const handleUrlPaste = useCallback(async (extractedId: string) => {
+        const seq = ++requestSeqRef.current;
         setResolving(true);
+        setLoading(false);
         setResults([]);
+        setError(null);
         try {
             const folder = await namerApi.getFolder(extractedId);
+            if (seq !== requestSeqRef.current) return;
             onSelect(folder.id, folder.name);
             setIsOpen(false);
             setQuery('');
         } catch (err) {
-            logger.error('folder-picker', 'URL resolve error', { error: err instanceof Error ? err.message : String(err) });
-            // Fall back to showing error in results
+            if (seq !== requestSeqRef.current) return;
+            const message = err instanceof Error ? err.message : String(err);
+            logger.error('folder-picker', 'URL resolve error', { error: message });
             setResults([]);
+            setError(`Couldn't open that folder: ${message}`);
         } finally {
-            setResolving(false);
+            if (seq === requestSeqRef.current) setResolving(false);
         }
     }, [onSelect]);
 
     // Handle input change — detect URLs vs search queries
     const handleInputChange = useCallback((value: string) => {
         setQuery(value);
+        setError(null);
 
         const extractedId = extractFolderIdFromUrl(value);
         if (extractedId) {
@@ -83,7 +101,10 @@ export default function FolderPicker({ label, folderId, folderName, onSelect }: 
             return;
         }
 
-        // Normal text search
+        // Normal text search. Bump the sequence now so an in-flight search
+        // or URL resolve can't land while the debounce is pending.
+        requestSeqRef.current++;
+        setResolving(false);
         if (debounceRef.current) clearTimeout(debounceRef.current);
         debounceRef.current = setTimeout(() => searchFolders(value), 300);
     }, [handleUrlPaste, searchFolders]);
@@ -94,6 +115,7 @@ export default function FolderPicker({ label, folderId, folderName, onSelect }: 
         const extractedId = extractFolderIdFromUrl(pasted);
         if (extractedId) {
             e.preventDefault();
+            if (debounceRef.current) clearTimeout(debounceRef.current);
             setQuery(pasted);
             handleUrlPaste(extractedId);
         }
@@ -183,6 +205,10 @@ export default function FolderPicker({ label, folderId, folderName, onSelect }: 
                                 <div className="w-4 h-4 rounded-full border-2 animate-spin"
                                     style={{ borderColor: 'var(--ram-border)', borderTopColor: 'var(--ram-accent)' }} />
                             </div>
+                        ) : error ? (
+                            <p className="text-[11px] px-3 py-3 text-center" style={{ color: 'var(--ram-red, #f87171)', wordBreak: 'break-word' }}>
+                                {error}
+                            </p>
                         ) : results.length === 0 ? (
                             <p className="text-[11px] px-3 py-3 text-center" style={{ color: 'var(--ram-text-tertiary)' }}>
                                 {query.length < 2 ? 'Type at least 2 characters or paste a Drive URL' : 'No folders found'}

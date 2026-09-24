@@ -12,8 +12,12 @@ import { isInSharedDrive } from '@/lib/google/drive-scope';
 import { getConfig } from '@/lib/config';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
+import { DRIVE_CALL_TIMEOUT_MS, namerErrorResponse } from '@/lib/namer/route-errors';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
+
+// One scope check (≤10s) + one PATCH (≤15s)
+export const maxDuration = 30;
 
 export async function POST(request: NextRequest) {
     const supabase = await createServerClient();
@@ -45,6 +49,7 @@ export async function POST(request: NextRequest) {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({ appProperties: properties }),
+                signal: AbortSignal.timeout(DRIVE_CALL_TIMEOUT_MS),
             }
         );
 
@@ -58,8 +63,6 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(result);
 
     } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.error('namer-props', 'Unexpected error', { error: message });
-        return NextResponse.json({ error: message }, { status: 500 });
+        return namerErrorResponse('namer-props', err, 'Setting Drive properties');
     }
 }

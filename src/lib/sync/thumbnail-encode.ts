@@ -29,3 +29,20 @@ export async function encodeThumbnail(input: Buffer): Promise<Buffer | null> {
         return null;
     }
 }
+
+/**
+ * The image's dominant colour as `#rrggbb`, stored in assets.thumb_color and
+ * painted as the grid card's background while the thumbnail loads.
+ * Returns null if the bytes can't be decoded.
+ */
+export async function thumbnailColor(image: Buffer): Promise<string | null> {
+    try {
+        // A 64px copy is plenty for a dominant colour and several times faster
+        const small = await sharp(image, { failOn: 'none' }).resize(64, 64, { fit: 'inside' }).toBuffer();
+        const { dominant } = await sharp(small).stats();
+        const hex = (n: number) => Math.round(n).toString(16).padStart(2, '0');
+        return `#${hex(dominant.r)}${hex(dominant.g)}${hex(dominant.b)}`;
+    } catch {
+        return null;
+    }
+}

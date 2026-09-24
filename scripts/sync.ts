@@ -21,16 +21,18 @@ import * as path from 'path';
 import { google } from 'googleapis';
 import { createClient } from '@supabase/supabase-js';
 import type { SupabaseClient } from '@supabase/supabase-js';
-import { parseFilename } from '../src/lib/filename-utils';
-import { buildEmbedText } from '../src/lib/embedding-text';
-import type { EmbeddableAssetRow } from '../src/lib/embedding-text';
+import { embedAssets, writeEmbeddings, type EmbeddableAsset } from '../src/lib/sync/embedder';
+import { embedInputsChanged, EMBED_INPUT_COLUMNS, type EmbedInputs } from '../src/lib/embedding-text';
 import { IMAGE_MIMES, VIDEO_MIMES, SHORTCUT_MIME, isAssetMime } from '../src/lib/sync/mime';
 import { parseLabelFields as parseRightsLabelFields } from '../src/lib/sync/rights-labels';
 import type { RightsLabelConfig } from '../src/lib/sync/rights-labels';
-import { buildAssetRow } from '../src/lib/sync/asset-row';
-import { encodeThumbnail, THUMBNAIL_MAX_PX } from '../src/lib/sync/thumbnail-encode';
+import { buildAssetRow, groupRowsByColumns } from '../src/lib/sync/asset-row';
+import { generateThumbnails } from '../src/lib/sync/thumbnails';
 import { PURGE_AFTER_DAYS, SHORTCUT_GRACE_DAYS } from '../src/lib/sync/constants';
-import type { DriveFile as SharedDriveFile } from '../src/lib/sync/types';
+import { normalizeSyncFolders, isInSyncScope } from '../src/lib/sync/scope';
+import { withDriveRetry as withSharedDriveRetry } from '../src/lib/sync/drive-retry';
+import type { DriveFile } from '../src/lib/sync/types';
+import { DRIVE_FILE_FIELDS, toDriveFile } from '../src/lib/sync/drive-file';
 
 // ---------------------------------------------------------------------------
 // Load environment
@@ -44,7 +46,6 @@ const CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
-const GEMINI_EMBED_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2-preview:batchEmbedContents';
 
 // Progress stream mode — output JSON lines for SSE piping
 const PROGRESS_STREAM = process.argv.includes('--progress-stream');
@@ -61,10 +62,63 @@ const MASS_ORPHAN_MIN = 100;
 const MASS_ORPHAN_FRACTION = 0.1;
 const ALLOW_MASS_ORPHAN = process.argv.includes('--allow-mass-orphan');
 
+// Dry run: every read happens, every write (DB, storage, Gemini, progress)
+// is skipped and recorded in `plan` instead. --dry-run-out=<file> writes the
+// plan as JSON so two versions of this script can be diffed on real data.
+const DRY_RUN = process.argv.includes('--dry-run');
+const DRY_RUN_OUT = process.argv.find(a => a.startsWith('--dry-run-out='))?.split('=')[1];
+const plan = {
+    folderDriveIds: 0,
+    thumbnailsToGenerate: [] as string[],
+    staleThumbnailRepairs: [] as string[],
+    assetUpserts: [] as Record<string, unknown>[],
+    softDelete: { orphaned: [] as string[], ignored: [] as string[], 'out-of-scope': [] as string[] },
+    massOrphanBlocked: 0,
+    restore: [] as string[],
+    shortcutUpserts: [] as Record<string, string>[],
+    shortcutsReappeared: [] as string[],
+    shortcutsNewlyMissing: [] as string[],
+    shortcutsExpired: [] as string[],
+    purge: [] as string[],
+    embeddingsToNull: [] as string[],
+    embeddingsToGenerate: [] as string[],
+};
+
+// Everything that went wrong without stopping the run. Recorded in the
+// run's sync_logs row (status 'partial', details.problems) so failures are
+// traceable from Settings → Recent activity, not just this job's log.
+interface SyncProblem { step: string; message: string; count?: number }
+const problems: SyncProblem[] = [];
+function problem(step: string, message: string, count?: number) {
+    log(`  ❌ [${step}] ${message}`);
+    if (problems.length < 100) problems.push({ step, message, ...(count !== undefined && { count }) });
+}
+
+// GitHub Actions context, so each log row links to the full job output
+const RUN_ID = process.env.GITHUB_RUN_ID ?? null;
+const RUN_URL = RUN_ID && process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY
+    ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${RUN_ID}`
+    : null;
+const runContext = () => ({
+    run_id: RUN_ID,
+    run_url: RUN_URL,
+    trigger: process.env.GITHUB_EVENT_NAME ?? 'local',
+});
+
+/** One-line summary of the problems for sync_logs.error_message */
+function summarizeProblems(list: SyncProblem[]): string {
+    const byStep = new Map<string, SyncProblem[]>();
+    for (const p of list) byStep.set(p.step, [...(byStep.get(p.step) ?? []), p]);
+    return [...byStep].map(([step, ps]) =>
+        ps.length === 1 ? `${step}: ${ps[0].message}` : `${step}: ${ps.length} problems (first: ${ps[0].message})`
+    ).join(' · ').slice(0, 1000);
+}
+
 // Persist sync progress to Supabase so the frontend can poll it.
 // Fire-and-forget — never block the sync pipeline on a progress write.
 let _lastProgressWrite = 0;
 function persistProgress(step: string, detail: string, pct?: number) {
+    if (DRY_RUN) return;
     const now = Date.now();
     // Throttle DB writes to at most once per 3 seconds (except for step changes)
     if (now - _lastProgressWrite < 3000 && pct !== undefined && pct !== 100) return;
@@ -160,7 +214,7 @@ async function loadConfig(): Promise<void> {
         if (settings.has('sync_folders')) {
             const folders = settings.get('sync_folders') as string[];
             if (Array.isArray(folders) && folders.length > 0) {
-                SYNC_FOLDERS = folders.map(f => f.trim().toLowerCase()).filter(Boolean);
+                SYNC_FOLDERS = normalizeSyncFolders(folders);
             }
         }
         if (settings.has('drive_label_id')) {
@@ -180,7 +234,7 @@ async function loadConfig(): Promise<void> {
         DRIVE_ID = process.env.GOOGLE_SHARED_DRIVE_ID;
     }
     if (SYNC_FOLDERS.length === 0 && process.env.SYNC_FOLDERS) {
-        SYNC_FOLDERS = process.env.SYNC_FOLDERS.split(',').map(f => f.trim().toLowerCase()).filter(Boolean);
+        SYNC_FOLDERS = normalizeSyncFolders(process.env.SYNC_FOLDERS.split(','));
     }
     if (!RIGHTS_LABEL_ID && process.env.GOOGLE_DRIVE_LABEL_ID) {
         RIGHTS_LABEL_ID = process.env.GOOGLE_DRIVE_LABEL_ID;
@@ -202,7 +256,6 @@ async function loadConfig(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function log(msg: string) {
     const ts = new Date().toLocaleTimeString();
@@ -216,43 +269,10 @@ function progress(current: number, total: number, label: string) {
     if (current === total) process.stdout.write('\n');
 }
 
-// ---------------------------------------------------------------------------
-// Drive API retry wrapper — exponential backoff for rate limit errors
-// ---------------------------------------------------------------------------
-const DRIVE_MAX_RETRIES = 5;
-
-async function withDriveRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
-    for (let attempt = 0; attempt <= DRIVE_MAX_RETRIES; attempt++) {
-        try {
-            return await fn();
-        } catch (rawErr) {
-            // Google API errors are untyped — narrow to the fields we inspect
-            const err = rawErr as {
-                code?: number;
-                status?: number;
-                message?: string;
-                response?: { status?: number };
-                errors?: { reason?: string }[];
-            };
-            const status = err?.code ?? err?.response?.status ?? err?.status;
-            const reason = err?.errors?.[0]?.reason ?? '';
-            const isRateLimit =
-                status === 429 ||
-                status === 403 && (reason === 'userRateLimitExceeded' || reason === 'rateLimitExceeded') ||
-                (err?.message ?? '').includes('User rate limit exceeded') ||
-                (err?.message ?? '').includes('Rate limit exceeded');
-
-            if (isRateLimit && attempt < DRIVE_MAX_RETRIES) {
-                const backoff = Math.pow(2, attempt) * 1000 + Math.random() * 500;
-                log(`  ⚠️  Rate limited on ${label} (attempt ${attempt + 1}/${DRIVE_MAX_RETRIES + 1}), retrying in ${(backoff / 1000).toFixed(1)}s...`);
-                await sleep(backoff);
-                continue;
-            }
-            throw rawErr;
-        }
-    }
-    throw new Error(`Drive API call failed after ${DRIVE_MAX_RETRIES + 1} attempts: ${label}`);
-}
+// Drive API retry — shared implementation (src/lib/sync/drive-retry), with
+// retries reported through the sync log.
+const withDriveRetry = <T>(fn: () => Promise<T>, label: string) =>
+    withSharedDriveRetry(fn, label, (m) => log(`  ⚠️  ${m}...`));
 
 // ---------------------------------------------------------------------------
 // Pre-fetch entire folder hierarchy in one pass
@@ -423,14 +443,6 @@ async function getAccessToken(): Promise<string> {
 // ---------------------------------------------------------------------------
 // Step 1: Crawl Drive
 // ---------------------------------------------------------------------------
-// The crawler's file shape is the shared ingest shape minus the fields the
-// crawler doesn't carry: filename parsing happens at upsert time, and
-// creator / project_description are user- or namer-managed. Deriving via
-// Omit keeps the two paths' columns from drifting apart.
-type DriveFile = Omit<
-    SharedDriveFile,
-    'creator' | 'projectDescription' | 'parsedCreator' | 'parsedShootDate' | 'parsedShootDescription'
->;
 
 // ---------------------------------------------------------------------------
 // Label field parser — shared implementation (src/lib/sync/rights-labels),
@@ -483,7 +495,7 @@ async function crawlDrive(accessToken: string, folderTree: FolderTree): Promise<
     // Build query
     const mimeFilter = [...IMAGE_MIMES, ...VIDEO_MIMES].map((m) => `mimeType='${m}'`).join(' or ');
     const query = `(${mimeFilter}) and trashed=false`;
-    const fields = 'nextPageToken,files(id,name,mimeType,size,description,parents,thumbnailLink,webViewLink,labelInfo,createdTime,modifiedTime,imageMediaMetadata(width,height),videoMediaMetadata(width,height,durationMillis))';
+    const fields = `nextPageToken,files(${DRIVE_FILE_FIELDS})`;
 
     let pageToken: string | undefined;
     let totalScanned = 0;
@@ -521,12 +533,9 @@ async function crawlDrive(accessToken: string, folderTree: FolderTree): Promise<
             const folderPath = resolvePath(file.parents);
 
             // Allowlist check
-            if (SYNC_FOLDERS.length > 0) {
-                const topFolder = folderPath.split('/').filter(Boolean)[0]?.toLowerCase() ?? '';
-                if (!SYNC_FOLDERS.some((f) => topFolder === f)) {
-                    skippedByFolder++;
-                    continue;
-                }
+            if (!isInSyncScope(folderPath, SYNC_FOLDERS)) {
+                skippedByFolder++;
+                continue;
             }
 
             // [relay-ignore] check — skip files in ignored folders
@@ -535,40 +544,8 @@ async function crawlDrive(accessToken: string, folderTree: FolderTree): Promise<
                 continue;
             }
 
-            const isVideo = VIDEO_MIMES.has(file.mimeType);
-            const width = isVideo
-                ? file.videoMediaMetadata?.width ?? 0
-                : file.imageMediaMetadata?.width ?? 0;
-            const height = isVideo
-                ? file.videoMediaMetadata?.height ?? 0
-                : file.imageMediaMetadata?.height ?? 0;
-            const duration = isVideo && file.videoMediaMetadata?.durationMillis
-                ? Number(file.videoMediaMetadata.durationMillis) / 1000
-                : null;
-
-            // Parse Rights Management label
-            const rights = parseLabelFields(file, file.name);
-
-            results.push({
-                id: file.id,
-                name: file.name,
-                mimeType: file.mimeType,
-                description: file.description ?? null,
-                folderPath,
-                thumbnailLink: file.thumbnailLink ?? null,
-                webViewLink: file.webViewLink ?? null,
-                width,
-                height,
-                duration,
-                assetType: isVideo ? 'video' : 'photo',
-                createdTime: file.createdTime ?? new Date().toISOString(),
-                modifiedTime: file.modifiedTime ?? new Date().toISOString(),
-                fileSize: file.size ? Number(file.size) : null,
-                organicRights: rights.organicRights,
-                organicRightsExpiration: rights.organicRightsExpiration,
-                paidRights: rights.paidRights,
-                paidRightsExpiration: rights.paidRightsExpiration,
-            });
+            // Mapping shared with the in-app ingest (src/lib/sync/drive-file)
+            results.push(toDriveFile(file, folderPath, parseLabelFields(file, file.name)));
         }
 
         progress(results.length, results.length, `found (${totalScanned} scanned, ${skippedByFolder} folder-skipped, ${skippedByIgnore} ignored)`);
@@ -700,12 +677,9 @@ async function resolveShortcuts(
         const folderPath = resolveFolderPath(sc.parents);
 
         // Allowlist check
-        if (SYNC_FOLDERS.length > 0) {
-            const topFolder = folderPath.split('/').filter(Boolean)[0]?.toLowerCase() ?? '';
-            if (!SYNC_FOLDERS.some((f) => topFolder === f)) {
-                skippedByFolder++;
-                continue;
-            }
+        if (!isInSyncScope(folderPath, SYNC_FOLDERS)) {
+            skippedByFolder++;
+            continue;
         }
 
         // [relay-ignore] check
@@ -729,10 +703,11 @@ async function resolveShortcuts(
     const DB_BATCH = 150; // keeps the .in() query string well under URL limits
     for (let i = 0; i < allTargetIds.length; i += DB_BATCH) {
         const batch = allTargetIds.slice(i, i + DB_BATCH);
-        const { data } = await supabase
+        const { data, error } = await supabase
             .from('assets')
             .select('id, drive_file_id')
             .in('drive_file_id', batch);
+        if (error) problem('shortcuts', `Target lookup failed for ${batch.length} shortcuts: ${error.message}`, batch.length);
 
         if (data) {
             for (const row of (data as { id: string; drive_file_id: string }[])) {
@@ -767,14 +742,15 @@ async function resolveShortcuts(
 
     // Batch upsert
     const BATCH = 50;
-    for (let i = 0; i < upsertRows.length; i += BATCH) {
+    if (DRY_RUN) plan.shortcutUpserts.push(...upsertRows);
+    for (let i = 0; i < upsertRows.length && !DRY_RUN; i += BATCH) {
         const batch = upsertRows.slice(i, i + BATCH);
         const { error } = await supabase
             .from('shortcuts')
             .upsert(batch, { onConflict: 'shortcut_drive_id', ignoreDuplicates: false });
 
         if (error) {
-            log(`  ❌ Shortcut upsert error: ${error.message}`);
+            problem('shortcuts', `Upsert failed for ${batch.length} shortcuts: ${error.message}`, batch.length);
         }
 
         const done = Math.min(i + BATCH, upsertRows.length);
@@ -806,7 +782,10 @@ async function cleanupOrphanedShortcuts(
             .select('id, shortcut_drive_id, missing_since')
             .order('id')
             .range(from, from + 999);
-        if (error) return 0;
+        if (error) {
+            problem('shortcuts', `Cleanup skipped — could not read shortcuts: ${error.message}`);
+            return 0;
+        }
         rows.push(...(data ?? []));
         if (!data || data.length < 1000) break;
     }
@@ -831,21 +810,30 @@ async function cleanupOrphanedShortcuts(
 
     const BATCH = 50;
 
+    if (DRY_RUN) {
+        plan.shortcutsReappeared.push(...reappeared);
+        plan.shortcutsNewlyMissing.push(...newlyMissing);
+        plan.shortcutsExpired.push(...expired);
+        return expired.length;
+    }
+
+    const check = (what: string, n: number) => ({ error }: { error: { message: string } | null }) => {
+        if (error) problem('shortcuts', `${what} failed for ${n} rows: ${error.message}`, n);
+    };
     for (let i = 0; i < reappeared.length; i += BATCH) {
-        await supabase.from('shortcuts')
-            .update({ missing_since: null })
-            .in('id', reappeared.slice(i, i + BATCH));
+        const ids = reappeared.slice(i, i + BATCH);
+        check('Clearing missing_since', ids.length)(await supabase.from('shortcuts').update({ missing_since: null }).in('id', ids));
     }
 
     const now = new Date().toISOString();
     for (let i = 0; i < newlyMissing.length; i += BATCH) {
-        await supabase.from('shortcuts')
-            .update({ missing_since: now })
-            .in('id', newlyMissing.slice(i, i + BATCH));
+        const ids = newlyMissing.slice(i, i + BATCH);
+        check('Marking missing', ids.length)(await supabase.from('shortcuts').update({ missing_since: now }).in('id', ids));
     }
 
     for (let i = 0; i < expired.length; i += BATCH) {
-        await supabase.from('shortcuts').delete().in('id', expired.slice(i, i + BATCH));
+        const ids = expired.slice(i, i + BATCH);
+        check('Deleting expired', ids.length)(await supabase.from('shortcuts').delete().in('id', ids));
     }
 
     if (reappeared.length > 0) log(`  ♻️  ${reappeared.length} missing shortcuts reappeared in Drive — cleared`);
@@ -860,11 +848,12 @@ async function cleanupOrphanedShortcuts(
 async function processThumbnails(
     accessToken: string,
     files: DriveFile[]
-): Promise<{ urlMap: Map<string, string>; failed: number }> {
+): Promise<{ urlMap: Map<string, string>; colorMap: Map<string, string>; failed: number }> {
     log('🖼️  Processing thumbnails...');
 
     const supabase = getSupabase();
     const urlMap = new Map<string, string>();
+    const colorMap = new Map<string, string>(); // placeholder colours for newly generated thumbnails
 
     // Check the STORAGE BUCKET for existing thumbnails (not just the DB column).
     // This catches thumbnails that were uploaded but whose URLs weren't written to DB.
@@ -919,84 +908,48 @@ async function processThumbnails(
 
     if (needsThumbnail.length === 0) {
         log('  ✅ All thumbnails up to date');
-        return { urlMap, failed: 0 };
+        return { urlMap, colorMap, failed: 0 };
+    }
+    if (DRY_RUN) {
+        plan.thumbnailsToGenerate.push(...needsThumbnail.map(f => f.id));
+        return { urlMap, colorMap, failed: 0 };
     }
 
-    // Bounded worker pool with a wall-clock budget. The budget is what keeps
-    // a large backlog (bulk upload) from eating the whole job timeout: this
-    // step runs before the upsert, so a job killed here used to lose the
-    // entire run — no metadata, no orphan detection, no sync log — and repeat
-    // that every run until the backlog drained. Files left over are simply
+    // Shared pipeline (src/lib/sync/thumbnails): bounded pool + wall-clock
+    // budget. The budget is what keeps a large backlog (bulk upload) from
+    // eating the whole job timeout: this step runs before the upsert, so a
+    // job killed here used to lose the entire run. Files left over are
     // picked up next run (this step is incremental).
-    const deadline = Date.now() + THUMBNAIL_BUDGET_MS;
-    let uploaded = 0;
-    let failedDownloads = 0;
-    let deferred = 0;
-    let done = 0;
-
-    const fetchAndStore = async (file: DriveFile): Promise<'ok' | 'failed' | 'rate-limited'> => {
-        try {
-            const url = file.thumbnailLink!.replace(/=s\d+$/, '') + `=s${THUMBNAIL_MAX_PX}`;
-            const res = await fetch(url, {
-                headers: { Authorization: `Bearer ${accessToken}` },
-            });
-            if (res.status === 429) return 'rate-limited';
-            if (!res.ok) return 'failed';
-
-            const webp = await encodeThumbnail(Buffer.from(await res.arrayBuffer()));
-            if (!webp) return 'failed';
-
-            const { error } = await supabase.storage
-                .from('thumbnails')
-                .upload(`${file.id}.webp`, webp, {
-                    contentType: 'image/webp',
-                    upsert: true,
-                });
-            if (error) return 'failed';
-
-            const { data } = supabase.storage
-                .from('thumbnails')
-                .getPublicUrl(`${file.id}.webp`);
-            urlMap.set(file.id, data.publicUrl);
-            return 'ok';
-        } catch {
-            return 'failed';
-        }
-    };
-
-    const queue = [...needsThumbnail];
-    const worker = async () => {
-        while (queue.length > 0) {
-            if (Date.now() > deadline) {
-                deferred += queue.length;
-                queue.length = 0;
-                return;
-            }
-            const file = queue.shift()!;
-            let result = await fetchAndStore(file);
-            // Back off and retry rate-limited fetches in place (3 attempts).
-            for (let attempt = 1; result === 'rate-limited' && attempt <= 3; attempt++) {
-                await sleep(1000 * 2 ** attempt);
-                result = await fetchAndStore(file);
-            }
-            if (result === 'ok') uploaded++;
-            else failedDownloads++;
-
-            done++;
-            if (done % 25 === 0 || done === needsThumbnail.length) {
-                emitProgress('thumbnails', `Uploading thumbnails — ${done}/${needsThumbnail.length}`,
-                    Math.round((done / needsThumbnail.length) * 100));
-                progress(done, needsThumbnail.length, 'thumbnails');
-            }
-        }
-    };
-    await Promise.all(Array.from({ length: THUMBNAIL_CONCURRENCY }, worker));
+    const { stored, failed: failedDownloads, deferred } = await generateThumbnails(
+        supabase, accessToken, needsThumbnail,
+        {
+            concurrency: THUMBNAIL_CONCURRENCY,
+            deadline: Date.now() + THUMBNAIL_BUDGET_MS,
+            allowOriginal: false, // no Drive thumbnail yet → leave it for a later run
+            versioned: false,     // only ever writes thumbnails that don't exist yet
+            onProgress: (done, total) => {
+                if (done % 25 === 0 || done === total) {
+                    emitProgress('thumbnails', `Uploading thumbnails — ${done}/${total}`, Math.round((done / total) * 100));
+                    progress(done, total, 'thumbnails');
+                }
+            },
+        },
+    );
+    for (const [id, { url, color }] of stored) {
+        urlMap.set(id, url);
+        if (color) colorMap.set(id, color);
+    }
+    const uploaded = stored.size;
 
     if (deferred > 0) {
         log(`  ⏱️  Thumbnail budget (${THUMBNAIL_BUDGET_MS / 60000} min) reached — ${deferred} deferred to the next sync`);
+        problem('thumbnails', `${deferred} deferred to the next sync (time budget reached)`, deferred);
+    }
+    if (failedDownloads > 0) {
+        problem('thumbnails', `${failedDownloads} could not be generated (fetch, decode or upload failed)`, failedDownloads);
     }
     log(`  ✅ Uploaded ${uploaded} new thumbnails (${skipped} already existed${failedDownloads > 0 ? `, ${failedDownloads} failed` : ''})`);
-    return { urlMap, failed: failedDownloads };
+    return { urlMap, colorMap, failed: failedDownloads };
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +970,10 @@ async function repairStaleThumbnailUrls(): Promise<number> {
     }
 
     log(`  🔍 Found ${staleAssets.length} assets with stale Google thumbnail URLs`);
+    if (DRY_RUN) {
+        plan.staleThumbnailRepairs.push(...(staleAssets as { drive_file_id: string }[]).map(a => a.drive_file_id));
+        return staleAssets.length;
+    }
 
     // Update each to the correct Supabase Storage public URL.
     // Prefer custom thumbnails (user-captured video frames) over auto-generated ones.
@@ -1047,6 +1004,7 @@ async function repairStaleThumbnailUrls(): Promise<number> {
                 .eq('id', asset.id);
 
             if (!updateErr) repaired++;
+            else problem('thumbnails', `Stale URL repair failed for ${asset.drive_file_id}: ${updateErr.message}`);
         }
 
         progress(Math.min(i + BATCH, staleAssets.length), staleAssets.length, 'thumbnail URLs repaired');
@@ -1062,7 +1020,9 @@ async function repairStaleThumbnailUrls(): Promise<number> {
 async function upsertToSupabase(
     files: DriveFile[],
     thumbnailUrls: Map<string, string>,
-    skipThumbnails: boolean = false
+    syncStartedAt: string,
+    skipThumbnails: boolean = false,
+    thumbnailColors: Map<string, string> = new Map()
 ): Promise<{ upserted: number; errors: number }> {
     log('💾 Upserting to Supabase...');
 
@@ -1071,67 +1031,77 @@ async function upsertToSupabase(
     let upserted = 0;
     let errors = 0;
 
-    // Look up assets that already have a custom thumbnail (user-set video frame).
-    // Never overwrite these — they were intentionally set by the user.
-    const customThumbnailIds = new Set<string>();
-    if (!skipThumbnails) {
-        const driveIds = files.map(f => f.id);
-        for (let i = 0; i < driveIds.length; i += 150) {
-            const batch = driveIds.slice(i, i + 150);
-            const { data } = await supabase
-                .from('assets')
-                .select('drive_file_id')
-                .in('drive_file_id', batch)
-                .like('thumbnail_url', '%/custom_%');
-            if (data) {
-                for (const row of (data as { drive_file_id: string }[])) {
-                    customThumbnailIds.add(row.drive_file_id);
-                }
-            }
-        }
-        if (customThumbnailIds.size > 0) {
-            log(`  🔒 Preserving ${customThumbnailIds.size} custom thumbnails (user-set)`);
-        }
-    }
+    // Checked per batch, right before that batch is written (so the window
+    // for a race is one batch, not the whole upsert step):
+    // - thumbnail_url, so the upsert only writes it when it actually changes
+    //   (keeps user-set custom frames and ?v= version stamps intact);
+    // - updated_at, to skip rows written after this sync started. The crawl
+    //   snapshot is minutes old by now; a Namer ingest that renamed/moved a
+    //   file in the meantime must not be overwritten with the older metadata.
+    const runStartMs = Date.parse(syncStartedAt);
+    const stripQuery = (u: string) => u.split('?')[0];
+    let customCount = 0;
+    let skippedNewer = 0;
 
     for (let i = 0; i < files.length; i += BATCH) {
-        const batch = files.slice(i, i + BATCH);
+        const candidates = files.slice(i, i + BATCH);
+        const existingThumb = new Map<string, string | null>();
+        const newerThanRun = new Set<string>();
+        const { data: existingRows, error: lookupErr } = await supabase
+            .from('assets')
+            .select('drive_file_id, thumbnail_url, updated_at')
+            .in('drive_file_id', candidates.map(f => f.id));
+        if (lookupErr) throw new Error(`Existing-row lookup failed: ${lookupErr.message}`);
+        for (const row of (existingRows ?? []) as { drive_file_id: string; thumbnail_url: string | null; updated_at: string }[]) {
+            existingThumb.set(row.drive_file_id, row.thumbnail_url);
+            if (row.thumbnail_url?.includes('/custom_')) customCount++;
+            // Compare as instants: Postgres (…+00:00, µs) and JS (…Z, ms) formats don't sort as strings
+            if (Date.parse(row.updated_at) > runStartMs) newerThanRun.add(row.drive_file_id);
+        }
+        skippedNewer += newerThanRun.size;
+        const batch = candidates.filter(f => !newerThanRun.has(f.id));
+
         const rows = batch.map((file) => {
             // Column mapping is shared with the ingest path (src/lib/sync/asset-row).
-            const parsed = parseFilename(file.name);
-            const row = buildAssetRow({
-                ...file,
-                creator: null,
-                projectDescription: null,
-                parsedCreator: parsed.creator,
-                parsedShootDate: parsed.shootDate?.toISOString().split('T')[0] ?? null,
-                parsedShootDescription: parsed.shootDescription,
-            });
+            const row = buildAssetRow(file, { labelsFetched: !!RIGHTS_LABEL_ID });
 
-            // Only set thumbnail_url to a permanent Supabase Storage URL.
-            // Never write temp googleusercontent.com URLs to the DB.
-            // Never overwrite custom thumbnails (user-captured video frames).
-            // If no Supabase URL exists, omit the field so the upsert
-            // preserves whatever is already in the DB.
-            if (!skipThumbnails && !customThumbnailIds.has(file.id)) {
-                const supabaseThumbUrl = thumbnailUrls.get(file.id);
-                if (supabaseThumbUrl) {
-                    row.thumbnail_url = supabaseThumbUrl;
+            // thumbnail_url: only a permanent Supabase Storage URL, only when it
+            // differs from what's stored (ignoring ?v= stamps), and never over a
+            // custom frame. Otherwise omitted — preserved by the grouped upsert.
+            if (!skipThumbnails) {
+                const current = existingThumb.get(file.id) ?? null;
+                const next = thumbnailUrls.get(file.id);
+                const isCustom = current?.includes('/custom_') ?? false;
+                if (next && !isCustom && (!current || stripQuery(current) !== stripQuery(next))) {
+                    row.thumbnail_url = next;
                 }
+                // Only for thumbnails generated this run
+                const color = thumbnailColors.get(file.id);
+                if (color && !isCustom) row.thumb_color = color;
             }
 
             return row;
         });
 
-        const { error } = await supabase
-            .from('assets')
-            .upsert(rows, { onConflict: 'drive_file_id', ignoreDuplicates: false });
+        // Upsert same-shape groups separately: a bulk upsert fills any column
+        // a row omits with NULL when another row in the batch includes it.
+        for (const group of groupRowsByColumns(rows)) {
+            if (DRY_RUN) {
+                // updated_at is a timestamp — drop it so plans are diffable
+                plan.assetUpserts.push(...group.map((r) => { const { updated_at: _omit, ...rest } = r; void _omit; return rest; }));
+                upserted += group.length;
+                continue;
+            }
+            const { error } = await supabase
+                .from('assets')
+                .upsert(group, { onConflict: 'drive_file_id', ignoreDuplicates: false });
 
-        if (error) {
-            log(`  ❌ Batch error (${batch.length} rows): ${error.message}`);
-            errors += batch.length; // sync_logs.upsert_errors counts rows, not batches
-        } else {
-            upserted += batch.length;
+            if (error) {
+                problem('upsert', `${group.length} rows failed: ${error.message}`, group.length);
+                errors += group.length; // sync_logs.upsert_errors counts rows, not batches
+            } else {
+                upserted += group.length;
+            }
         }
 
         progress(Math.min(i + BATCH, files.length), files.length, 'upserted');
@@ -1140,6 +1110,8 @@ async function upsertToSupabase(
         emitProgress('upsert', `Upserting to database — ${done}/${files.length}`, pct);
     }
 
+    if (!skipThumbnails && customCount > 0) log(`  🔒 Preserved ${customCount} custom thumbnails (user-set)`);
+    if (skippedNewer > 0) log(`  ⏭️  Skipped ${skippedNewer} assets updated after this sync started (e.g. a Namer ingest) — the next sync refreshes them`);
     log(`  ✅ Upserted ${upserted} assets (${errors} rows failed)`);
     emitProgress('upsert', `Upserted ${upserted} assets`, 100);
     return { upserted, errors };
@@ -1186,7 +1158,7 @@ async function detectOrphans(
     }
 
     if (fetchErr) {
-        log(`  ❌ Failed to fetch active assets: ${fetchErr.message}`);
+        problem('orphans', `Orphan detection skipped — could not read active assets: ${fetchErr.message}`);
         return { softDeleted: 0, restored: 0, massOrphanBlocked: 0 };
     }
 
@@ -1212,8 +1184,7 @@ async function detectOrphans(
         // top-level folder: the file still exists in Drive, so tag it
         // out-of-scope — purgeExpired skips these, keeping embeddings and
         // thumbnails intact in case the folder is re-scoped.
-        const topFolder = asset.folder_path?.split('/').filter(Boolean)[0]?.toLowerCase() ?? '';
-        if (SYNC_FOLDERS.length > 0 && !SYNC_FOLDERS.includes(topFolder)) {
+        if (!isInSyncScope(asset.folder_path, SYNC_FOLDERS)) {
             outOfScopeIds.push(asset.id);
         } else {
             orphanIds.push(asset.id);
@@ -1228,7 +1199,7 @@ async function detectOrphans(
     // The fraction is of the whole live library. activeAssets can't be the
     // base: it excludes rows touched since the sync started, i.e. everything
     // the upsert just wrote — it's essentially the orphan candidates alone.
-    const librarySize = crawledIds.size + activeAssets.length;
+    const librarySize = crawledIds.size + activeAssets.filter(a => !crawledIds.has(a.drive_file_id)).length;
     const orphanLimit = Math.max(MASS_ORPHAN_MIN, Math.floor(librarySize * MASS_ORPHAN_FRACTION));
     let massOrphanBlocked = 0;
     if (orphanIds.length > orphanLimit && !ALLOW_MASS_ORPHAN) {
@@ -1238,6 +1209,7 @@ async function detectOrphans(
         log('     If the deletion is real, re-run with --allow-mass-orphan.');
         orphanIds.length = 0;
     }
+    plan.massOrphanBlocked = massOrphanBlocked;
 
     const allDeleteIds = [
         ...orphanIds.map(id => ({ id, reason: 'orphaned' as const })),
@@ -1245,7 +1217,10 @@ async function detectOrphans(
         ...outOfScopeIds.map(id => ({ id, reason: 'out-of-scope' as const })),
     ];
 
-    if (allDeleteIds.length > 0) {
+    if (DRY_RUN) {
+        for (const { id, reason } of allDeleteIds) plan.softDelete[reason].push(id);
+        softDeleted = allDeleteIds.length;
+    } else if (allDeleteIds.length > 0) {
         // Batch update: set is_active=false, deleted_at=now(), deleted_reason
         const BATCH = 50;
         for (let i = 0; i < allDeleteIds.length; i += BATCH) {
@@ -1268,7 +1243,7 @@ async function detectOrphans(
 
                 if (error) {
                     // e.g. deleted_reason CHECK constraint not yet migrated
-                    log(`  ❌ Soft-delete failed for ${ids.length} ${reason} assets: ${error.message}`);
+                    problem('orphans', `Soft-delete failed for ${ids.length} ${reason} assets: ${error.message}`, ids.length);
                 } else {
                     softDeleted += data?.length ?? 0;
                 }
@@ -1308,7 +1283,10 @@ async function detectOrphans(
             }
         }
 
-        if (restoreIds.length > 0) {
+        if (DRY_RUN) {
+            plan.restore.push(...restoreIds);
+            restored = restoreIds.length;
+        } else if (restoreIds.length > 0) {
             for (let i = 0; i < restoreIds.length; i += 150) {
                 const { data, error } = await supabase.from('assets')
                     .update({
@@ -1319,7 +1297,7 @@ async function detectOrphans(
                     .in('id', restoreIds.slice(i, i + 150))
                     .select('id');
 
-                if (error) log(`  ❌ Restore failed: ${error.message}`);
+                if (error) problem('orphans', `Restore failed: ${error.message}`);
                 else restored += data?.length ?? 0;
             }
             log(`  ♻️  Restored ${restored} assets (back in Drive)`);
@@ -1381,6 +1359,10 @@ async function purgeExpired(): Promise<number> {
     // or re-ingest landing between the fetch above and here must not lose its
     // row. Thumbnails (including irreplaceable custom video frames) are then
     // removed only for rows that were actually deleted.
+    if (DRY_RUN) {
+        plan.purge.push(...expired.map((a) => a.id));
+        return expired.length;
+    }
     const BATCH = 50;
     const purgedDriveIds: string[] = [];
     for (let i = 0; i < expired.length; i += BATCH) {
@@ -1393,7 +1375,7 @@ async function purgeExpired(): Promise<number> {
             .lt('deleted_at', cutoff.toISOString())
             .select('drive_file_id');
         if (error) {
-            log(`  ❌ Purge delete failed for ${batch.length} rows: ${error.message}`);
+            problem('purge', `Delete failed for ${batch.length} rows: ${error.message}`, batch.length);
             continue;
         }
         purgedDriveIds.push(...(data ?? []).map((r: { drive_file_id: string }) => r.drive_file_id));
@@ -1402,7 +1384,7 @@ async function purgeExpired(): Promise<number> {
     const thumbPaths = purgedDriveIds.flatMap((id) => [`${id}.webp`, `custom_${id}.webp`]);
     for (let i = 0; i < thumbPaths.length; i += BATCH) {
         const { error } = await supabase.storage.from('thumbnails').remove(thumbPaths.slice(i, i + BATCH));
-        if (error) log(`  ⚠️  Thumbnail removal failed: ${error.message}`);
+        if (error) problem('purge', `Thumbnail removal failed: ${error.message}`);
     }
 
     log(`  🗑️  Purged ${purgedDriveIds.length} assets (rows + thumbnails)`);
@@ -1412,11 +1394,7 @@ async function purgeExpired(): Promise<number> {
 // ---------------------------------------------------------------------------
 // Step 6: Re-embed assets whose metadata changed
 // ---------------------------------------------------------------------------
-interface MetadataSnapshot {
-    name: string;
-    description: string | null;
-    parsed_shoot_description: string | null;
-}
+type MetadataSnapshot = EmbedInputs;
 
 async function snapshotMetadata(): Promise<Map<string, MetadataSnapshot>> {
     const supabase = getSupabase();
@@ -1428,67 +1406,20 @@ async function snapshotMetadata(): Promise<Map<string, MetadataSnapshot>> {
     while (true) {
         const { data, error } = await supabase
             .from('assets')
-            .select('drive_file_id, name, description, parsed_shoot_description')
+            .select(`drive_file_id, ${EMBED_INPUT_COLUMNS}`)
             .eq('is_active', true)
             .order('id') // stable order — offset paging on an unordered set can skip/repeat rows
             .range(from, from + PAGE - 1);
 
         if (error || !data || data.length === 0) break;
-        for (const row of (data as { drive_file_id: string; name: string; description: string | null; parsed_shoot_description: string | null }[])) {
-            map.set(row.drive_file_id, {
-                name: row.name,
-                description: row.description,
-                parsed_shoot_description: row.parsed_shoot_description,
-            });
+        for (const { drive_file_id, ...inputs } of (data as unknown as (EmbedInputs & { drive_file_id: string })[])) {
+            map.set(drive_file_id, inputs);
         }
         if (data.length < PAGE) break;
         from += PAGE;
     }
 
     return map;
-}
-
-// Embedding text comes from the shared builder (src/lib/embedding-text) so
-// sync.ts and embed.ts produce identical document text for the same asset.
-
-// Build the multimodal content parts (text + optional thumbnail image).
-// Thumbnails are stored as .webp but hold JPEG/PNG bytes; Gemini only accepts
-// image/jpeg and image/png, so the real format is sniffed from magic bytes.
-type EmbeddableAsset = EmbeddableAssetRow & {
-    id: string;
-    drive_file_id: string;
-    thumbnail_url: string | null;
-};
-type GeminiPart =
-    | { text: string }
-    | { inline_data: { mime_type: string; data: string } };
-
-async function buildEmbedParts(asset: EmbeddableAsset): Promise<{ parts: GeminiPart[]; hasImage: boolean }> {
-    const parts: GeminiPart[] = [{ text: buildEmbedText(asset) }];
-
-    if (asset.thumbnail_url && !asset.thumbnail_url.includes('googleusercontent.com') && asset.drive_file_id) {
-        const supabase = getSupabase();
-        for (const thumbPath of [`custom_${asset.drive_file_id}.webp`, `${asset.drive_file_id}.webp`]) {
-            try {
-                const { data: thumbData, error: thumbErr } = await supabase.storage
-                    .from('thumbnails')
-                    .download(thumbPath);
-                if (!thumbErr && thumbData) {
-                    const buffer = Buffer.from(await thumbData.arrayBuffer());
-                    const hex = buffer.slice(0, 4).toString('hex');
-                    const mimeType = hex.startsWith('ffd8') ? 'image/jpeg'
-                        : hex.startsWith('8950') ? 'image/png'
-                        : 'image/jpeg';
-                    parts.push({ inline_data: { mime_type: mimeType, data: buffer.toString('base64') } });
-                    return { parts, hasImage: true };
-                }
-            } catch {
-                // Fall through to text-only
-            }
-        }
-    }
-
-    return { parts, hasImage: false };
 }
 
 async function reEmbedChanged(
@@ -1511,199 +1442,90 @@ async function reEmbedChanged(
         // and will be picked up by the backfill query below
         if (!before) continue;
 
-        const parsed = parseFilename(file.name);
-        const newDesc = parsed.shootDescription ?? null;
-        const fileDesc = file.description ?? null;
-
-        if (
-            before.name !== file.name ||
-            before.description !== fileDesc ||
-            before.parsed_shoot_description !== newDesc
-        ) {
+        if (embedInputsChanged(before, {
+            name: file.name,
+            description: file.description,
+            folder_path: file.folderPath,
+            parsed_creator: file.parsedCreator,
+            parsed_shoot_description: file.parsedShootDescription,
+        })) {
             changedDriveIds.push(file.id);
         }
     }
 
-    // Null out embeddings for changed assets so they get re-embedded below
-    if (changedDriveIds.length > 0) {
-        log(`  Found ${changedDriveIds.length} assets with changed metadata — nulling embeddings...`);
-        const NULL_BATCH = 50;
-        for (let i = 0; i < changedDriveIds.length; i += NULL_BATCH) {
-            const batch = changedDriveIds.slice(i, i + NULL_BATCH);
-            await supabase.from('assets')
+    // Clear changed assets' embeddings up front. A null embedding is the
+    // durable "needs embedding" marker: whatever happens below (Gemini
+    // failure, job timeout, crash), the next run's null-embedding query
+    // retries it. (Change detection itself is one-shot — the next run's
+    // snapshot already has the new metadata.)
+    if (DRY_RUN) {
+        plan.embeddingsToNull.push(...changedDriveIds);
+    } else if (changedDriveIds.length > 0) {
+        log(`  Found ${changedDriveIds.length} assets with changed metadata — clearing embeddings for re-embed...`);
+        for (let i = 0; i < changedDriveIds.length; i += 150) {
+            const { error } = await supabase.from('assets')
                 .update({ embedding: null })
-                .in('drive_file_id', batch);
+                .in('drive_file_id', changedDriveIds.slice(i, i + 150));
+            if (error) problem('embeddings', `Could not clear embeddings of changed assets: ${error.message}`);
         }
     } else {
         log('  ✅ No metadata changes detected');
     }
 
-    // ── Backfill: fetch ALL assets with null embeddings (paginated) ──
+    // Everything without an embedding (new, changed, previously failed)
     log('  🧠 Fetching all assets that need embeddings...');
     const toEmbed: EmbeddableAsset[] = [];
-    let from = 0;
-    const PAGE = 1000;
-    while (true) {
+    for (let from = 0; ; from += 1000) {
         const { data, error } = await supabase
             .from('assets')
             .select('id, drive_file_id, name, description, asset_type, folder_path, parsed_creator, parsed_shoot_description, thumbnail_url')
             .is('embedding', null)
             .eq('is_active', true)
             .order('id') // stable order — offset paging on an unordered set can skip/repeat rows
-            .range(from, from + PAGE - 1);
-
+            .range(from, from + 999);
         if (error) {
-            log(`  ❌ Failed to fetch null-embedding assets: ${error.message}`);
+            problem('embeddings', `Could not read assets needing embeddings: ${error.message}`);
             break;
         }
-        if (!data || data.length === 0) break;
-        toEmbed.push(...data);
-        if (data.length < PAGE) break;
-        from += PAGE;
+        toEmbed.push(...(data ?? []));
+        if (!data || data.length < 1000) break;
     }
 
+    if (DRY_RUN) {
+        // Changed assets would be cleared first, then embedded with the rest
+        plan.embeddingsToGenerate.push(...new Set([...changedDriveIds, ...toEmbed.map(a => a.drive_file_id)]));
+        return 0;
+    }
     if (toEmbed.length === 0) {
         log('  ✅ All embeddings are up to date');
         return 0;
     }
 
-    log(`  📊 ${toEmbed.length} assets need embeddings (${changedDriveIds.length} changed, ${toEmbed.length - changedDriveIds.length} new/missing)`);
+    log(`  📊 ${toEmbed.length} assets need embeddings (${changedDriveIds.length} changed)`);
 
-    // ── Embed in batches of 20 with retry (multimodal — text + thumbnail) ──
-    const EMBED_BATCH = 20;
-    let embedded = 0;
-    let failed = 0;
-    let withImage = 0;
-    const MAX_RETRIES = 2;
+    // Shared embedder (src/lib/sync/embedder): multimodal batches, per-asset
+    // retry with text-only fallback, WebP thumbnails converted for Gemini.
+    // Each batch is written as soon as it's embedded.
+    let written = 0;
+    let writeFailed = 0;
+    const result = await embedAssets(supabase, GEMINI_API_KEY, toEmbed, {
+        log: (m) => log(`  ⚠️  ${m}`),
+        onBatch: async (vectors) => {
+            const w = await writeEmbeddings(supabase, vectors);
+            written += w.written;
+            writeFailed += w.failed.length;
+        },
+        onProgress: (done, total, r) => {
+            progress(done, total, 'embedded');
+            emitProgress('reembed', `Embedding — ${done}/${total} (${r.vectors.size} succeeded, ${r.withImage} multimodal)`,
+                Math.round((done / total) * 100));
+        },
+    });
 
-    for (let i = 0; i < toEmbed.length; i += EMBED_BATCH) {
-        const batch = toEmbed.slice(i, i + EMBED_BATCH);
-
-        // Build multimodal requests: text + thumbnail for each asset
-        const requests = await Promise.all(
-            batch.map(async (asset) => {
-                const { parts, hasImage } = await buildEmbedParts(asset);
-                if (hasImage) withImage++;
-                return {
-                    model: 'models/gemini-embedding-2-preview',
-                    content: { parts },
-                    outputDimensionality: 768,
-                };
-            })
-        );
-
-        // Retry loop for Gemini API calls
-        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            try {
-                const res = await fetch(GEMINI_EMBED_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-                    body: JSON.stringify({ requests }),
-                });
-
-                if (!res.ok) {
-                    const errText = await res.text();
-                    if (res.status === 429 && attempt < MAX_RETRIES) {
-                        const backoff = (attempt + 1) * 3000;
-                        log(`  ⚠️  Rate limited (attempt ${attempt + 1}/${MAX_RETRIES + 1}), retrying in ${backoff / 1000}s...`);
-                        await sleep(backoff);
-                        continue;
-                    }
-                    log(`  ❌ Gemini API error: ${res.status} ${errText.slice(0, 200)} (batch ${Math.floor(i / EMBED_BATCH) + 1})`);
-                    failed += batch.length;
-                    break;
-                }
-
-                const data = await res.json();
-                const embeddings = (data.embeddings as { values: number[] }[]).map((e) => e.values);
-
-                // Update assets with embeddings — track individual failures
-                const UPDATE_CONCURRENCY = 10;
-                for (let j = 0; j < batch.length; j += UPDATE_CONCURRENCY) {
-                    const updateBatch = batch.slice(j, j + UPDATE_CONCURRENCY);
-                    const results = await Promise.allSettled(
-                        updateBatch.map((asset, idx) =>
-                            supabase.from('assets')
-                                .update({ embedding: JSON.stringify(embeddings[j + idx]) })
-                                .eq('id', asset.id)
-                                .then(({ error }) => {
-                                    if (error) throw error;
-                                })
-                        )
-                    );
-                    const succeeded = results.filter(r => r.status === 'fulfilled').length;
-                    const dbFailed = results.filter(r => r.status === 'rejected').length;
-                    embedded += succeeded;
-                    if (dbFailed > 0) {
-                        failed += dbFailed;
-                        log(`  ⚠️  ${dbFailed} DB writes failed in update batch`);
-                    }
-                }
-                break; // Success — exit retry loop
-            } catch (err) {
-                const message = err instanceof Error ? err.message : String(err);
-                if (attempt < MAX_RETRIES) {
-                    const backoff = (attempt + 1) * 2000;
-                    log(`  ⚠️  Embedding error (attempt ${attempt + 1}/${MAX_RETRIES + 1}): ${message}, retrying in ${backoff / 1000}s...`);
-                    await sleep(backoff);
-                } else {
-                    // Batch failed after all retries — retry each asset individually
-                    log(`  ⚠️  Batch ${Math.floor(i / EMBED_BATCH) + 1} failed after ${MAX_RETRIES + 1} attempts, retrying individually...`);
-                    for (const asset of batch) {
-                        try {
-                            // Try multimodal first
-                            const { parts, hasImage } = await buildEmbedParts(asset);
-                            const singleReq = [{ model: 'models/gemini-embedding-2-preview', content: { parts }, outputDimensionality: 768 }];
-                            const singleRes = await fetch(GEMINI_EMBED_URL, {
-                                method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-                                body: JSON.stringify({ requests: singleReq }),
-                            });
-
-                            if (!singleRes.ok) throw new Error(`API ${singleRes.status}`);
-                            const singleData = await singleRes.json();
-                            const vec = singleData.embeddings[0].values;
-
-                            const { error: ue } = await supabase.from('assets')
-                                .update({ embedding: JSON.stringify(vec) }).eq('id', asset.id);
-                            if (!ue) { embedded++; if (hasImage) withImage++; }
-                            else failed++;
-                        } catch {
-                            // Multimodal failed — try text-only
-                            try {
-                                const textReq = [{ model: 'models/gemini-embedding-2-preview', content: { parts: [{ text: buildEmbedText(asset) }] }, outputDimensionality: 768 }];
-                                const textRes = await fetch(GEMINI_EMBED_URL, {
-                                    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-                                    body: JSON.stringify({ requests: textReq }),
-                                });
-                                if (!textRes.ok) throw new Error(`API ${textRes.status}`);
-                                const textData = await textRes.json();
-                                const vec = textData.embeddings[0].values;
-
-                                const { error: ue } = await supabase.from('assets')
-                                    .update({ embedding: JSON.stringify(vec) }).eq('id', asset.id);
-                                if (!ue) { embedded++; log(`    ↳ ${asset.name}: text-only fallback ✓`); }
-                                else failed++;
-                            } catch (e2) {
-                                failed++;
-                                log(`    ↳ ${asset.name}: failed entirely — ${e2 instanceof Error ? e2.message : String(e2)}`);
-                            }
-                        }
-                        await sleep(200);
-                    }
-                }
-            }
-        }
-
-        const done = Math.min(i + EMBED_BATCH, toEmbed.length);
-        progress(done, toEmbed.length, 'embedded');
-        const pct = Math.round((done / toEmbed.length) * 100);
-        emitProgress('reembed', `Embedding — ${done}/${toEmbed.length} (${embedded} succeeded, ${withImage} multimodal)`, pct);
-
-        if (i + EMBED_BATCH < toEmbed.length) await sleep(500);
-    }
-
-    log(`  ✅ Embedded ${embedded} assets${failed > 0 ? ` (${failed} failed)` : ''}`);
-    return embedded;
+    const failed = result.failed.length + writeFailed;
+    if (failed > 0) problem('embeddings', `${failed} assets not embedded — retried next run`, failed);
+    log(`  ✅ Embedded ${written} assets (${result.withImage} with image)${failed > 0 ? ` (${failed} failed — retried next run)` : ''}`);
+    return written;
 }
 
 // ---------------------------------------------------------------------------
@@ -1722,6 +1544,7 @@ async function main() {
         console.log('');
     }
     if (skipThumbnails) log('⏭️  Skipping thumbnail processing (--skip-thumbnails)');
+    if (DRY_RUN) log('🧪 DRY RUN — reading everything, writing nothing');
 
     const startTime = Date.now();
     const startedAt = new Date().toISOString();
@@ -1770,18 +1593,22 @@ async function main() {
     }
 
     // Persist folder path → Drive folder ID mapping for "Open in Google Drive" links
-    if (Object.keys(folderIdMap).length > 0) {
+    if (DRY_RUN) {
+        plan.folderDriveIds = Object.keys(folderIdMap).length;
+    } else if (Object.keys(folderIdMap).length > 0) {
         const supabase = getSupabase();
-        await supabase.from('app_settings').upsert({
+        const { error: mapErr } = await supabase.from('app_settings').upsert({
             key: 'folder_drive_ids',
             value: folderIdMap,
             updated_at: new Date().toISOString(),
         });
+        if (mapErr) problem('folders', `Could not save folder-to-Drive-ID map: ${mapErr.message}`);
         log(`  📁 Saved ${Object.keys(folderIdMap).length} folder-to-Drive-ID mappings`);
     }
 
     // Step 2: Thumbnails (optional)
     let thumbnailUrls: Map<string, string>;
+    let thumbnailColors = new Map<string, string>();
     let thumbnailsUploaded = 0;
     let thumbnailErrors = 0;
     if (skipThumbnails) {
@@ -1792,6 +1619,7 @@ async function main() {
         emitProgress('thumbnails', 'Processing thumbnails...');
         const thumbs = await processThumbnails(accessToken, files);
         thumbnailUrls = thumbs.urlMap;
+        thumbnailColors = thumbs.colorMap;
         thumbnailsUploaded = thumbnailUrls.size;
         // Counted directly: the URL map also holds every pre-existing storage
         // object, so deriving failures from its size undercounted them.
@@ -1801,7 +1629,7 @@ async function main() {
 
     // Step 3: Upsert
     emitProgress('upsert', 'Upserting to database...');
-    const { upserted, errors: upsertErrors } = await upsertToSupabase(files, thumbnailUrls, skipThumbnails);
+    const { upserted, errors: upsertErrors } = await upsertToSupabase(files, thumbnailUrls, startedAt, skipThumbnails, thumbnailColors);
 
     // Step 3b: Self-healing — fix any stale Google thumbnail URLs remaining in DB
     let thumbnailsRepaired = 0;
@@ -1855,11 +1683,32 @@ async function main() {
         console.log('');
     }
 
+    if (DRY_RUN) {
+        const counts = Object.fromEntries(Object.entries(plan).map(([k, v]) =>
+            [k, Array.isArray(v) ? v.length : typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([r, ids]) => [r, (ids as string[]).length])) : v]));
+        log('🧪 DRY RUN — nothing was written. Planned changes:');
+        log(JSON.stringify(counts, null, 2));
+        if (DRY_RUN_OUT) {
+            const fs = await import('fs');
+            // Sorted so two runs of the same data produce identical files
+            const sorted = {
+                ...plan,
+                assetUpserts: [...plan.assetUpserts].sort((a, b) => String(a.drive_file_id).localeCompare(String(b.drive_file_id))),
+                shortcutUpserts: [...plan.shortcutUpserts].sort((a, b) => a.shortcut_drive_id.localeCompare(b.shortcut_drive_id)),
+            };
+            for (const v of Object.values(sorted)) if (Array.isArray(v) && typeof v[0] === 'string') (v as string[]).sort();
+            for (const ids of Object.values(sorted.softDelete)) ids.sort();
+            fs.writeFileSync(DRY_RUN_OUT, JSON.stringify(sorted, null, 1));
+            log(`   Plan written to ${DRY_RUN_OUT}`);
+        }
+        return;
+    }
+
     // Write sync log to Supabase
     try {
         const supabase = getSupabase();
-        const hasErrors = upsertErrors > 0 || thumbnailErrors > 0 || massOrphanBlocked > 0;
-        await supabase.from('sync_logs').insert({
+        const hasErrors = problems.length > 0 || upsertErrors > 0 || thumbnailErrors > 0 || massOrphanBlocked > 0;
+        const { error: logErr } = await supabase.from('sync_logs').insert({
             started_at: startedAt,
             finished_at: finishedAt,
             duration_secs: durationSecs,
@@ -1880,13 +1729,19 @@ async function main() {
             shortcuts_orphaned: shortcutResult.orphansRemoved,
             master_folders: SYNC_FOLDERS,
             status: hasErrors ? 'partial' : 'success',
-            error_message: massOrphanBlocked > 0
-                ? `Skipped trashing ${massOrphanBlocked} assets missing from Drive (mass-orphan safety limit). `
-                  + 'A synced top-level folder may have been renamed or moved. If the files were really deleted, '
-                  + 'run the GitHub Actions sync manually with "allow_mass_orphan" checked (CLI: --allow-mass-orphan).'
-                : null,
+            error_message: [
+                massOrphanBlocked > 0
+                    ? `Skipped trashing ${massOrphanBlocked} assets missing from Drive (mass-orphan safety limit). `
+                      + 'A synced top-level folder may have been renamed or moved. If the files were really deleted, '
+                      + 'run the GitHub Actions sync manually with "allow_mass_orphan" checked (CLI: --allow-mass-orphan).'
+                    : '',
+                summarizeProblems(problems),
+            ].filter(Boolean).join(' · ') || null,
+            source: 'cron',
+            details: { ...runContext(), problems },
         });
-        log('📝 Sync log written to database');
+        if (logErr) log(`⚠️  Failed to write sync log: ${logErr.message}`);
+        else log(`📝 Sync log written to database${problems.length > 0 ? ` (partial — ${problems.length} problem(s))` : ''}`);
     } catch (err) {
         log(`⚠️  Failed to write sync log: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1901,7 +1756,7 @@ main().catch(async (err) => {
     console.error('❌ Sync failed:', err.message);
     // Record the failure so it shows in Settings — otherwise a crashed run
     // leaves no trace in the app and the last success looks current.
-    if (runStartedAt && SUPABASE_URL && SUPABASE_SERVICE_KEY) {
+    if (runStartedAt && SUPABASE_URL && SUPABASE_SERVICE_KEY && !DRY_RUN) {
         try {
             const finishedAt = new Date();
             await getSupabase().from('sync_logs').insert({
@@ -1910,6 +1765,8 @@ main().catch(async (err) => {
                 duration_secs: (finishedAt.getTime() - new Date(runStartedAt).getTime()) / 1000,
                 status: 'failed',
                 error_message: String(err?.message ?? err).slice(0, 1000),
+                source: 'cron',
+                details: { ...runContext(), problems, stack: String(err?.stack ?? '').slice(0, 2000) },
             });
         } catch { /* best effort */ }
     }

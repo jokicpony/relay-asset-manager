@@ -92,7 +92,10 @@ export default function FilePreviewTable({
     const [failedThumbs, setFailedThumbs] = useState<Set<string>>(new Set());
     // Anchor for shift-click range selection, with the status the anchor click
     // produced — a shift-click paints that same status across the range.
+    // Reset whenever a bulk action or filter change makes the anchor's status
+    // stale — otherwise a later shift-click paints that stale status.
     const anchorRef = useRef<{ id: string; status: 'pending' | 'excluded' } | null>(null);
+    const resetAnchor = () => { anchorRef.current = null; };
 
     const visibleFiles = files.filter(file => {
         if (file.status === 'processing' || file.status === 'success' || file.status === 'error') return true;
@@ -187,16 +190,18 @@ export default function FilePreviewTable({
                 <div className="order-pill-group">
                     {(['all', 'images', 'videos'] as FilterType[]).map(t => (
                         <button key={t} className={`order-pill${filterType === t ? ' active' : ''}`}
-                            onClick={() => setFilterType(t)}>
+                            onClick={() => { resetAnchor(); setFilterType(t); }}>
                             {t === 'all' ? 'All' : t === 'images' ? 'Images' : 'Videos'}
                         </button>
                     ))}
                 </div>
                 <span style={{ color: 'var(--ram-border)' }}>|</span>
                 <button
-                    onClick={() => isFiltered && onSelectFiltered
-                        ? onSelectFiltered(filteredToggleableIds)
-                        : onSelectAll()}
+                    onClick={() => {
+                        resetAnchor();
+                        if (isFiltered && onSelectFiltered) onSelectFiltered(filteredToggleableIds);
+                        else onSelectAll();
+                    }}
                     style={{
                         background: 'none',
                         border: 'none',
@@ -210,9 +215,11 @@ export default function FilePreviewTable({
                     Select All
                 </button>
                 <button
-                    onClick={() => isFiltered && onDeselectFiltered
-                        ? onDeselectFiltered(filteredToggleableIds)
-                        : onDeselectAll()}
+                    onClick={() => {
+                        resetAnchor();
+                        if (isFiltered && onDeselectFiltered) onDeselectFiltered(filteredToggleableIds);
+                        else onDeselectAll();
+                    }}
                     style={{
                         background: 'none',
                         border: 'none',
@@ -246,12 +253,12 @@ export default function FilePreviewTable({
                         type="text"
                         placeholder="Filter by name…"
                         value={searchQuery}
-                        onChange={e => setSearchQuery(e.target.value)}
+                        onChange={e => { resetAnchor(); setSearchQuery(e.target.value); }}
                         className="bg-transparent outline-none flex-1"
                         style={{ fontSize: '11px', color: 'var(--ram-text-primary)', minWidth: 0 }}
                     />
                     {searchQuery && (
-                        <button onClick={() => setSearchQuery('')} style={{ lineHeight: 0, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+                        <button onClick={() => { resetAnchor(); setSearchQuery(''); }} style={{ lineHeight: 0, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
                             <svg width="10" height="10" viewBox="0 0 24 24" fill="none"
                                 stroke="var(--ram-text-tertiary)" strokeWidth="2.5">
                                 <path d="M18 6L6 18M6 6l12 12" />
@@ -345,6 +352,10 @@ export default function FilePreviewTable({
                                             opacity: isExcluded ? 0.45 : 1,
                                             cursor: isProcessed ? 'default' : 'pointer',
                                             padding: 0,
+                                            // Shift-click range selection would otherwise
+                                            // also extend a text selection across captions
+                                            userSelect: 'none',
+                                            WebkitUserSelect: 'none',
                                         }}
                                     >
                                         {/* Thumbnail */}
@@ -587,6 +598,9 @@ export default function FilePreviewTable({
                                         {!isProcessed && (
                                             <button
                                                 onClick={e => handleToggle(file, e.shiftKey)}
+                                                // Shift+mousedown would extend a text selection
+                                                // across the rows; names stay copyable otherwise
+                                                onMouseDown={e => { if (e.shiftKey) e.preventDefault(); }}
                                                 className="w-5 h-5 rounded flex items-center justify-center transition-all"
                                                 style={{
                                                     border: isExcluded

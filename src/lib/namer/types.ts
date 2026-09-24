@@ -130,5 +130,75 @@ export interface NamerSettings {
     helpGuideContent: string;
 }
 
-// Batch-processing state shapes live with their only consumer:
-// src/components/namer/NamerQueue.tsx (BatchInfo / BatchFile).
+// ---------------------------------------------------------------------------
+// Batch processing (client-side queue in NamerView / NamerQueue)
+// ---------------------------------------------------------------------------
+
+export type BatchFileStatus = 'queued' | 'processing' | 'analyzing' | 'success' | 'error' | 'cancelled';
+
+/**
+ * Pipeline steps recorded per file so "Retry failed" redoes only what didn't
+ * succeed. `move` is the rename + move; `label:<labelId>` one Drive label.
+ */
+export type BatchStep = 'move' | 'orientation' | 'ai' | 'description' | `label:${string}`;
+
+export interface BatchFile {
+    id: string;
+    name: string;
+    proposedName: string;
+    /**
+     * `success` means the rename/move landed (later steps may still have
+     * `warnings`); `error` means it didn't; `cancelled` means it never started.
+     */
+    status: BatchFileStatus;
+    finalName: string | null;
+    /**
+     * The name the rename step aimed for — reused on retry, so a retry never
+     * renames a file a second time (e.g. to `_002`) when the first attempt
+     * actually landed but its response was lost.
+     */
+    targetName?: string;
+    orientation?: 'Horizontal' | 'Vertical' | 'Square';
+    imageMediaMetadata?: { width: number; height: number };
+    videoMediaMetadata?: { width: number; height: number };
+    /** Why the rename/move failed (status `error`). */
+    error?: string;
+    /** Post-move steps that failed (labels, orientation, AI, description). */
+    warnings?: string[];
+    /** Steps that succeeded; a retry skips these. */
+    doneSteps?: BatchStep[];
+    /** AI result, kept so a retry of only the description can reuse it. */
+    aiMetadata?: AIMetadata | null;
+    /** Per-file revert outcome — a batch is only "Reverted" when all are `done`. */
+    revert?: 'done' | 'failed';
+    revertError?: string;
+}
+
+/**
+ * Settings captured when a batch is queued, so processing uses what the user
+ * saw at queue time even if they change labels/AI/schema before it runs.
+ */
+export interface BatchSnapshot {
+    selectedLabelIds: string[];
+    labelFieldValues: LabelFieldValues;
+    aiEnabled: boolean;
+    labels: DriveLabel[];
+    settings: NamerSettings | null;
+    /** Counter's token index in the names (see naming.ts dedupeName). */
+    counterIndex?: number | null;
+}
+
+export interface BatchInfo {
+    id: string;
+    files: BatchFile[];
+    progress: { completed: number; total: number; errors: number };
+    /** `revert-failed`: some files couldn't be moved back — retryable. */
+    status: 'queued' | 'processing' | 'completed' | 'reverting' | 'reverted' | 'revert-failed';
+    timestamp: number;
+    labelsSummary?: string;
+    sourceFolderId: string;
+    destFolderId: string;
+    /** Set by Cancel; the runner stops before the next file starts. */
+    cancelRequested?: boolean;
+    _snapshot?: BatchSnapshot;
+}

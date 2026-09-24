@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { getAdminClient } from '@/lib/supabase/admin';
 import { getDriveAccessToken } from '@/lib/google/auth';
-import { isInSharedDrive } from '@/lib/google/drive-scope';
+import { isInSharedDrive, DriveScopeUnavailableError } from '@/lib/google/drive-scope';
 import { resolveFolderPathById } from '@/lib/google/folder-path';
 import { getConfig } from '@/lib/config';
 import { logger } from '@/lib/logger';
@@ -197,6 +197,11 @@ export async function POST(request: NextRequest) {
             resolvedFolderPath: targetFolderPath,
         });
     } catch (err) {
+        if (err instanceof DriveScopeUnavailableError) {
+            // Drive couldn't confirm the folder is in the shared drive (rate
+            // limit / outage) — retryable, not a permissions problem
+            return NextResponse.json({ error: err.message }, { status: 503 });
+        }
         logger.error('shortcut', 'Shortcut creation error', { error: String(err) });
         return NextResponse.json({ error: 'Failed to create shortcuts' }, { status: 500 });
     }
