@@ -1,14 +1,6 @@
 -- ============================================================
 -- Relay Asset Manager — Complete Database Schema
 -- Run this in the Supabase SQL Editor (Dashboard → SQL Editor)
---
--- Fresh install: this file alone creates the complete, current schema.
--- It is safe to re-run (e.g. after a partial failure): every statement
--- is idempotent.
---
--- Existing install: re-running this file does NOT add columns to tables
--- that already exist — apply the files in supabase/migrations/ instead
--- (see supabase/migrations/README.md).
 -- ============================================================
 
 -- ────────────────────────────────────────────────────────────
@@ -23,7 +15,7 @@ create extension if not exists vector with schema extensions;
 -- 2. Assets table — the master library
 -- ────────────────────────────────────────────────────────────
 
-create table if not exists public.assets (
+create table public.assets (
     id              uuid primary key default gen_random_uuid(),
     drive_file_id   text unique not null,
     name            text not null,
@@ -32,7 +24,6 @@ create table if not exists public.assets (
     asset_type      text not null check (asset_type in ('photo', 'video')),
     folder_path     text not null,
     thumbnail_url   text,
-    thumb_color     text,                                  -- dominant colour placeholder (#rrggbb)
     preview_url     text,                                         -- video stream URL
     width           int not null default 0,
     height          int not null default 0,
@@ -59,10 +50,9 @@ create table if not exists public.assets (
     -- Gemini embedding (nullable — videos may lack descriptions)
     embedding       vector(768),
 
-    -- Soft delete (14-day trash queue; 'out-of-scope' rows are exempt from
-    -- the purge — the Drive files still exist, only the allowlist changed)
+    -- Soft delete (14-day trash queue)
     deleted_at      timestamptz default null,
-    deleted_reason  text check (deleted_reason in ('orphaned', 'ignored', 'out-of-scope')),
+    deleted_reason  text check (deleted_reason in ('orphaned', 'ignored')),
 
     -- Drive timestamps (preserved from Google Drive, separate from Supabase auto-timestamps)
     drive_created_at  timestamptz,
@@ -80,21 +70,17 @@ create table if not exists public.assets (
 -- 3. Assets indexes
 -- ────────────────────────────────────────────────────────────
 
--- HNSW, not ivfflat: ivfflat trains its lists at build time, and this
--- script runs on an empty table (see migrations/2026-09-24_hnsw_embedding_index.sql).
-create index if not exists idx_assets_embedding_hnsw on public.assets
-    using hnsw (embedding vector_cosine_ops);
+create index idx_assets_embedding on public.assets
+    using ivfflat (embedding vector_cosine_ops) with (lists = 100);
 
-create index if not exists idx_assets_shoot_date on public.assets (parsed_shoot_date);
-create index if not exists idx_assets_creator    on public.assets (parsed_creator);
-create index if not exists idx_assets_folder     on public.assets (folder_path);
--- Serves /api/assets: active rows ordered by (folder_path, name, id).
--- (drive_file_id is indexed by its UNIQUE constraint.)
-create index if not exists idx_assets_active_folder_name on public.assets (folder_path, name, id)
-    where is_active;
+create index idx_assets_shoot_date on public.assets (parsed_shoot_date);
+create index idx_assets_creator    on public.assets (parsed_creator);
+create index idx_assets_folder     on public.assets (folder_path);
+create index idx_assets_active     on public.assets (is_active);
+create index idx_assets_drive_id   on public.assets (drive_file_id);
 
 -- Partial index: only index rows in the trash queue
-create index if not exists idx_assets_deleted_at on public.assets (deleted_at)
+create index idx_assets_deleted_at on public.assets (deleted_at)
     where deleted_at is not null;
 
 
@@ -102,25 +88,24 @@ create index if not exists idx_assets_deleted_at on public.assets (deleted_at)
 -- 4. Shortcuts table — one asset can live in many project folders
 -- ────────────────────────────────────────────────────────────
 
-create table if not exists public.shortcuts (
+create table public.shortcuts (
     id                      uuid primary key default gen_random_uuid(),
     shortcut_drive_id       text unique not null,                 -- Drive ID of the shortcut file
     target_asset_id         uuid not null references public.assets(id) on delete cascade,
     project_folder_path     text not null,                        -- e.g. /Special Projects/Q1 Campaign
     project_folder_drive_id text not null,                        -- Drive ID of the containing folder
-    created_at              timestamptz default now(),
-    missing_since           timestamptz default null              -- set when a sync doesn't see the shortcut; deleted after a grace period
+    created_at              timestamptz default now()
 );
 
-create index if not exists idx_shortcuts_target on public.shortcuts (target_asset_id);
-create index if not exists idx_shortcuts_folder on public.shortcuts (project_folder_drive_id);
+create index idx_shortcuts_target on public.shortcuts (target_asset_id);
+create index idx_shortcuts_folder on public.shortcuts (project_folder_drive_id);
 
 
 -- ────────────────────────────────────────────────────────────
 -- 5. Sync logs — one row per sync run for the settings dashboard
 -- ────────────────────────────────────────────────────────────
 
-create table if not exists public.sync_logs (
+create table public.sync_logs (
     id                   uuid primary key default gen_random_uuid(),
     started_at           timestamptz not null,
     finished_at          timestamptz not null,
@@ -153,17 +138,10 @@ create table if not exists public.sync_logs (
                          check (status in ('success', 'partial', 'failed')),
     error_message        text,
 
-    -- Activity log for both ingestion paths: 'cron' (scheduled sync) or
-    -- 'ingest' (in-app, after a Namer batch). details holds structured
-    -- problems + context (GitHub run URL, triggering user, per-file errors).
-    source               text not null default 'cron',
-    details              jsonb,
-
     created_at           timestamptz default now()
 );
 
-create index if not exists idx_sync_logs_finished on public.sync_logs (finished_at desc);
-create index if not exists idx_sync_logs_source_finished on public.sync_logs (source, finished_at desc);
+create index idx_sync_logs_finished on public.sync_logs (finished_at desc);
 
 
 -- ────────────────────────────────────────────────────────────
@@ -185,43 +163,45 @@ create table if not exists app_settings (
 -- Assets
 alter table public.assets enable row level security;
 
-drop policy if exists "Users can view assets" on public.assets;
 create policy "Users can view assets"
     on public.assets for select to authenticated using (true);
 
--- No authenticated-client write policies: all writes go through server routes
--- and the sync pipeline using the service role key (which bypasses RLS). This
--- prevents a signed-in browser session from tampering with the library.
+create policy "Authenticated users can insert assets"
+    on public.assets for insert to authenticated with check (true);
+
+create policy "Authenticated users can update assets"
+    on public.assets for update to authenticated
+    using (true) with check (true);
 
 -- Shortcuts
 alter table public.shortcuts enable row level security;
 
-drop policy if exists "Users can view shortcuts" on public.shortcuts;
 create policy "Users can view shortcuts"
     on public.shortcuts for select to authenticated using (true);
 
--- No authenticated-client write policies: shortcut rows are created/deleted by
--- server routes (/api/drive/shortcut[/delete]) and the sync pipeline using the
--- service role key. Authenticated clients have read-only access.
+create policy "Users can create shortcuts"
+    on public.shortcuts for insert to authenticated with check (true);
+
+create policy "Users can delete shortcuts"
+    on public.shortcuts for delete to authenticated using (true);
 
 -- Sync logs
 alter table public.sync_logs enable row level security;
 
-drop policy if exists "Authenticated users can read sync_logs" on public.sync_logs;
 create policy "Authenticated users can read sync_logs"
     on public.sync_logs for select using (auth.role() = 'authenticated');
 
 -- App settings
 alter table app_settings enable row level security;
 
-drop policy if exists "Authenticated users can read settings" on app_settings;
 create policy "Authenticated users can read settings"
     on app_settings for select using (auth.role() = 'authenticated');
 
--- No authenticated-client write policies: writes go through server routes
--- (/api/settings/config, sync pipeline) using the service role key. This stops
--- users from rewriting operational config directly via the anon key and
--- bypassing the server-side key allowlist.
+create policy "Authenticated users can update settings"
+    on app_settings for update using (auth.role() = 'authenticated');
+
+create policy "Authenticated users can insert settings"
+    on app_settings for insert with check (auth.role() = 'authenticated');
 
 -- Service role (used by sync pipeline) bypasses RLS automatically.
 
@@ -239,7 +219,6 @@ begin
 end;
 $$ language plpgsql;
 
-drop trigger if exists on_assets_updated on public.assets;
 create trigger on_assets_updated
     before update on public.assets
     for each row
@@ -253,7 +232,6 @@ create or replace function match_assets(
 )
 returns table (id uuid, similarity float)
 language sql stable
-set hnsw.ef_search = 200  -- default 40 caps results below the app's limit of 100
 as $$
   select
     assets.id,
@@ -275,10 +253,10 @@ insert into storage.buckets (id, name, public)
 values ('thumbnails', 'thumbnails', true)
 on conflict (id) do nothing;
 
-drop policy if exists "Public thumbnail access" on storage.objects;
 create policy "Public thumbnail access"
     on storage.objects for select to public
     using (bucket_id = 'thumbnails');
 
--- No authenticated INSERT policy: all thumbnail uploads use the service role
--- (see migrations/2026-06-10_drop_authenticated_thumbnail_upload.sql).
+create policy "Authenticated users can upload thumbnails"
+    on storage.objects for insert to authenticated
+    with check (bucket_id = 'thumbnails');

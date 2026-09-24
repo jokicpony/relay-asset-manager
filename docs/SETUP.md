@@ -16,7 +16,7 @@ Supabase provides the database, auth, and thumbnail storage.
    - A `thumbnails` storage bucket
    - The `match_assets` function for semantic search
 
-   > **Upgrading an existing install?** Also run the files in `supabase/migrations/` (in date order) in the SQL Editor. `schema.sql` is always the complete, current schema for fresh installs; the migration files apply the same incremental changes to databases created earlier.
+   > **Upgrading an existing install?** Run the files in `supabase/migrations/` you haven't applied yet, in date order, *before* deploying the new code — see [`supabase/migrations/README.md`](../supabase/migrations/README.md) for what each one does and which are required. Every migration is safe to re-run. `schema.sql` is always the complete, current schema for fresh installs (and is itself safe to re-run); CI checks that both paths produce the same database.
 
 3. Go to **Project Settings → API** and copy:
    - **Project URL** → `NEXT_PUBLIC_SUPABASE_URL`
