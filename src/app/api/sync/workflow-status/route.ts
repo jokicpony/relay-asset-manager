@@ -51,6 +51,14 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const triggeredAt = searchParams.get('triggered_at');
     const runId = searchParams.get('run_id');
+    // Both end up in GitHub API URLs sent with the repo token — accept only
+    // the expected shapes (a run_id like "../.." would walk other API paths)
+    if (runId !== null && !/^\d{1,20}$/.test(runId)) {
+        return NextResponse.json({ error: 'Invalid run_id' }, { status: 400 });
+    }
+    if (triggeredAt !== null && Number.isNaN(Date.parse(triggeredAt))) {
+        return NextResponse.json({ error: 'Invalid triggered_at' }, { status: 400 });
+    }
 
     const headers = {
         Authorization: `Bearer ${token}`,

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { thumbnailColor } from '@/lib/sync/thumbnail-encode';
+import { encodeThumbnail, thumbnailColor } from '@/lib/sync/thumbnail-encode';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { getAdminClient } from '@/lib/supabase/admin';
 import { logger } from '@/lib/logger';
@@ -49,9 +49,13 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ error: 'Asset not found' }, { status: 404 });
         }
 
-        // Upload to Supabase Storage
-        const arrayBuffer = await file.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
+        // Same rule as every other thumbnail: real WebP, ≤800px. Decoding it
+        // also rejects anything that isn't an image before it replaces the
+        // user's current frame.
+        const buffer = await encodeThumbnail(Buffer.from(await file.arrayBuffer()));
+        if (!buffer) {
+            return NextResponse.json({ error: 'The captured frame is not a valid image' }, { status: 400 });
+        }
         const filePath = `custom_${driveFileId}.webp`;
 
         const { error: uploadError } = await supabase.storage

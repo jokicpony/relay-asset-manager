@@ -101,6 +101,7 @@ const RUN_URL = RUN_ID && process.env.GITHUB_SERVER_URL && process.env.GITHUB_RE
     : null;
 const runContext = () => ({
     run_id: RUN_ID,
+    run_attempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
     run_url: RUN_URL,
     trigger: process.env.GITHUB_EVENT_NAME ?? 'local',
 });
@@ -152,6 +153,9 @@ interface CrawlStats {
 }
 interface CrawlResult {
     files: DriveFile[];
+    /** Files the crawl saw but skipped — they exist in Drive (see detectOrphans) */
+    seenOutOfScope: Set<string>;
+    seenIgnored: Set<string>;
     folderIdMap: Record<string, string>;
     stats: CrawlStats;
 }
@@ -197,9 +201,15 @@ let rightsLabelConfig: RightsLabelConfig = {
 async function loadConfig(): Promise<void> {
     try {
         const supabase = getSupabase();
-        const { data } = await supabase
+        const { data, error } = await supabase
             .from('app_settings')
             .select('key, value');
+        if (error) {
+            // In CI there are no env fallbacks worth trusting — stop with the
+            // real reason instead of a misleading "not configured" later
+            if (process.env.GITHUB_ACTIONS) throw new Error(`Could not load app_settings: ${error.message}`);
+            log(`  ⚠️  Could not load app_settings (${error.message}) — using env var fallbacks`);
+        }
 
         const settings = new Map<string, unknown>();
         if (!data || data.length === 0) {
@@ -477,6 +487,8 @@ async function crawlDrive(accessToken: string, folderTree: FolderTree): Promise<
 
     const { pathCache, ignoredFolderIds, directlyTaggedIds } = folderTree;
     const results: DriveFile[] = [];
+    const seenOutOfScope = new Set<string>();
+    const seenIgnored = new Set<string>();
 
     // Resolve folder path from pre-fetched tree (zero API calls)
     function resolvePath(parents: string[] | null | undefined): string {
@@ -535,12 +547,14 @@ async function crawlDrive(accessToken: string, folderTree: FolderTree): Promise<
             // Allowlist check
             if (!isInSyncScope(folderPath, SYNC_FOLDERS)) {
                 skippedByFolder++;
+                seenOutOfScope.add(file.id);
                 continue;
             }
 
             // [relay-ignore] check — skip files in ignored folders
             if (isIgnored(file.parents)) {
                 skippedByIgnore++;
+                seenIgnored.add(file.id);
                 continue;
             }
 
@@ -573,6 +587,8 @@ async function crawlDrive(accessToken: string, folderTree: FolderTree): Promise<
 
     return {
         files: results,
+        seenOutOfScope,
+        seenIgnored,
         folderIdMap: folderTree.folderIdMap,
         stats: { skippedByFolder, skippedByIgnore, ignoredFolders: ignoredFolderDetails },
     };
@@ -720,10 +736,14 @@ async function resolveShortcuts(
     let matched = 0;
     let failed = 0;
     const upsertRows: Record<string, string>[] = [];
-    const discoveredShortcutIds = new Set<string>();
+    // "Still exists in Drive" is every shortcut the listing returned — not
+    // just the in-scope ones. Relays can target any folder in the shared
+    // drive (a project folder outside the synced ones is normal); the scope
+    // filter only decides which shortcuts the sync adds by itself. Counting
+    // only in-scope ones marked such relays missing and deleted them.
+    const discoveredShortcutIds = new Set(shortcuts.map((sc) => sc.id));
 
     for (const sc of filteredShortcuts) {
-        discoveredShortcutIds.add(sc.id);
         const assetId = targetToAssetId.get(sc.targetId);
 
         if (!assetId) {
@@ -848,7 +868,7 @@ async function cleanupOrphanedShortcuts(
 async function processThumbnails(
     accessToken: string,
     files: DriveFile[]
-): Promise<{ urlMap: Map<string, string>; colorMap: Map<string, string>; failed: number }> {
+): Promise<{ urlMap: Map<string, string>; colorMap: Map<string, string>; failed: number; uploaded: number }> {
     log('🖼️  Processing thumbnails...');
 
     const supabase = getSupabase();
@@ -867,7 +887,13 @@ async function processThumbnails(
             .from('thumbnails')
             .list('', { limit: LIST_PAGE, offset: listOffset, sortBy: { column: 'name', order: 'asc' } });
 
-        if (listErr || !storageFiles || storageFiles.length === 0) break;
+        if (listErr) {
+            // Without the listing every thumbnail looks missing and the whole
+            // budget would go to regenerating existing ones — skip this run
+            problem('thumbnails', `Skipped — could not list the thumbnails bucket: ${listErr.message}`);
+            return { urlMap: new Map(), colorMap, failed: 0, uploaded: 0 };
+        }
+        if (!storageFiles || storageFiles.length === 0) break;
 
         for (const sf of storageFiles) {
             // Files are named {drive_file_id}.webp or custom_{drive_file_id}.webp
@@ -908,11 +934,11 @@ async function processThumbnails(
 
     if (needsThumbnail.length === 0) {
         log('  ✅ All thumbnails up to date');
-        return { urlMap, colorMap, failed: 0 };
+        return { urlMap, colorMap, failed: 0, uploaded: 0 };
     }
     if (DRY_RUN) {
         plan.thumbnailsToGenerate.push(...needsThumbnail.map(f => f.id));
-        return { urlMap, colorMap, failed: 0 };
+        return { urlMap, colorMap, failed: 0, uploaded: 0 };
     }
 
     // Shared pipeline (src/lib/sync/thumbnails): bounded pool + wall-clock
@@ -949,7 +975,7 @@ async function processThumbnails(
         problem('thumbnails', `${failedDownloads} could not be generated (fetch, decode or upload failed)`, failedDownloads);
     }
     log(`  ✅ Uploaded ${uploaded} new thumbnails (${skipped} already existed${failedDownloads > 0 ? `, ${failedDownloads} failed` : ''})`);
-    return { urlMap, colorMap, failed: failedDownloads };
+    return { urlMap, colorMap, failed: failedDownloads, uploaded };
 }
 
 // ---------------------------------------------------------------------------
@@ -965,6 +991,7 @@ async function repairStaleThumbnailUrls(): Promise<number> {
         .eq('is_active', true)
         .like('thumbnail_url', '%googleusercontent.com%');
 
+    if (error) problem('thumbnails', `Stale URL check failed: ${error.message}`);
     if (error || !staleAssets || staleAssets.length === 0) {
         return 0;
     }
@@ -1123,7 +1150,9 @@ async function upsertToSupabase(
 async function detectOrphans(
     crawledIds: Set<string>,
     syncStartedAt: string,
-    ignoredFolderPaths: string[] = []
+    ignoredFolderPaths: string[] = [],
+    seenOutOfScope: Set<string> = new Set(),
+    seenIgnored: Set<string> = new Set(),
 ): Promise<{ softDeleted: number; restored: number; massOrphanBlocked: number }> {
     log('🔍 Detecting orphaned assets...');
 
@@ -1169,6 +1198,19 @@ async function detectOrphans(
     for (const asset of activeAssets || []) {
         if (crawledIds.has(asset.drive_file_id)) continue;
 
+        // The crawl saw the file but skipped it — it still exists in Drive,
+        // it just moved out of scope or into an ignored folder. Classify by
+        // where it is now; the stored folder_path is where it *was*, and
+        // judging by that tagged moved files 'orphaned' (purged in 14 days).
+        if (seenIgnored.has(asset.drive_file_id)) {
+            ignoredIds.push(asset.id);
+            continue;
+        }
+        if (seenOutOfScope.has(asset.drive_file_id)) {
+            outOfScopeIds.push(asset.id);
+            continue;
+        }
+
         // Is the asset's folder_path the ignored folder or nested inside it?
         // (Boundary-checked — plain startsWith would also match sibling
         // folders sharing a name prefix.) The explicit [relay-ignore] tag
@@ -1201,13 +1243,18 @@ async function detectOrphans(
     // the upsert just wrote — it's essentially the orphan candidates alone.
     const librarySize = crawledIds.size + activeAssets.filter(a => !crawledIds.has(a.drive_file_id)).length;
     const orphanLimit = Math.max(MASS_ORPHAN_MIN, Math.floor(librarySize * MASS_ORPHAN_FRACTION));
+    // Both reasons end in a hard purge after 14 days, and [relay-ignore] is a
+    // description tag any Drive editor can type — so a mistaken tag on a big
+    // folder is throttled the same way. (out-of-scope rows are never purged.)
+    const purgeBound = orphanIds.length + ignoredIds.length;
     let massOrphanBlocked = 0;
-    if (orphanIds.length > orphanLimit && !ALLOW_MASS_ORPHAN) {
-        massOrphanBlocked = orphanIds.length;
-        log(`  🛑 ${orphanIds.length} assets would be trashed as orphaned (limit ${orphanLimit}) — skipping.`);
-        log('     Likely a renamed/moved top-level folder or an incomplete Drive listing.');
-        log('     If the deletion is real, re-run with --allow-mass-orphan.');
+    if (purgeBound > orphanLimit && !ALLOW_MASS_ORPHAN) {
+        massOrphanBlocked = purgeBound;
+        log(`  🛑 ${purgeBound} assets would be trashed (${orphanIds.length} orphaned, ${ignoredIds.length} [relay-ignore]; limit ${orphanLimit}) — skipping.`);
+        log('     Likely a renamed/moved top-level folder, a [relay-ignore] tag on a large folder, or an incomplete Drive listing.');
+        log('     If this is intended, re-run with --allow-mass-orphan.');
         orphanIds.length = 0;
+        ignoredIds.length = 0;
     }
     plan.massOrphanBlocked = massOrphanBlocked;
 
@@ -1341,7 +1388,11 @@ async function purgeExpired(): Promise<number> {
                 .order('id') // stable order — offset paging on an unordered set can skip/repeat rows
                 .range(from, from + PAGE - 1);
 
-            if (error || !data || data.length === 0) break;
+            if (error) {
+                problem('purge', `Could not read expired trash: ${error.message}`);
+                break;
+            }
+            if (!data || data.length === 0) break;
             expired.push(...data);
             if (data.length < PAGE) break;
             from += PAGE;
@@ -1411,7 +1462,10 @@ async function snapshotMetadata(): Promise<Map<string, MetadataSnapshot>> {
             .order('id') // stable order — offset paging on an unordered set can skip/repeat rows
             .range(from, from + PAGE - 1);
 
-        if (error || !data || data.length === 0) break;
+        // A partial snapshot would make changed assets look new (never
+        // re-embedded) — nothing has been written yet, so stop the run
+        if (error) throw new Error(`Metadata snapshot failed: ${error.message}`);
+        if (!data || data.length === 0) break;
         for (const { drive_file_id, ...inputs } of (data as unknown as (EmbedInputs & { drive_file_id: string })[])) {
             map.set(drive_file_id, inputs);
         }
@@ -1478,7 +1532,7 @@ async function reEmbedChanged(
     for (let from = 0; ; from += 1000) {
         const { data, error } = await supabase
             .from('assets')
-            .select('id, drive_file_id, name, description, asset_type, folder_path, parsed_creator, parsed_shoot_description, thumbnail_url')
+            .select('id, drive_file_id, name, description, asset_type, folder_path, parsed_creator, parsed_shoot_description, thumbnail_url, updated_at')
             .is('embedding', null)
             .eq('is_active', true)
             .order('id') // stable order — offset paging on an unordered set can skip/repeat rows
@@ -1508,12 +1562,15 @@ async function reEmbedChanged(
     // Each batch is written as soon as it's embedded.
     let written = 0;
     let writeFailed = 0;
+    let superseded = 0;
+    const versions = new Map(toEmbed.map(a => [a.id, a.updated_at]));
     const result = await embedAssets(supabase, GEMINI_API_KEY, toEmbed, {
         log: (m) => log(`  ⚠️  ${m}`),
         onBatch: async (vectors) => {
-            const w = await writeEmbeddings(supabase, vectors);
+            const w = await writeEmbeddings(supabase, vectors, versions);
             written += w.written;
             writeFailed += w.failed.length;
+            superseded += w.superseded;
         },
         onProgress: (done, total, r) => {
             progress(done, total, 'embedded');
@@ -1524,6 +1581,7 @@ async function reEmbedChanged(
 
     const failed = result.failed.length + writeFailed;
     if (failed > 0) problem('embeddings', `${failed} assets not embedded — retried next run`, failed);
+    if (superseded > 0) log(`  ⏭️  ${superseded} assets changed while embedding — left for the next run`);
     log(`  ✅ Embedded ${written} assets (${result.withImage} with image)${failed > 0 ? ` (${failed} failed — retried next run)` : ''}`);
     return written;
 }
@@ -1584,11 +1642,30 @@ async function main() {
 
     // Step 1: Crawl
     emitProgress('crawl', 'Crawling Google Drive...');
-    const { files, folderIdMap, stats: crawlStats } = await crawlDrive(accessToken, folderTree);
+    const { files, seenOutOfScope, seenIgnored, folderIdMap, stats: crawlStats } = await crawlDrive(accessToken, folderTree);
 
     if (files.length === 0) {
         log('No assets found — nothing to sync.');
         emitProgress('done', 'No assets found', 100);
+        // Usually config drift (the only synced folder renamed, wrong
+        // sync_folders) — record it so Settings says why, not just "overdue"
+        if (!DRY_RUN) {
+            const finishedAt = new Date().toISOString();
+            await getSupabase().from('sync_logs').insert({
+                started_at: startedAt,
+                finished_at: finishedAt,
+                duration_secs: (Date.parse(finishedAt) - Date.parse(startedAt)) / 1000,
+                status: 'partial',
+                error_message: `Found 0 assets in scope (sync folders: ${SYNC_FOLDERS.join(', ') || 'all'}; `
+                    + `${crawlStats.skippedByFolder} outside them, ${crawlStats.skippedByIgnore} in [relay-ignore]). `
+                    + 'Check Sync Folders in Settings → Advanced.',
+                skipped_by_folder: crawlStats.skippedByFolder,
+                skipped_by_ignore: crawlStats.skippedByIgnore,
+                master_folders: SYNC_FOLDERS,
+                source: 'cron',
+                details: { ...runContext(), problems },
+            });
+        }
         return;
     }
 
@@ -1620,7 +1697,7 @@ async function main() {
         const thumbs = await processThumbnails(accessToken, files);
         thumbnailUrls = thumbs.urlMap;
         thumbnailColors = thumbs.colorMap;
-        thumbnailsUploaded = thumbnailUrls.size;
+        thumbnailsUploaded = thumbs.uploaded; // this run's uploads, not everything in storage
         // Counted directly: the URL map also holds every pre-existing storage
         // object, so deriving failures from its size undercounted them.
         thumbnailErrors = thumbs.failed;
@@ -1646,7 +1723,7 @@ async function main() {
     emitProgress('orphans', 'Detecting orphaned assets...');
     const crawledIds = new Set(files.map((f) => f.id));
     const ignoredPaths = crawlStats.ignoredFolders.map(f => f.path);
-    const { softDeleted, restored, massOrphanBlocked } = await detectOrphans(crawledIds, startedAt, ignoredPaths);
+    const { softDeleted, restored, massOrphanBlocked } = await detectOrphans(crawledIds, startedAt, ignoredPaths, seenOutOfScope, seenIgnored);
     emitProgress('orphans', `${softDeleted} soft-deleted, ${restored} restored`, 100);
 
     // Step 5: Resolve shortcuts — discover and link shortcuts to assets
@@ -1731,8 +1808,8 @@ async function main() {
             status: hasErrors ? 'partial' : 'success',
             error_message: [
                 massOrphanBlocked > 0
-                    ? `Skipped trashing ${massOrphanBlocked} assets missing from Drive (mass-orphan safety limit). `
-                      + 'A synced top-level folder may have been renamed or moved. If the files were really deleted, '
+                    ? `Skipped trashing ${massOrphanBlocked} assets (mass-trash safety limit). `
+                      + 'A synced top-level folder may have been renamed or moved, or a large folder tagged [relay-ignore]. If this is intended, '
                       + 'run the GitHub Actions sync manually with "allow_mass_orphan" checked (CLI: --allow-mass-orphan).'
                     : '',
                 summarizeProblems(problems),

@@ -9,9 +9,10 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { google } from 'googleapis';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { getConfig } from '@/lib/config';
+import { isInSharedDrive, isDriveId, DriveScopeUnavailableError } from '@/lib/google/drive-scope';
+import { resolveFolderPathById } from '@/lib/google/folder-path';
 import { normalizeSyncFolders, isInSyncScope } from '@/lib/sync/scope';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { getAdminClient } from '@/lib/supabase/admin';
@@ -19,6 +20,8 @@ import { logger } from '@/lib/logger';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+export const maxDuration = 30;
 
 export async function GET(request: NextRequest) {
     const supabaseAuth = await createServerClient();
@@ -30,8 +33,8 @@ export async function GET(request: NextRequest) {
     const { searchParams } = new URL(request.url);
     const folderId = searchParams.get('folderId');
 
-    if (!folderId) {
-        return NextResponse.json({ error: 'folderId is required' }, { status: 400 });
+    if (!folderId || !isDriveId(folderId)) {
+        return NextResponse.json({ error: 'A valid folderId is required' }, { status: 400 });
     }
 
     try {
@@ -64,42 +67,26 @@ export async function GET(request: NextRequest) {
             }
         }
 
-        // 2. Cache miss — resolve folder path from Drive API
+        // 2. Cache miss — resolve from Drive, but only for folders inside the
+        // shared drive (the service account can see more; walking an outside
+        // folder's parents would reveal names from other drives).
         logger.info('scope-check', `Cache miss for folder ${folderId}, resolving from Drive`);
-
         const accessToken = await getDriveAccessToken();
-        const auth = new google.auth.OAuth2();
-        auth.setCredentials({ access_token: accessToken });
-        const drive = google.drive({ version: 'v3', auth });
-        const driveId = config.sharedDriveId;
-
-        // Walk up the parent chain to build the full path
-        let currentId = folderId;
-        const pathParts: string[] = [];
-
-        while (currentId && currentId !== driveId) {
-            try {
-                const res = await drive.files.get({
-                    fileId: currentId,
-                    fields: 'id,name,parents',
-                    supportsAllDrives: true,
-                });
-
-                pathParts.unshift(res.data.name || 'unknown');
-                currentId = res.data.parents?.[0] || '';
-            } catch {
-                break;
-            }
+        if (!(await isInSharedDrive(accessToken, folderId, config.sharedDriveId))) {
+            return NextResponse.json({ inScope: false, folderPath: null, source: 'outside-shared-drive' });
         }
 
-        const folderPath = '/' + pathParts.join('/');
-        const inScope = isInSyncScope(folderPath, syncFolders);
+        const { path: folderPath } = await resolveFolderPathById(accessToken, folderId, config.sharedDriveId);
+        const inScope = folderPath !== '/unknown' && isInSyncScope(folderPath, syncFolders);
 
         return NextResponse.json({ inScope, folderPath, source: 'drive-api' });
 
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        if (err instanceof DriveScopeUnavailableError) {
+            return NextResponse.json({ error: message }, { status: 503 });
+        }
         logger.error('scope-check', 'Scope check failed', { error: message });
-        return NextResponse.json({ error: message }, { status: 500 });
+        return NextResponse.json({ error: 'Scope check failed' }, { status: 500 });
     }
 }

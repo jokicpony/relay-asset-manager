@@ -10,6 +10,9 @@ import { logger } from '@/lib/logger';
  * Uses a service account (via WIF) for Drive access.
  * Supports Range requests for video seeking.
  */
+// Each range request streams one chunk; the limit bounds a slow one
+export const maxDuration = 300;
+
 export async function GET(
     request: NextRequest,
     { params }: { params: Promise<{ fileId: string }> }
@@ -82,6 +85,10 @@ export async function GET(
 
         responseHeaders.set('Accept-Ranges', 'bytes');
         responseHeaders.set('Cache-Control', 'private, max-age=3600');
+        // Served inline on the app's origin: never let a mislabeled upload be
+        // sniffed into HTML, and sandbox it if opened directly
+        responseHeaders.set('X-Content-Type-Options', 'nosniff');
+        responseHeaders.set('Content-Security-Policy', 'sandbox');
 
         return new NextResponse(driveRes.body, {
             status: driveRes.status,

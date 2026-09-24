@@ -89,9 +89,7 @@ export async function GET(request: NextRequest) {
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         logger.error('search', 'Search error', { error: message });
-        return NextResponse.json(
-            { error: message || 'Internal server error' },
-            { status: 500 }
-        );
+        // Details go to the server log, not the client
+        return NextResponse.json({ error: 'Search failed' }, { status: 500 });
     }
 }

@@ -107,9 +107,13 @@ Open [http://localhost:3000](http://localhost:3000) and sign in with Google.
 After signing in, go to **Settings → Sync** and trigger a manual sync to index your Drive assets. The sync pipeline will:
 
 1. Crawl your configured Shared Drive folders
-2. Extract metadata and generate thumbnails
+2. Extract metadata and generate thumbnails (WebP, ≤800px, with a placeholder colour)
 3. Store everything in Supabase
 4. Generate Gemini embeddings for semantic search (if API key is configured)
+
+Every run — scheduled or in-app — is recorded in **Settings → Recent Activity**,
+with the reason for anything that failed. To see what a sync *would* change
+without writing anything, run `npx tsx scripts/sync.ts --dry-run`.
 
 ## 📁 Project Structure
 
@@ -138,12 +142,19 @@ src/
 ├── lib/
 │   ├── google/                 # Drive auth (WIF + OAuth + ADC)
 │   ├── supabase/               # Client, server, middleware helpers
-│   ├── sync/                   # Sync pipeline (crawler, upsert, thumbnails)
+│   ├── sync/                   # Shared sync engine: scope, Drive retry, file mapping,
+│   │                           #   thumbnails, embeddings (used by the cron sync + in-app ingest)
+│   ├── download/               # Streaming zip downloads
 │   ├── config.ts               # DB-backed app configuration
 │   └── filename-utils.ts       # Filename parsing conventions
 └── types/                      # TypeScript interfaces
+scripts/
+├── sync.ts                     # Full sync (GitHub Actions / CLI); --dry-run to preview
+└── embed.ts                    # Backfill or regenerate embeddings
 supabase/
-└── schema.sql                  # Complete database schema (run this)
+├── schema.sql                  # Complete database schema — fresh installs run this
+└── migrations/                 # Upgrades for existing installs (see its README)
+tests/                          # Unit tests (npm test), incl. schema/migration parity
 ```
 
 ## ⚙️ Configuration
@@ -240,7 +251,20 @@ The included workflow (`.github/workflows/daily-sync.yml`) runs the sync pipelin
    - `GEMINI_API_KEY` (optional, for semantic search embeddings)
    > Operational config (Shared Drive ID, sync folders, label ID) is loaded from the database at runtime — configure these in Settings → Advanced.
 
+**Manual runs** (Actions → Daily Sync → Run workflow) offer three options:
+`dry_run` (write nothing; the planned changes are attached to the run as an
+artifact), `skip_thumbnails`, and `allow_mass_orphan` (see below). Runs never
+overlap, and a run that fails, is cancelled or times out is still recorded in
+Settings → Recent Activity.
+
+**Safety limit:** if one run would trash an unusually large number of assets
+(more than 100, or 10% of the library) — typically because a synced top-level
+folder was renamed — the sync skips trashing and records why. If the files
+really were deleted, re-run with `allow_mass_orphan`.
+
 > **Without GitHub Actions:** Run syncs manually from the Settings panel in the UI, or via `npx tsx scripts/sync.ts`.
+
+See [docs/RUNBOOK.md](docs/RUNBOOK.md) for what to do when a sync or ingest fails.
 
 ### Access Control (Sign-In Allowlist)
 

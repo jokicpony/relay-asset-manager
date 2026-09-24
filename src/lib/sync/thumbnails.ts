@@ -52,21 +52,24 @@ export async function fetchThumbnailSource(
     allowOriginal: boolean,
     maxRetries = 3,
 ): Promise<Buffer | null> {
-    const auth = { headers: { Authorization: `Bearer ${accessToken}` } };
+    // Each attempt (request + body) is time-limited: the default fetch timeout
+    // is minutes, which would blow straight through a caller's deadline.
+    const auth = (ms: number) => ({ headers: { Authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(ms) });
+    const body = async (res: Response | null) => (res?.ok ? Buffer.from(await res.arrayBuffer()) : null);
 
     if (file.thumbnailLink) {
         const sized = file.thumbnailLink.replace(/=s\d+$/, '') + `=s${THUMBNAIL_MAX_PX}`;
-        const res = await fetchWithDriveRetry(sized, auth, maxRetries).catch(() => null);
-        if (res?.ok) return Buffer.from(await res.arrayBuffer());
+        const bytes = await fetchWithDriveRetry(sized, auth(15_000), maxRetries).then(body).catch(() => null);
+        if (bytes) return bytes;
     }
 
     if (allowOriginal && file.mimeType.startsWith('image/')) {
-        const res = await fetchWithDriveRetry(
+        const bytes = await fetchWithDriveRetry(
             `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(file.id)}?alt=media&supportsAllDrives=true`,
-            auth,
+            auth(30_000),
             maxRetries,
-        ).catch(() => null);
-        if (res?.ok) return Buffer.from(await res.arrayBuffer());
+        ).then(body).catch(() => null);
+        if (bytes) return bytes;
     }
 
     return null;

@@ -14,7 +14,7 @@ import { parseFilename } from '../filename-utils';
 
 /** Per-file fields both paths request (files.list wraps it in `files(...)`). */
 export const DRIVE_FILE_FIELDS = [
-    'id', 'name', 'mimeType', 'size', 'description', 'parents',
+    'id', 'name', 'mimeType', 'size', 'description', 'parents', 'driveId',
     'thumbnailLink', 'webViewLink', 'labelInfo', 'createdTime', 'modifiedTime',
     'imageMediaMetadata(width,height)',
     'videoMediaMetadata(width,height,durationMillis)',

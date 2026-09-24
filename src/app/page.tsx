@@ -332,7 +332,9 @@ export default function Home() {
       // On network error, clear semantic state so text search takes over
       setSemanticResults(null);
     } finally {
-      if (requestId === searchCounterRef.current) {
+      // An aborted search was superseded by a newer one (typing) — leave the
+      // indicator to that one rather than switching it off mid-search
+      if (requestId === searchCounterRef.current && !signal?.aborted) {
         setSemanticLoading(false);
       }
     }
@@ -401,6 +403,9 @@ export default function Home() {
       // returning visit shows the library immediately instead of a skeleton.
       let freshApplied = false;
       const freshPromise = loadAssetList(false).then((r) => { freshApplied = true; return r; });
+      // Handled below (after the cache read); this just stops an early
+      // failure from surfacing as an unhandled rejection meanwhile
+      freshPromise.catch(() => {});
       const mySeq = assetFetchSeqRef.current; // loadAssetList bumps it synchronously
 
       // Hidden folders apply independently of the asset fetch's outcome
@@ -1224,6 +1229,9 @@ export default function Home() {
             setAssets(prev => prev.map(a =>
               a.id === assetId ? { ...a, thumbnailUrl: newUrl } : a
             ));
+            // Then re-pull: updates the shortcut clones too, and replaces the
+            // cached list so a reload doesn't show the old frame
+            refreshAssets().catch(() => { /* local patch already shown */ });
             // Update expanded view in-place
             if (expandedAsset?.id === assetId) {
               setExpandedAsset(prev => prev ? { ...prev, thumbnailUrl: newUrl } : prev);

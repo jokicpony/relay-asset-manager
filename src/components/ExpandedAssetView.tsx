@@ -109,7 +109,10 @@ export default function ExpandedAssetView({
         const handleCanPlay = () => setVideoReady(true);
         video.addEventListener('canplay', handleCanPlay);
 
-        // Trigger preload
+        // The element is reused between videos and a hover sets preload='auto'
+        // on the DOM node directly — reset it so only this video's metadata
+        // loads until the user shows intent again
+        video.preload = 'metadata';
         video.src = videoSrc;
         video.load();
 
@@ -169,8 +172,11 @@ export default function ExpandedAssetView({
 
         try {
             // Draw current frame to canvas
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
+            // Capped client-side too: a 4K PNG (Safari has no WebP encoder)
+            // can exceed the upload limit; the server re-encodes to ≤800px
+            const scale = Math.min(1, 1600 / Math.max(video.videoWidth, video.videoHeight));
+            canvas.width = Math.round(video.videoWidth * scale);
+            canvas.height = Math.round(video.videoHeight * scale);
             const ctx = canvas.getContext('2d');
             if (!ctx) throw new Error('Canvas context unavailable');
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);

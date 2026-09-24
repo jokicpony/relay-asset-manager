@@ -82,10 +82,13 @@ async function getSetting<T>(key: string, fallback: T): Promise<T> {
         .from('app_settings')
         .select('value')
         .eq('key', key)
-        .single();
+        .maybeSingle();
 
-    if (error || !data) return fallback;
-    return data.value as T;
+    // Defaults only when the setting was never saved. On a real read error,
+    // returning defaults would make the Namer build names from placeholder
+    // schemas — and the next Settings save would overwrite the stored ones.
+    if (error) throw new Error(`Could not load ${key}: ${error.message}`);
+    return data ? data.value as T : fallback;
 }
 
 async function setSetting(key: string, value: unknown, email?: string): Promise<void> {
@@ -149,6 +152,14 @@ export async function PUT(request: NextRequest) {
 
         // Update only the keys that are provided
         const updates: Promise<void>[] = [];
+
+        // Shape check: a null/array/scalar here would be stored and crash the
+        // Namer on its next load
+        const isObject = (v: unknown) => typeof v === 'object' && v !== null && !Array.isArray(v);
+        const bad = (['schemas', 'dropdowns', 'aiSettings'] as const).find(k => body[k] !== undefined && !isObject(body[k]));
+        if (bad || (body.helpGuideContent !== undefined && typeof body.helpGuideContent !== 'string')) {
+            return NextResponse.json({ error: `Invalid ${bad ?? 'helpGuideContent'}` }, { status: 400 });
+        }
 
         if (body.schemas !== undefined) {
             updates.push(setSetting('namer_schemas', body.schemas, email));

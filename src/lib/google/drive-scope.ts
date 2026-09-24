@@ -2,6 +2,14 @@ import { fetchWithDriveRetry } from '@/lib/sync/drive-retry';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 
+/**
+ * Drive file/folder/shared-drive IDs are URL-safe tokens (shared drives ~19
+ * chars, files ~28–44). Anything else is rejected before it can reach a
+ * Drive URL or `q` expression.
+ */
+export const DRIVE_ID_PATTERN = /^[A-Za-z0-9_-]{10,100}$/;
+export const isDriveId = (id: unknown): id is string => typeof id === 'string' && DRIVE_ID_PATTERN.test(id);
+
 /** Total budget for the check, including retry backoff (~3s at 2 retries). */
 const SCOPE_CHECK_TIMEOUT_MS = 10_000;
 const SCOPE_CHECK_RETRIES = 2;
@@ -38,6 +46,9 @@ export async function isInSharedDrive(
 ): Promise<boolean> {
     if (!sharedDriveId) return true;                 // not configured → no restriction
     if (resourceId === sharedDriveId) return true;   // the shared drive root itself
+    // Malformed IDs are never in scope — and callers that only interpolate an
+    // ID after this check can rely on it being a plain Drive ID
+    if (!isDriveId(resourceId)) return false;
 
     let res: Response;
     try {

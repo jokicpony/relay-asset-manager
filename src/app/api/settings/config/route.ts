@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { getConfig, updateSetting } from '@/lib/config';
 import { logger } from '@/lib/logger';
+import { isDriveId } from '@/lib/google/drive-scope';
+import { getDriveAccessToken } from '@/lib/google/auth';
 
 /**
  * GET /api/settings/config
@@ -37,7 +39,7 @@ const isStringArray = (v: unknown): v is string[] =>
  */
 const VALIDATORS: Record<string, (v: unknown) => string | null> = {
     shared_drive_id: (v) =>
-        typeof v === 'string' && v.trim() !== '' ? null : 'Shared Drive ID cannot be empty',
+        isDriveId(v) ? null : 'Shared Drive ID must be a valid Drive ID',
     sync_folders: (v) =>
         !isStringArray(v) ? 'Sync folders must be a list of folder names'
             : v.length === 0 ? 'Keep at least one sync folder — an empty list syncs every folder in the drive'
@@ -47,9 +49,21 @@ const VALIDATORS: Record<string, (v: unknown) => string | null> = {
     semantic_similarity_threshold: (v) =>
         typeof v === 'number' && v >= 0 && v <= 1 ? null : 'Threshold must be a number between 0 and 1',
     hidden_folders: (v) => (isStringArray(v) ? null : 'Hidden folders must be a list of paths'),
-    rights_label_config: (v) =>
-        v && typeof v === 'object' && 'fieldIds' in v && 'choiceMap' in v
-            ? null : 'Rights label config must include fieldIds and choiceMap',
+    // The sync parses every file's labels with this — a malformed value would
+    // crash the whole run on the first file, so the shape is checked fully.
+    rights_label_config: (v) => {
+        const c = v as { fieldIds?: Record<string, unknown>; choiceMap?: Record<string, unknown> } | null;
+        const fields = ['organicRights', 'organicExpiration', 'paidRights', 'paidExpiration'];
+        if (!c || typeof c !== 'object' || !c.fieldIds || typeof c.fieldIds !== 'object'
+            || !fields.every((f) => typeof c.fieldIds![f] === 'string')) {
+            return `Rights label config needs fieldIds with string ${fields.join(', ')}`;
+        }
+        if (!c.choiceMap || typeof c.choiceMap !== 'object' || Array.isArray(c.choiceMap)
+            || !Object.values(c.choiceMap).every((x) => x === 'unlimited' || x === 'limited' || x === 'expired')) {
+            return 'Rights label choiceMap must map choice IDs to unlimited / limited / expired';
+        }
+        return null;
+    },
 };
 
 /**
@@ -81,6 +95,23 @@ export async function PUT(request: NextRequest) {
         const invalid = validate(value);
         if (invalid) {
             return NextResponse.json({ error: invalid }, { status: 400 });
+        }
+
+        // Changing the shared drive re-points the whole library, relays and the
+        // Namer: only accept a shared drive the service account can open (a
+        // typo would otherwise silently break every Drive operation).
+        if (key === 'shared_drive_id') {
+            const token = await getDriveAccessToken();
+            const check = await fetch(
+                `https://www.googleapis.com/drive/v3/drives/${encodeURIComponent(value)}?fields=id`,
+                { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(10_000) }
+            );
+            if (!check.ok) {
+                return NextResponse.json(
+                    { error: 'That ID is not a shared drive the service account can access' },
+                    { status: 400 }
+                );
+            }
         }
 
         const result = await updateSetting(key, value, user.email);

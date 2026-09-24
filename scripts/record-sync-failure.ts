@@ -26,11 +26,15 @@ async function main() {
     }
     const supabase = createClient(url, key);
 
-    const { data: existing, error: findErr } = await supabase
+    // A re-run of the same workflow run keeps its run_id; match the attempt
+    // too, or a failed re-run would be hidden by attempt 1's row
+    const attempt = process.env.GITHUB_RUN_ATTEMPT ?? null;
+    let lookup = supabase
         .from('sync_logs')
         .select('id')
-        .eq('details->>run_id', runId)
-        .limit(1);
+        .eq('details->>run_id', runId);
+    if (attempt) lookup = lookup.eq('details->>run_attempt', attempt);
+    const { data: existing, error: findErr } = await lookup.limit(1);
     if (findErr) throw new Error(`Lookup failed: ${findErr.message}`);
     if (existing && existing.length > 0) {
         console.log('The sync already recorded this run — nothing to add');
@@ -59,6 +63,7 @@ async function main() {
         source: 'cron',
         details: {
             run_id: runId,
+            run_attempt: attempt,
             run_url: runUrl,
             trigger: process.env.GITHUB_EVENT_NAME ?? null,
             job_status: process.env.JOB_STATUS ?? null,

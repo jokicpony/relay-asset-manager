@@ -58,26 +58,37 @@ test('revert targets moved files that are not yet reverted', () => {
 
 // ── isInSharedDrive ───────────────────────────────────────────────────────
 
+const FILE_ID = '1AbCdEfGhIjKlMnOpQrStUvWxYz012345';
+const DRIVE_ID = '0ADriveIdAbc123456x';
 const realFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = realFetch; });
 
 test('isInSharedDrive: 404 / other drive → false (fail closed)', async () => {
     globalThis.fetch = (async () => new Response('', { status: 404 })) as typeof fetch;
-    assert.equal(await isInSharedDrive('t', 'file', 'drive'), false);
-    globalThis.fetch = (async () => Response.json({ driveId: 'other' })) as typeof fetch;
-    assert.equal(await isInSharedDrive('t', 'file', 'drive'), false);
-    globalThis.fetch = (async () => Response.json({ driveId: 'drive' })) as typeof fetch;
-    assert.equal(await isInSharedDrive('t', 'file', 'drive'), true);
+    assert.equal(await isInSharedDrive('t', FILE_ID, DRIVE_ID), false);
+    globalThis.fetch = (async () => Response.json({ driveId: '0AOtherDrive1234567' })) as typeof fetch;
+    assert.equal(await isInSharedDrive('t', FILE_ID, DRIVE_ID), false);
+    globalThis.fetch = (async () => Response.json({ driveId: DRIVE_ID })) as typeof fetch;
+    assert.equal(await isInSharedDrive('t', FILE_ID, DRIVE_ID), true);
 });
 
 test('isInSharedDrive: network failure → retryable DriveScopeUnavailableError, not false', async () => {
     globalThis.fetch = (async () => { throw new TypeError('fetch failed'); }) as typeof fetch;
-    await assert.rejects(isInSharedDrive('t', 'file', 'drive'), DriveScopeUnavailableError);
+    await assert.rejects(isInSharedDrive('t', FILE_ID, DRIVE_ID), DriveScopeUnavailableError);
 });
 
 test('isInSharedDrive: persistent 503 → DriveScopeUnavailableError after retries', async () => {
     let calls = 0;
     globalThis.fetch = (async () => { calls++; return new Response('', { status: 503 }); }) as typeof fetch;
-    await assert.rejects(isInSharedDrive('t', 'file', 'drive'), DriveScopeUnavailableError);
+    await assert.rejects(isInSharedDrive('t', FILE_ID, DRIVE_ID), DriveScopeUnavailableError);
     assert.equal(calls, 3); // first try + 2 retries
+});
+
+test('isInSharedDrive: malformed IDs are refused without calling Drive', async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => { calls++; return Response.json({ driveId: DRIVE_ID }); }) as typeof fetch;
+    for (const bad of ["x' or name contains '", '../files', 'short', '']) {
+        assert.equal(await isInSharedDrive('t', bad, DRIVE_ID), false);
+    }
+    assert.equal(calls, 0);
 });

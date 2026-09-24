@@ -12,6 +12,10 @@ import { logger } from '@/lib/logger';
  *
  * Uses a service account (via WIF) for Drive access.
  */
+// Single files stream Drive → browser through this function; the download
+// preflight refuses files too large to finish inside this limit.
+export const maxDuration = 300;
+
 export async function GET(
     request: NextRequest,
     { params }: { params: Promise<{ fileId: string }> }
@@ -65,6 +69,7 @@ export async function GET(
         const contentType = driveRes.headers.get('content-type') || 'application/octet-stream';
         headers.set('Content-Type', contentType);
         headers.set('Content-Disposition', contentDisposition(name));
+        headers.set('X-Content-Type-Options', 'nosniff');
 
         const contentLength = driveRes.headers.get('content-length');
         if (contentLength) headers.set('Content-Length', contentLength);

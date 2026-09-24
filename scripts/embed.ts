@@ -88,7 +88,7 @@ async function main() {
     for (let from = 0; ; from += 1000) {
         let query = supabase
             .from('assets')
-            .select('id, drive_file_id, name, description, asset_type, folder_path, parsed_creator, parsed_shoot_description, thumbnail_url')
+            .select('id, drive_file_id, name, description, asset_type, folder_path, parsed_creator, parsed_shoot_description, thumbnail_url, updated_at')
             .eq('is_active', true)
             .order('id')
             .range(from, from + 999);
@@ -110,11 +110,12 @@ async function main() {
     // keeps its progress, and a re-run only picks up what's left.
     let written = 0;
     const writeFailed: string[] = [];
+    const versions = new Map(allAssets.map(a => [a.id, a.updated_at]));
     const result = await embedAssets(supabase, GEMINI_API_KEY, allAssets, {
         withImages: !textOnly,
         log: (m) => log(`  ⚠️  ${m}`),
         onBatch: async (vectors) => {
-            const w = await writeEmbeddings(supabase, vectors);
+            const w = await writeEmbeddings(supabase, vectors, versions);
             written += w.written;
             writeFailed.push(...w.failed);
         },

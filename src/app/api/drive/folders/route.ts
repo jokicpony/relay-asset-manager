@@ -3,12 +3,9 @@ import { createClient } from '@/lib/supabase/server';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { logger } from '@/lib/logger';
 import { getConfig } from '@/lib/config';
-import { isInSharedDrive, DriveScopeUnavailableError } from '@/lib/google/drive-scope';
-
-// Drive file/folder IDs are URL-safe base64-ish tokens. Validating before an
-// ID reaches a Drive `q` expression prevents query injection (a crafted
-// parentId could otherwise rewrite the query).
-const DRIVE_ID_PATTERN = /^[A-Za-z0-9_-]{10,100}$/;
+// Validating IDs before they reach a Drive `q` expression prevents query
+// injection (a crafted parentId could otherwise rewrite the query).
+import { isInSharedDrive, DriveScopeUnavailableError, DRIVE_ID_PATTERN } from '@/lib/google/drive-scope';
 
 /**
  * GET /api/drive/folders?parentId=<folderId>

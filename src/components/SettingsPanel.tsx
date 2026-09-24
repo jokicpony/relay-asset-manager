@@ -933,10 +933,11 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                             );
                                         }
 
-                                        const saveConfigField = async (key: string, value: unknown) => {
-                                            if (saving) return; // edits build on the current list — no overlapping saves
+                                        const saveConfigField = async (key: string, value: unknown): Promise<boolean> => {
+                                            if (saving) return false; // edits build on the current list — no overlapping saves
                                             setSaving(true);
                                             setConfigError(null);
+                                            let ok = false;
                                             try {
                                                 const res = await fetch('/api/settings/config', {
                                                     method: 'PUT',
@@ -944,6 +945,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                     body: JSON.stringify({ key, value }),
                                                 });
                                                 if (res.ok) {
+                                                    ok = true;
                                                     setEditingField(null);
                                                 } else {
                                                     const body = await res.json().catch(() => ({}));
@@ -956,6 +958,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                 setConfigError('Save failed — check your connection');
                                             }
                                             setSaving(false);
+                                            return ok;
                                         };
 
                                         const singleFields = [
@@ -1052,7 +1055,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                                 <input type="text" value={chipAddValue} onChange={e => setChipAddValue(e.target.value)}
                                                                     placeholder={sensitive ? 'Paste ID...' : 'Enter value...'}
                                                                     onKeyDown={async e => {
-                                                                        if (e.key === 'Enter' && chipAddValue.trim()) { await saveConfigField(key, [...items, chipAddValue.trim()]); setChipAddValue(''); }
+                                                                        if (e.key === 'Enter' && chipAddValue.trim()) { if (await saveConfigField(key, [...items, chipAddValue.trim()])) setChipAddValue(''); }
                                                                         else if (e.key === 'Escape') { e.preventDefault(); setEditingField(null); setChipAddValue(''); }
                                                                     }}
                                                                     style={{ flex: 1, padding: '5px 10px', borderRadius: 6, border: '1px solid var(--ram-border)', background: 'var(--ram-bg-primary)', color: 'var(--ram-text-primary)', fontSize: 12, fontFamily: 'monospace', outline: 'none' }}
@@ -1061,7 +1064,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                                     autoFocus
                                                                 />
                                                                 <button disabled={saving || !chipAddValue.trim()}
-                                                                    onClick={async () => { if (chipAddValue.trim()) { await saveConfigField(key, [...items, chipAddValue.trim()]); setChipAddValue(''); } }}
+                                                                    onClick={async () => { if (chipAddValue.trim()) { if (await saveConfigField(key, [...items, chipAddValue.trim()])) setChipAddValue(''); } }}
                                                                     style={{ padding: '5px 10px', borderRadius: 6, border: 'none', background: chipAddValue.trim() ? 'var(--ram-accent)' : 'var(--ram-bg-hover)', color: chipAddValue.trim() ? '#0c0e12' : 'var(--ram-text-tertiary)', fontSize: 11, fontWeight: 600, cursor: chipAddValue.trim() ? 'pointer' : 'default', transition: 'all 0.15s' }}
                                                                 >Add</button>
                                                                 <button onClick={() => { setEditingField(null); setChipAddValue(''); }}
@@ -1324,8 +1327,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                                     onKeyDown={async e => {
                                                                         if (e.key === 'Enter' && chipAddValue.trim()) {
                                                                             const allIds = rightsId ? [rightsId, ...extraLabels, chipAddValue.trim()] : [...extraLabels, chipAddValue.trim()];
-                                                                            await saveConfigField('namer_label_ids', allIds);
-                                                                            setChipAddValue('');
+                                                                            if (await saveConfigField('namer_label_ids', allIds)) setChipAddValue('');
                                                                         } else if (e.key === 'Escape') { e.preventDefault(); setEditingField(null); setChipAddValue(''); }
                                                                     }}
                                                                     style={{ flex: 1, padding: '5px 10px', borderRadius: 6, border: '1px solid var(--ram-border)', background: 'var(--ram-bg-primary)', color: 'var(--ram-text-primary)', fontSize: 12, fontFamily: 'monospace', outline: 'none' }}
@@ -1337,8 +1339,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                                     onClick={async () => {
                                                                         if (chipAddValue.trim()) {
                                                                             const allIds = rightsId ? [rightsId, ...extraLabels, chipAddValue.trim()] : [...extraLabels, chipAddValue.trim()];
-                                                                            await saveConfigField('namer_label_ids', allIds);
-                                                                            setChipAddValue('');
+                                                                            if (await saveConfigField('namer_label_ids', allIds)) setChipAddValue('');
                                                                         }
                                                                     }}
                                                                     style={{ padding: '5px 10px', borderRadius: 6, border: 'none', background: chipAddValue.trim() ? 'var(--ram-accent)' : 'var(--ram-bg-hover)', color: chipAddValue.trim() ? '#0c0e12' : 'var(--ram-text-tertiary)', fontSize: 11, fontWeight: 600, cursor: chipAddValue.trim() ? 'pointer' : 'default', transition: 'all 0.15s' }}

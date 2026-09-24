@@ -29,6 +29,7 @@ import {
     revertTargets,
     statusOnCancel,
 } from '@/lib/namer/batch-utils';
+import { sanitizeNameToken } from '@/lib/namer/name-token';
 import SchemaSelector from './SchemaSelector';
 import FolderPicker from './FolderPicker';
 import NamingBuilder from './NamingBuilder';
@@ -399,7 +400,10 @@ export default function NamerView() {
         // Snapshot what the user confirmed — state can change during the await
         const pendingFiles = files.filter(f => f.status === 'pending');
         if (pendingFiles.length === 0 || !destFolderId) return;
-        const batchSourceFolderId = sourceFolderId;
+        // The listed files came from loadedFolderId; if the picker has moved on
+        // since, removeParents would name the wrong folder — refuse
+        if (loadedFolderId !== sourceFolderId) return;
+        const batchSourceFolderId = loadedFolderId;
         const batchDestFolderId = destFolderId;
         const fields = schemaFields;
         const passthrough = isPassthrough;
@@ -505,7 +509,7 @@ export default function NamerView() {
             enqueueingRef.current = false;
             setEnqueueing(false);
         }
-    }, [files, destFolderId, sourceFolderId, schemaFields, isPassthrough, counter, selectedLabelIds, labelFieldValues, labels, aiEnabled, settings, loadFiles]);
+    }, [files, destFolderId, sourceFolderId, loadedFolderId, schemaFields, isPassthrough, counter, selectedLabelIds, labelFieldValues, labels, aiEnabled, settings, loadFiles]);
 
     // ==========================================================
     // Process one batch — runs the file-by-file processing loop
@@ -565,7 +569,17 @@ export default function NamerView() {
                 destNameById.set(f.id, f.name);
             }
         } catch (err) {
-            logger.warn('namer-batch', 'Could not list destination for duplicate checks', { error: errMessage(err) });
+            // Without the listing there's no duplicate-name check against the
+            // destination, and a retry can't tell a move that already landed.
+            // Stop; every queued file becomes a retryable failure.
+            const reason = `Couldn't check the destination folder — ${errMessage(err)}`;
+            logger.warn('namer-batch', 'Destination listing failed — batch not run', { error: errMessage(err) });
+            setBatches(prev => prev.map(b => {
+                if (b.id !== batchId) return b;
+                const files = b.files.map(f => f.status === 'queued' ? { ...f, status: 'error' as const, error: reason } : f);
+                return { ...b, files, status: 'completed', progress: batchProgress(files) };
+            }));
+            return;
         }
         const counterIndex = snap?.counterIndex ?? null;
 
@@ -874,60 +888,79 @@ export default function NamerView() {
     // ==========================================================
     // Revert batch (also retries a partially failed revert)
     // ==========================================================
+    const revertingRef = useRef(new Set<string>());
     const revertBatch = useCallback(async (batchId: string) => {
         const batch = batches.find(b => b.id === batchId);
         if (!batch || (batch.status !== 'completed' && batch.status !== 'revert-failed')) return;
-        // Files reported failed whose move actually landed (e.g. the request
-        // timed out after Drive applied it) are in the destination under their
-        // target name — revert those too, or "Reverted" would leave them there.
-        const landed = new Set<string>();
-        if (batch.destFolderId) {
-            try {
-                const destById = new Map((await namerApi.listFiles(batch.destFolderId)).map(f => [f.id, f.name]));
-                for (const f of batch.files) {
-                    if (!isMoved(f) && f.targetName && f.revert !== 'done' && destById.get(f.id) === f.targetName) landed.add(f.id);
-                }
-            } catch (err) {
-                logger.warn('namer-batch', 'Could not list destination before revert', { error: errMessage(err) });
-            }
-        }
-        const targets = [...revertTargets(batch), ...batch.files.filter(f => landed.has(f.id))];
-        if (targets.length === 0) return;
+        // One revert per batch at a time (double-click, or Revert racing Retry)
+        if (revertingRef.current.has(batchId)) return;
 
-        // One click moves and renames every file in the batch — confirm first
-        // (a retry of the failed remainder was already confirmed).
-        const count = targets.length;
+        const known = revertTargets(batch);
+        // Reported failed but may have landed (request timed out after Drive
+        // applied it) — checked against the destination listing below
+        const maybeLanded = batch.files.filter(f => !isMoved(f) && f.targetName && f.revert !== 'done');
+        if (known.length === 0 && maybeLanded.length === 0) return;
+
+        // Confirm before anything async, then mark the batch busy right away so
+        // Retry/Revert can't start while the listing runs
+        const count = known.length;
         if (batch.status === 'completed'
             && !window.confirm(`Revert ${count} file${count === 1 ? '' : 's'}? They'll be renamed with a "revert_" prefix and moved back to the source folder.`)) {
             return;
         }
-
-        // Cancel any pending deferred ingest for this batch
-        cancelIngest(batchId);
-
+        revertingRef.current.add(batchId);
+        cancelIngest(batchId); // cancel any pending deferred ingest for this batch
         patchBatch(batchId, { status: 'reverting' });
 
-        let failed = 0;
-        for (const file of targets) {
-            try {
-                // Rename with revert_ prefix + original name, move back to source
-                const revertName = `revert_${file.name}`;
-                await namerApi.updateFile(file.id, revertName, batch.sourceFolderId, batch.destFolderId || undefined);
-                patchFile(batchId, file.id, { revert: 'done', revertError: undefined });
-            } catch (err) {
-                failed++;
-                logger.error('namer-batch', `Failed to revert ${file.name}`, { error: errMessage(err) });
-                patchFile(batchId, file.id, { revert: 'failed', revertError: errMessage(err) });
+        try {
+            const landed = new Set<string>();
+            let listingFailed = false;
+            if (batch.destFolderId && maybeLanded.length > 0) {
+                try {
+                    const destById = new Map((await namerApi.listFiles(batch.destFolderId)).map(f => [f.id, f.name]));
+                    for (const f of maybeLanded) if (destById.get(f.id) === f.targetName) landed.add(f.id);
+                } catch (err) {
+                    listingFailed = true;
+                    logger.warn('namer-batch', 'Could not list destination before revert', { error: errMessage(err) });
+                }
             }
-        }
+            const targets = [...known, ...maybeLanded.filter(f => landed.has(f.id))];
 
-        // "Reverted" only when every moved file made it back; otherwise the
-        // failures stay visible with a Retry revert action
-        patchBatch(batchId, { status: failed === 0 ? 'reverted' : 'revert-failed' });
+            let failed = 0;
+            for (const file of targets) {
+                try {
+                    // Rename with revert_ prefix + original name, move back to source
+                    const revertName = `revert_${file.name}`;
+                    await namerApi.updateFile(file.id, revertName, batch.sourceFolderId, batch.destFolderId || undefined);
+                    patchFile(batchId, file.id, { revert: 'done', revertError: undefined });
+                } catch (err) {
+                    failed++;
+                    logger.error('namer-batch', `Failed to revert ${file.name}`, { error: errMessage(err) });
+                    patchFile(batchId, file.id, { revert: 'failed', revertError: errMessage(err) });
+                }
+            }
+            // Couldn't tell whether these reached the destination — don't
+            // claim "Reverted"; Retry revert checks again
+            if (listingFailed) {
+                for (const f of maybeLanded) {
+                    failed++;
+                    patchFile(batchId, f.id, { revert: 'failed', revertError: "Couldn't check whether this file reached the destination" });
+                }
+            }
 
-        // Reverted files reappear in the source list (hiddenSourceFileIds)
-        if (batch.sourceFolderId) {
-            setTimeout(() => loadFiles(), 1500); // Small delay for Drive propagation
+            // "Reverted" only when every moved file made it back; otherwise the
+            // failures stay visible with a Retry revert action
+            patchBatch(batchId, { status: failed === 0 ? 'reverted' : 'revert-failed' });
+
+            // Reverted files reappear in the source list (hiddenSourceFileIds) —
+            // only reload if that's still the folder on screen
+            if (batch.sourceFolderId) {
+                setTimeout(() => {
+                    if (sourceFolderRef.current === batch.sourceFolderId) loadFiles();
+                }, 1500); // Small delay for Drive propagation
+            }
+        } finally {
+            revertingRef.current.delete(batchId);
         }
     }, [batches, cancelIngest, loadFiles, patchBatch, patchFile]);
 
@@ -942,8 +975,9 @@ export default function NamerView() {
     if (!selectedSchema) validationWarnings.push('No asset type selected — choose a naming template above');
     if (files.length > 0 && !destFolderId) validationWarnings.push('No destination folder set');
     // Passthrough skips naming-field validation entirely
+    // Checked on the sanitized token — "   " or "///" becomes empty in the name
     const missingRequired = isPassthrough ? [] : schemaFields
-        .filter(f => f.required && !f.value)
+        .filter(f => f.required && !sanitizeNameToken(f.value ?? ''))
         .map(f => f.label);
     if (missingRequired.length > 0) validationWarnings.push(`Required naming fields empty: ${missingRequired.join(', ')}`);
     const canExecute = pendingCount > 0 && !!destFolderId && !!selectedSchema && missingRequired.length === 0 && !enqueueing;

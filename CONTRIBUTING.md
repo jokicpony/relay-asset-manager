@@ -58,6 +58,11 @@ Keep PRs focused on a single concern. If you're fixing a bug and notice a nearby
 
 - TypeScript strict mode is enabled
 - ESLint is configured — run `npm run lint` to check
+- Unit tests: `npm test` (lint, `npx tsc --noEmit` and tests all run in CI)
+- Database changes: add an idempotent file to `supabase/migrations/` *and* update
+  `supabase/schema.sql` — see `supabase/migrations/README.md`; `npm test` checks the two agree
+- Sync changes: compare `npx tsx scripts/sync.ts --dry-run --dry-run-out=before.json` against the
+  same run on your branch before merging
 - CSS variables use the `--ram-` prefix (defined in `src/app/globals.css`)
 - Tailwind CSS 4 for utility classes
 - No external state management library — plain React hooks

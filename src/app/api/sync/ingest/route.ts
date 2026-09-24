@@ -22,6 +22,10 @@ import { DRIVE_FILE_FIELDS, toDriveFile } from '@/lib/sync/drive-file';
 import { withDriveRetry } from '@/lib/sync/drive-retry';
 import { embedInputsChanged, EMBED_INPUT_COLUMNS, type EmbedInputs } from '@/lib/embedding-text';
 import { resolveFolderPathById, type FolderInfo } from '@/lib/google/folder-path';
+import { isDriveId } from '@/lib/google/drive-scope';
+
+// One Namer batch per request; the queue ingests per batch
+const MAX_INGEST_FILES = 500;
 import { parseLabelFields, emptyRightsFields } from '@/lib/sync/rights-labels';
 import { getConfig } from '@/lib/config';
 import { normalizeSyncFolders, isInSyncScope } from '@/lib/sync/scope';
@@ -97,6 +101,12 @@ export async function POST(request: NextRequest) {
         if (!Array.isArray(fileIds) || fileIds.length === 0 || !destFolderId) {
             return NextResponse.json(
                 { error: 'fileIds (array) and destFolderId are required' },
+                { status: 400 }
+            );
+        }
+        if (fileIds.length > MAX_INGEST_FILES || !fileIds.every(isDriveId)) {
+            return NextResponse.json(
+                { error: `fileIds must be at most ${MAX_INGEST_FILES} valid Drive file IDs` },
                 { status: 400 }
             );
         }
@@ -177,7 +187,21 @@ export async function POST(request: NextRequest) {
                         continue;
                     }
 
+                    // The service account can see more than the library's
+                    // shared drive (other drives, files shared with it). Only
+                    // files that live in the shared drive may be ingested —
+                    // checked before resolving the path, so nothing about
+                    // outside files is echoed back either.
+                    if (file.driveId !== driveId) {
+                        skipped.push({ fileId, reason: 'Not in the shared drive' });
+                        continue;
+                    }
+
                     const { path: folderPath, ignored } = await resolveFolderPathById(accessToken, parentId, driveId, pathCache);
+                    if (folderPath === '/unknown') {
+                        skipped.push({ fileId, reason: 'Folder path could not be resolved' });
+                        continue;
+                    }
 
                     if (ignored) {
                         skipped.push({ fileId, reason: `Folder tagged [relay-ignore]: ${folderPath}` });
@@ -236,10 +260,11 @@ export async function POST(request: NextRequest) {
         const before = new Map<string, EmbedInputs>();
         const ids = driveFiles.map(f => f.id);
         for (let i = 0; i < ids.length; i += 150) {
-            const { data } = await adminClient
+            const { data, error: beforeErr } = await adminClient
                 .from('assets')
                 .select(`drive_file_id, ${EMBED_INPUT_COLUMNS}`)
                 .in('drive_file_id', ids.slice(i, i + 150));
+            if (beforeErr) errors.push(`Could not read existing rows (changed files may keep stale search embeddings): ${beforeErr.message}`);
             for (const { drive_file_id, ...inputs } of (data ?? []) as unknown as (EmbedInputs & { drive_file_id: string })[]) {
                 before.set(drive_file_id, inputs);
             }
@@ -287,13 +312,17 @@ export async function POST(request: NextRequest) {
 
         // Update thumbnail URLs in the database
 
+        // In parallel (10 at a time) — one-by-one updates ate into the time
+        // limit after the thumbnail deadline on large batches
         let thumbnailsUpdated = 0;
-        for (const [driveFileId, { url, color }] of urlMap) {
-            const { error } = await adminClient
-                .from('assets')
-                .update({ thumbnail_url: url, ...(color ? { thumb_color: color } : {}) })
-                .eq('drive_file_id', driveFileId);
-            if (!error) thumbnailsUpdated++;
+        const thumbEntries = [...urlMap];
+        for (let i = 0; i < thumbEntries.length; i += 10) {
+            const results = await Promise.all(thumbEntries.slice(i, i + 10).map(([driveFileId, { url, color }]) =>
+                adminClient
+                    .from('assets')
+                    .update({ thumbnail_url: url, ...(color ? { thumb_color: color } : {}) })
+                    .eq('drive_file_id', driveFileId)));
+            thumbnailsUpdated += results.filter(r => !r.error).length;
         }
 
         // ── Update folder_drive_ids mapping ──
@@ -357,7 +386,7 @@ export async function POST(request: NextRequest) {
             startedAt, status: 'failed', requested: requestedCount,
             upserted: 0, upsertErrors: 0, thumbnails: 0, thumbnailErrors: 0,
             errorMessage: `Ingest failed: ${message}`,
-            details: { user: user.email ?? null, destFolderId: destFolderForLog, stack: err instanceof Error ? err.stack?.slice(0, 2000) : null },
+            details: { user: user.email ?? null, destFolderId: destFolderForLog },
         });
         return NextResponse.json({ error: message }, { status: 500 });
     }

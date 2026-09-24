@@ -36,6 +36,7 @@ export const maxDuration = 60;
 // config and sharp on a large original.
 const DOWNLOAD_TIMEOUT_MS = 17_000;
 const GEMINI_TIMEOUT_MS = 22_000;
+const MAX_ANALYZE_BYTES = 60 * 1024 * 1024;
 
 /**
  * Fetch image from Drive and resize with sharp for cost optimization.
@@ -55,6 +56,13 @@ async function fetchAndPrepareImage(
         );
         if (!res.ok) {
             throw new Error(`Failed to fetch file from Drive: ${res.status} ${res.statusText}`);
+        }
+        // The whole file is buffered for sharp — refuse very large originals
+        // (e.g. a video or huge TIFF) rather than exhausting function memory
+        const size = Number(res.headers.get('content-length') ?? 0);
+        if (size > MAX_ANALYZE_BYTES) {
+            await res.body?.cancel();
+            throw new Error(`File is too large for AI analysis (${Math.round(size / 1048576)} MB; limit ${MAX_ANALYZE_BYTES / 1048576} MB)`);
         }
         buffer = Buffer.from(await res.arrayBuffer());
     } catch (err) {

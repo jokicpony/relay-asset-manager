@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { isDriveId } from '@/lib/google/drive-scope';
 import { createClient } from '@/lib/supabase/server';
 import { getAdminClient } from '@/lib/supabase/admin';
 import { getDriveAccessToken } from '@/lib/google/auth';
@@ -14,12 +15,18 @@ import { logger } from '@/lib/logger';
  *
  * Body: { shortcutIds: string[] }
  */
+export const maxDuration = 120;
+
 export async function DELETE(request: NextRequest) {
     try {
         const { shortcutIds } = await request.json() as { shortcutIds: string[] };
 
-        if (!shortcutIds || shortcutIds.length === 0) {
+        if (!Array.isArray(shortcutIds) || shortcutIds.length === 0) {
             return NextResponse.json({ error: 'No shortcut IDs specified' }, { status: 400 });
+        }
+        // Relays are capped at 500 per request, so their undo is too
+        if (shortcutIds.length > 500 || !shortcutIds.every(isDriveId)) {
+            return NextResponse.json({ error: 'shortcutIds must be at most 500 valid Drive IDs' }, { status: 400 });
         }
 
         // Verify user is authenticated

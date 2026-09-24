@@ -21,6 +21,8 @@ export type EmbeddableAsset = EmbeddableAssetRow & {
     id: string;
     drive_file_id: string;
     thumbnail_url: string | null;
+    /** Row version when read — writeEmbeddings skips rows changed since */
+    updated_at?: string;
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -169,22 +171,40 @@ export async function embedAssets(
             }
             // Usually one bad image — retry individually, text-only as a last resort
             log(`Embedding batch ${i / BATCH + 1} failed (${err instanceof Error ? err.message : err}) — retrying individually`);
+            let quotaHit = false;
             for (const [j, asset] of batch.entries()) {
                 try {
                     const [vec] = await batchEmbed(apiKey, [request(built[j].parts)]);
                     batchVectors.set(asset.id, vec);
                     if (built[j].hasImage) result.withImage++; else result.textOnly++;
-                } catch {
-                    try {
-                        const [vec] = await batchEmbed(apiKey, [request([{ text: buildEmbedText(asset) }])]);
-                        batchVectors.set(asset.id, vec);
-                        result.textOnly++;
-                        log(`  ↳ ${asset.name}: text-only fallback`);
-                    } catch (e2) {
-                        result.failed.push(asset.id);
-                        log(`  ↳ ${asset.name}: failed — ${e2 instanceof Error ? e2.message : e2}`);
+                } catch (e1) {
+                    if (e1 instanceof RetryableEmbedError) { quotaHit = true; }
+                    else {
+                        try {
+                            const [vec] = await batchEmbed(apiKey, [request([{ text: buildEmbedText(asset) }])]);
+                            batchVectors.set(asset.id, vec);
+                            result.textOnly++;
+                            log(`  ↳ ${asset.name}: text-only fallback`);
+                            continue;
+                        } catch (e2) {
+                            if (e2 instanceof RetryableEmbedError) quotaHit = true;
+                            else {
+                                result.failed.push(asset.id);
+                                log(`  ↳ ${asset.name}: failed — ${e2 instanceof Error ? e2.message : e2}`);
+                                continue;
+                            }
+                        }
                     }
+                    // Quota/outage hit mid-fallback: stop like the batch path does
+                    log(`Embedding stopped during per-asset retries: Gemini rate-limited or unreachable`);
+                    result.failed.push(...batch.slice(j).map((a) => a.id), ...assets.slice(i + BATCH).map((a) => a.id));
+                    break;
                 }
+            }
+            if (quotaHit) {
+                for (const [id, vec] of batchVectors) result.vectors.set(id, vec);
+                if (opts.onBatch && batchVectors.size > 0) await opts.onBatch(batchVectors);
+                break;
             }
         }
 
@@ -196,25 +216,40 @@ export async function embedAssets(
     return result;
 }
 
-/** Write vectors to assets.embedding (10 in flight). Returns ids that failed to write. */
+/**
+ * Write vectors to assets.embedding (10 in flight). Returns ids that failed.
+ *
+ * With `versions` (id → updated_at as read), a write only lands if the row
+ * is unchanged since: if an ingest renamed the asset and cleared its
+ * embedding in the meantime, a vector built from the old text must not
+ * overwrite that "needs embedding" marker. Such rows are counted as
+ * `superseded` — they're picked up by the next run.
+ */
 export async function writeEmbeddings(
     supabase: SupabaseClient,
     vectors: Map<string, number[]>,
-): Promise<{ written: number; failed: string[] }> {
+    versions?: Map<string, string | undefined>,
+): Promise<{ written: number; failed: string[]; superseded: number }> {
     const entries = [...vectors];
     const failed: string[] = [];
     let written = 0;
+    let superseded = 0;
     for (let i = 0; i < entries.length; i += 10) {
         const results = await Promise.all(entries.slice(i, i + 10).map(async ([id, vec]) => {
-            const { error } = await supabase.from('assets')
+            let query = supabase.from('assets')
                 .update({ embedding: JSON.stringify(vec) })
                 .eq('id', id);
-            return { id, ok: !error };
+            const version = versions?.get(id);
+            if (version) query = query.eq('updated_at', version);
+            const { data, error } = await query.select('id');
+            if (error) return 'failed' as const;
+            return data && data.length > 0 ? 'written' as const : 'superseded' as const;
         }));
-        for (const r of results) {
-            if (r.ok) written++;
-            else failed.push(r.id);
-        }
+        results.forEach((r, j) => {
+            if (r === 'written') written++;
+            else if (r === 'superseded') superseded++;
+            else failed.push(entries[i + j][0]);
+        });
     }
-    return { written, failed };
+    return { written, failed, superseded };
 }
