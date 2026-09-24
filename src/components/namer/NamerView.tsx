@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import * as namerApi from '@/lib/namer/namer-api';
 import { logger } from '@/lib/logger';
 import type {
@@ -11,16 +11,22 @@ import type {
     AIMetadata,
 } from '@/lib/namer/types';
 import { PASSTHROUGH_SCHEMA_KEY } from '@/lib/namer/types';
+import { sanitizeNameToken } from '@/lib/namer/name-token';
 import SchemaSelector from './SchemaSelector';
 import FolderPicker from './FolderPicker';
 import NamingBuilder from './NamingBuilder';
 import LabelSelector from './LabelSelector';
 import FilePreviewTable from './FilePreviewTable';
+import type { PreviewViewMode, TileSize } from './FilePreviewTable';
 import NamerQueue from './NamerQueue';
 import type { BatchInfo } from './NamerQueue';
 import NamerSettingsPanel from './NamerSettings';
 import BatchConfirmModal from './BatchConfirmModal';
 import { useDeferredIngest } from '@/hooks/useDeferredIngest';
+
+// LocalStorage keys for the file-preview view preference
+const LS_PREVIEW_VIEW = 'ram_namer_preview_view';
+const LS_TILE_SIZE = 'ram_namer_tile_size';
 
 // ---------------------------------------------------------------------------
 // NamerView — Top-level orchestrator for the Ingest workflow.
@@ -58,6 +64,15 @@ export default function NamerView() {
     // ─── Queue (batches processed inline) ──────────────────────
     const [batches, setBatches] = useState<BatchInfo[]>([]);
     const [isProcessing, setIsProcessing] = useState(false);
+
+    // Closing or reloading the tab mid-batch abandons the rest of the queue
+    // (some files renamed/moved, others not) — ask first.
+    useEffect(() => {
+        if (!isProcessing) return;
+        const handler = (e: BeforeUnloadEvent) => { e.preventDefault(); };
+        window.addEventListener('beforeunload', handler);
+        return () => window.removeEventListener('beforeunload', handler);
+    }, [isProcessing]);
     const processingRef = useRef(false);
     const batchFileIdsRef = useRef<Set<string>>(new Set());
 
@@ -127,6 +142,7 @@ export default function NamerView() {
     // When schema changes, load its fields
     // ==========================================================
     const isPassthrough = selectedSchema === PASSTHROUGH_SCHEMA_KEY;
+    const lastSchemaRef = useRef('');
 
     useEffect(() => {
         if (!selectedSchema) {
@@ -144,43 +160,73 @@ export default function NamerView() {
             return;
         }
         const schema = settings.schemas[selectedSchema];
-        if (schema) {
-            const today = new Date();
-            const yyyymmdd = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, '0')}${String(today.getDate()).padStart(2, '0')}`;
-            setSchemaFields(schema.fields.map(f => ({
-                ...f,
-                // Date fields: auto-populate with today and ensure editable
-                value: f.type === 'date' && !f.value ? yyyymmdd : f.value,
-                frozen: f.type === 'date' ? false : f.frozen,
-            })));
-            setAiEnabled(schema.aiEnabled ?? true);
+        if (!schema) {
+            // Schema was renamed or deleted in Settings — don't keep stale fields
+            setSelectedSchema('');
+            setSchemaFields([]);
+            return;
         }
+        // Same schema re-applied (e.g. after saving Settings): keep what the
+        // user already typed into the builder, matched by field id. Constants
+        // and frozen fields always take the Settings value.
+        const sameSchema = lastSchemaRef.current === selectedSchema;
+        lastSchemaRef.current = selectedSchema;
+        const today = new Date();
+        const yyyymmdd = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, '0')}${String(today.getDate()).padStart(2, '0')}`;
+        setSchemaFields(prev => {
+            const typed = sameSchema ? new Map(prev.map(f => [f.id, f.value])) : new Map<string, string>();
+            return schema.fields.map(f => {
+                const kept = f.type !== 'constant' && (f.type === 'date' || !f.frozen) ? typed.get(f.id) : undefined;
+                return {
+                    ...f,
+                    // Date fields: auto-populate with today and ensure editable
+                    value: kept || (f.type === 'date' && !f.value ? yyyymmdd : f.value),
+                    frozen: f.type === 'date' ? false : f.frozen,
+                };
+            });
+        });
+        if (!sameSchema) setAiEnabled(schema.aiEnabled ?? true);
     }, [selectedSchema, settings]);
 
     // ==========================================================
     // Load files from source folder
     // ==========================================================
+    // Sequence guard: a slower earlier listing (or one for a folder the user
+    // has since switched away from) must not overwrite the current list.
+    const loadSeqRef = useRef(0);
+    const [filesError, setFilesError] = useState<string | null>(null);
+    const [loadedFolderId, setLoadedFolderId] = useState('');
+
     const loadFiles = useCallback(async () => {
         if (!sourceFolderId) return;
+        const seq = ++loadSeqRef.current;
         setFilesLoading(true);
+        setFilesError(null);
         try {
             const raw = await namerApi.listFiles(sourceFolderId);
+            if (seq !== loadSeqRef.current) return;
             // Filter out files already tracked in any batch (processing, completed, etc.)
             const knownIds = batchFileIdsRef.current;
             const fresh = raw.filter(f => !knownIds.has(f.id));
             const previews: NamerFilePreview[] = fresh.map(f => ({
                 ...f,
                 originalName: f.name,
-                proposedName: f.name, // Will be updated by naming builder
+                proposedName: f.name, // derived later (namedFiles)
                 status: 'pending',
             }));
             setFiles(previews);
+            setLoadedFolderId(sourceFolderId);
             setLoadCount(c => c + 1);
             setCounter(1); // Reset counter for new folder
         } catch (err) {
+            if (seq !== loadSeqRef.current) return;
             logger.error('namer', 'Failed to load files', { error: err instanceof Error ? err.message : String(err) });
+            // Don't leave the previous list on screen looking current — it may
+            // include files that were just queued.
+            setFiles([]);
+            setFilesError(err instanceof Error ? err.message : 'Failed to load files');
         } finally {
-            setFilesLoading(false);
+            if (seq === loadSeqRef.current) setFilesLoading(false);
         }
     }, [sourceFolderId]);
 
@@ -199,8 +245,11 @@ export default function NamerView() {
             if (field.type === 'counter') {
                 const num = counter + index;
                 parts.push(String(num).padStart(3, '0'));
-            } else if (field.value) {
-                parts.push(field.value.replace(/\s+/g, '-'));
+            } else {
+                // Text/select/date, and constants (fixed tokens from Settings).
+                // Skip values that sanitize to nothing, or the name gets "__".
+                const token = field.value ? sanitizeNameToken(field.value) : '';
+                if (token) parts.push(token);
             }
         }
 
@@ -214,24 +263,18 @@ export default function NamerView() {
         return parts.join('_') + ext;
     }, [schemaFields, counter, isPassthrough]);
 
-    // Update proposed names when fields change
-    useEffect(() => {
-        if (files.length === 0) return;
-        setFiles(prev => {
-            let idx = 0;
-            return prev.map(f => {
-                if (f.status === 'pending') {
-                    const proposedName = buildName(f, idx);
-                    idx++;
-                    return { ...f, proposedName };
-                }
-                if (f.status === 'excluded') {
-                    return f; // Don't count excluded files in the index
-                }
-                return f;
-            });
-        });
-    }, [buildName, files.length]);
+    // Proposed names are derived, never stored. They used to be written into
+    // `files` by an effect keyed on [buildName, files.length], which missed
+    // reloads with the same file count (names silently reverted to the
+    // originals — and the batch then moved files without renaming them) and
+    // exclude/re-include toggles (stale, duplicated counter numbers).
+    // The counter indexes pending files only, in list order.
+    const namedFiles = useMemo(() => {
+        let idx = 0;
+        return files.map(f => f.status === 'pending'
+            ? { ...f, proposedName: buildName(f, idx++) }
+            : f);
+    }, [files, buildName]);
 
     // ==========================================================
     // Toggle exclude a file
@@ -274,11 +317,58 @@ export default function NamerView() {
         ));
     }, []);
 
+    /** Shift-click range paint — set every toggleable id in the range to one status. */
+    const setRangeStatus = useCallback((ids: string[], status: 'pending' | 'excluded') => {
+        const s = new Set(ids);
+        setFiles(prev => prev.map(f =>
+            s.has(f.id) && (f.status === 'pending' || f.status === 'excluded')
+                ? { ...f, status }
+                : f
+        ));
+    }, []);
+
+    // ==========================================================
+    // File preview view mode (list / grid)
+    // Lives here, not in FilePreviewTable: that component is keyed by
+    // loadCount and remounts on every load, which would reset the choice.
+    // ==========================================================
+    const [previewView, setPreviewView] = useState<PreviewViewMode>('list');
+    const [tileSize, setTileSize] = useState<TileSize>('m');
+
+    useEffect(() => {
+        try {
+            const v = localStorage.getItem(LS_PREVIEW_VIEW);
+            if (v === 'list' || v === 'grid') setPreviewView(v);
+            const t = localStorage.getItem(LS_TILE_SIZE);
+            if (t === 's' || t === 'm' || t === 'l') setTileSize(t);
+        } catch {
+            // localStorage unavailable — fall back to defaults
+        }
+    }, []);
+
+    const changePreviewView = useCallback((mode: PreviewViewMode) => {
+        setPreviewView(mode);
+        try {
+            localStorage.setItem(LS_PREVIEW_VIEW, mode);
+        } catch {
+            // localStorage unavailable — choice just won't persist
+        }
+    }, []);
+
+    const changeTileSize = useCallback((size: TileSize) => {
+        setTileSize(size);
+        try {
+            localStorage.setItem(LS_TILE_SIZE, size);
+        } catch {
+            // localStorage unavailable — choice just won't persist
+        }
+    }, []);
+
     // ==========================================================
     // Enqueue batch — creates batch and returns immediately
     // ==========================================================
     const enqueueBatch = useCallback(() => {
-        const pendingFiles = files.filter(f => f.status === 'pending');
+        const pendingFiles = namedFiles.filter(f => f.status === 'pending');
         if (pendingFiles.length === 0 || !destFolderId) return;
 
         const batchId = `batch-${Date.now()}`;
@@ -344,7 +434,7 @@ export default function NamerView() {
         // Eagerly add file IDs so loadFiles filters them out, then reload
         for (const f of batch.files) batchFileIdsRef.current.add(f.id);
         if (sourceFolderId) loadFiles();
-    }, [files, destFolderId, sourceFolderId, selectedLabelIds, labelFieldValues, labels, aiEnabled, settings, loadFiles]);
+    }, [namedFiles, destFolderId, sourceFolderId, selectedLabelIds, labelFieldValues, labels, aiEnabled, settings, loadFiles]);
 
     // ==========================================================
     // Process one batch — runs the file-by-file processing loop
@@ -355,28 +445,28 @@ export default function NamerView() {
         const batchSourceFolderId = batch.sourceFolderId;
 
         // Pull settings from snapshot (or fallback to current)
-        const snap = (batch as any)._snapshot || {};
-        const batchLabelIds: string[] = snap.selectedLabelIds || selectedLabelIds;
-        const batchLabelFieldValues = snap.labelFieldValues || labelFieldValues;
-        const batchAiEnabled: boolean = snap.aiEnabled ?? aiEnabled;
-        const batchLabels: typeof labels = snap.labels || labels;
-        const batchSettings = snap.settings || settings;
+        const snap = batch._snapshot;
+        const batchLabelIds: string[] = snap?.selectedLabelIds || selectedLabelIds;
+        const batchLabelFieldValues = snap?.labelFieldValues || labelFieldValues;
+        const batchAiEnabled: boolean = snap?.aiEnabled ?? aiEnabled;
+        const batchLabels: typeof labels = snap?.labels || labels;
+        const batchSettings = snap?.settings || settings;
 
         // Build labelParts from snapshot for semantic description
         const labelParts: string[] = [];
         for (const labelId of batchLabelIds) {
-            const label = batchLabels.find((l: any) => l.id === labelId);
+            const label = batchLabels.find((l) => l.id === labelId);
             const fv = batchLabelFieldValues[labelId] || {};
             const fieldItems = Object.entries(fv)
-                .filter(([, v]: any) => Array.isArray(v.value) ? v.value.length > 0 : !!v.value)
-                .map(([fId, v]: any) => {
-                    const field = label?.fields?.find((f: any) => f.id === fId);
+                .filter(([, v]) => Array.isArray(v.value) ? v.value.length > 0 : !!v.value)
+                .map(([fId, v]) => {
+                    const field = label?.fields?.find((f) => f.id === fId);
                     const name = field?.properties?.displayName || fId;
                     const rawValues = Array.isArray(v.value) ? v.value : [v.value];
                     let val: string;
                     if (field?.selectionOptions?.choices) {
                         val = rawValues.map((id: string) => {
-                            const choice = field.selectionOptions!.choices.find((c: any) => c.id === id);
+                            const choice = field.selectionOptions!.choices.find((c) => c.id === id);
                             return choice?.properties?.displayName || id;
                         }).join(', ');
                     } else {
@@ -401,6 +491,7 @@ export default function NamerView() {
             existingNames = new Set();
         }
 
+        const succeededIds: string[] = [];
         for (let i = 0; i < batch.files.length; i++) {
             const file = batch.files[i];
 
@@ -454,17 +545,17 @@ export default function NamerView() {
                             height: String(meta.height),
                         });
 
-                        const contentTagsLabel = batchLabels.find((l: any) =>
+                        const contentTagsLabel = batchLabels.find((l) =>
                             l.properties?.title?.toLowerCase() === 'content tags'
                         );
                         if (contentTagsLabel?.fields) {
                             const orientField = contentTagsLabel.fields.find(
-                                (f: any) => f.properties?.displayName?.toLowerCase() === 'orientation'
+                                (f) => f.properties?.displayName?.toLowerCase() === 'orientation'
                                     && f.selectionOptions?.choices && f.selectionOptions.choices.length > 0
                             );
                             if (orientField?.selectionOptions?.choices) {
                                 const choice = orientField.selectionOptions.choices.find(
-                                    (c: any) => c.properties?.displayName?.toLowerCase() === orientationValue!.toLowerCase()
+                                    (c) => c.properties?.displayName?.toLowerCase() === orientationValue!.toLowerCase()
                                 );
                                 if (choice) {
                                     await namerApi.applyLabel(file.id, contentTagsLabel.id, {
@@ -553,6 +644,7 @@ export default function NamerView() {
                 }
 
                 // Mark success
+                succeededIds.push(file.id);
                 setBatches(prev => prev.map(b => {
                     if (b.id !== batchId) return b;
                     const updatedFiles = b.files.map(f => f.id === file.id ? { ...f, status: 'success', finalName, orientation: orientationValue } : f);
@@ -575,19 +667,12 @@ export default function NamerView() {
         // Mark batch complete
         setBatches(prev => prev.map(b => b.id === batchId ? { ...b, status: 'completed' } : b));
 
-        // Schedule deferred ingest into DAM
-        setBatches(prev => {
-            const completedBatch = prev.find(b => b.id === batchId);
-            if (completedBatch) {
-                const successIds = completedBatch.files
-                    .filter(f => f.status === 'success')
-                    .map(f => f.id);
-                if (successIds.length > 0) {
-                    scheduleIngest(batchId, successIds, batchDestFolderId);
-                }
-            }
-            return prev;
-        });
+        // Schedule deferred ingest into DAM. Called directly — it used to run
+        // inside a setBatches updater, which must be pure (StrictMode runs
+        // updaters twice → duplicate pending-ingest records).
+        if (succeededIds.length > 0) {
+            scheduleIngest(batchId, succeededIds, batchDestFolderId);
+        }
     }, [selectedLabelIds, labelFieldValues, labels, aiEnabled, settings, scheduleIngest]);
 
     // ==========================================================
@@ -620,6 +705,12 @@ export default function NamerView() {
     const revertBatch = useCallback(async (batchId: string) => {
         const batch = batches.find(b => b.id === batchId);
         if (!batch || batch.status !== 'completed') return;
+
+        // One click moves and renames every file in the batch — confirm first.
+        const count = batch.files.filter(f => f.status === 'success').length;
+        if (!window.confirm(`Revert ${count} file${count === 1 ? '' : 's'}? They'll be renamed with a "revert_" prefix and moved back to the source folder.`)) {
+            return;
+        }
 
         // Cancel any pending deferred ingest for this batch
         cancelIngest(batchId);
@@ -867,7 +958,19 @@ export default function NamerView() {
                                     label="Source Folder"
                                     folderId={sourceFolderId}
                                     folderName={sourceFolderName}
-                                    onSelect={(id: string, name: string) => { setSourceFolderId(id); setSourceFolderName(name); }}
+                                    onSelect={(id: string, name: string) => {
+                                        if (id !== sourceFolderId) {
+                                            // The listed files must always belong to the source
+                                            // folder: batches move files out of sourceFolderId, so
+                                            // a stale list would target the wrong parent.
+                                            loadSeqRef.current++;
+                                            setFiles([]);
+                                            setFilesError(null);
+                                            setFilesLoading(false);
+                                        }
+                                        setSourceFolderId(id);
+                                        setSourceFolderName(name);
+                                    }}
                                 />
                                 <FolderPicker
                                     label="Destination Folder"
@@ -1176,7 +1279,13 @@ export default function NamerView() {
                             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
                         </svg>
                         <p className="text-sm" style={{ color: 'var(--ram-text-tertiary)' }}>
-                            {sourceFolderId ? 'No media files found in this folder' : 'Select a source folder and click Load Files'}
+                            {filesError
+                                ? `Couldn't load files: ${filesError}`
+                                : !sourceFolderId
+                                    ? 'Select a source folder and click Load Files'
+                                    : loadedFolderId === sourceFolderId
+                                        ? 'No media files found in this folder'
+                                        : 'Click Load Files to list this folder'}
                         </p>
                     </div>
                 ) : (
@@ -1210,7 +1319,7 @@ export default function NamerView() {
                         )}
                         <FilePreviewTable
                             key={loadCount} // remount per load — resets filter/search state
-                            files={files}
+                            files={namedFiles}
                             onToggleExclude={toggleExclude}
                             onSelectAll={selectAll}
                             onDeselectAll={deselectAll}
@@ -1220,6 +1329,11 @@ export default function NamerView() {
                             isProcessing={isProcessing}
                             onSelectFiltered={selectFiltered}
                             onDeselectFiltered={deselectFiltered}
+                            onSetRange={setRangeStatus}
+                            viewMode={previewView}
+                            onViewModeChange={changePreviewView}
+                            tileSize={tileSize}
+                            onTileSizeChange={changeTileSize}
                         />
 
                     </>

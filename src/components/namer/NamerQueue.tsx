@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import type { PendingIngest } from '@/hooks/useDeferredIngest';
+import type { DriveLabel, LabelFieldValues, NamerSettings } from '@/lib/namer/types';
 
 export interface BatchFile {
     id: string;
@@ -14,6 +15,18 @@ export interface BatchFile {
     videoMediaMetadata?: { width: number; height: number };
 }
 
+/**
+ * Settings captured when a batch is queued, so processing uses what the user
+ * saw at queue time even if they change labels/AI/schema before it runs.
+ */
+export interface BatchSnapshot {
+    selectedLabelIds: string[];
+    labelFieldValues: LabelFieldValues;
+    aiEnabled: boolean;
+    labels: DriveLabel[];
+    settings: NamerSettings | null;
+}
+
 export interface BatchInfo {
     id: string;
     files: BatchFile[];
@@ -23,8 +36,7 @@ export interface BatchInfo {
     labelsSummary?: string;
     sourceFolderId: string;
     destFolderId: string;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    _snapshot?: any;
+    _snapshot?: BatchSnapshot;
 }
 
 interface NamerQueueProps {

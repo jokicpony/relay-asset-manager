@@ -11,7 +11,7 @@ import ActionBar from '@/components/ActionBar';
 import FolderSidebar from '@/components/FolderSidebar';
 import ExpandedAssetView from '@/components/ExpandedAssetView';
 import SettingsPanel from '@/components/SettingsPanel';
-import TrashPanel from '@/components/TrashPanel';
+import TrashPanel, { type TrashItem } from '@/components/TrashPanel';
 import FolderPickerModal, { type RecentFolder } from '@/components/FolderPickerModal';
 import DownloadQueue, { useDownloadQueue } from '@/components/DownloadQueue';
 import RelayHistory, { useRelayHistory } from '@/components/RelayHistory';
@@ -102,6 +102,7 @@ export default function Home() {
 
   // App mode — toggle between Browse and Ingest (Namer)
   const [appMode, setAppMode] = useState<'browse' | 'ingest'>('browse');
+  const [namerOpened, setNamerOpened] = useState(false);
 
   // UI state
   const [filters, setFilters] = useState<SearchFilters>(() => ({
@@ -127,20 +128,27 @@ export default function Home() {
   const [userInitials, setUserInitials] = useState('?');
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
-  const gridRef = useRef<HTMLDivElement>(null);
+  // Callback-ref state, not useRef: the grid isn't in the DOM on first render
+  // (loading skeleton), and an effect keyed on a plain ref never re-ran once
+  // it mounted — gridColWidth stayed at its 300px default forever.
+  const [gridEl, setGridEl] = useState<HTMLDivElement | null>(null);
+  // The grid's scroll container — the infinite-scroll observer's root.
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const loadMore = useCallback(() => setVisibleCount((v) => v + PAGE_SIZE), []);
   const [gridColWidth, setGridColWidth] = useState(300);
 
 
-  // Sync shareable filter params → URL (no page reload)
+  // Sync shareable filter params → URL (no page reload). Cheap on unrelated
+  // filter changes — replaceState only fires when the URL actually differs.
   useEffect(() => {
     const url = filtersToUrl(filters);
     if (url !== window.location.pathname + window.location.search) {
       window.history.replaceState(null, '', url);
     }
-  }, [filters.folderPath, filters.sortBy, filters.assetType, filters.orientation]);
+  }, [filters]);
 
   // Trash queue state
-  const [trashItems, setTrashItems] = useState<any[]>([]);
+  const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [trashModalOpen, setTrashModalOpen] = useState(false);
 
   // Relay (Folder Picker) state
@@ -229,9 +237,10 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id, action }),
       });
-      if (res.ok) {
+      // 404 = no longer in the trash (restored/purged elsewhere) — drop it too
+      if (res.ok || res.status === 404) {
         setTrashItems((prev) => prev.filter((item) => item.id !== id));
-        if (action === 'restore') {
+        if (res.ok && action === 'restore') {
           // Re-fetch assets to show the restored one
           await refreshAssets();
         }
@@ -500,7 +509,7 @@ export default function Home() {
   // Measure actual grid column width via ResizeObserver.
   // This accounts for sidebar open/close, padding, and window resize.
   useEffect(() => {
-    const el = gridRef.current;
+    const el = gridEl;
     if (!el) return;
     const measure = () => {
       const style = getComputedStyle(el);
@@ -514,7 +523,7 @@ export default function Home() {
     const observer = new ResizeObserver(measure);
     observer.observe(el);
     return () => observer.disconnect();
-  }, []);
+  }, [gridEl]);
 
   // Note: CSS Grid fills row-major natively, so no transpose/reorder
   // is needed — visibleAssets can be rendered directly in sort order.
@@ -635,12 +644,13 @@ export default function Home() {
   }, []);
 
   // Download handler — enqueues to background download queue
+  const { enqueue: enqueueDownload } = downloadQueue;
   const handleDownload = useCallback((targetAssets: Asset[]) => {
     if (targetAssets.length === 0) return;
-    downloadQueue.enqueue(
+    enqueueDownload(
       targetAssets.map((a) => ({ driveFileId: a.driveFileId, name: a.name }))
     );
-  }, [downloadQueue.enqueue]);
+  }, [enqueueDownload]);
 
   // Batch download
   const handleBatchDownload = useCallback(() => {
@@ -856,7 +866,7 @@ export default function Home() {
               📂 Library
             </button>
             <button
-              onClick={() => setAppMode('ingest')}
+              onClick={() => { setAppMode('ingest'); setNamerOpened(true); }}
               className="text-xs font-semibold px-4 py-1.5 rounded-md transition-all"
               style={{
                 background: appMode === 'ingest' ? 'var(--ram-bg-elevated)' : 'transparent',
@@ -964,9 +974,16 @@ export default function Home() {
         </header>
 
         {/* MODE-DEPENDENT CONTENT */}
-        {appMode === 'ingest' ? (
-          <NamerView />
-        ) : (
+        {/* Once opened, the Namer stays mounted (just hidden) while browsing:
+            its batch queue lives in component state, and unmounting mid-batch
+            orphaned the running loop — lost progress, no library ingest
+            scheduled, and files re-listed for a second concurrent rename. */}
+        {namerOpened && (
+          <div hidden={appMode !== 'ingest'} className="flex flex-col flex-1 min-h-0">
+            <NamerView />
+          </div>
+        )}
+        {appMode !== 'ingest' && (
           <>
         {/* Search + filters */}
         <div className="flex-shrink-0 px-6 py-4">
@@ -991,7 +1008,7 @@ export default function Home() {
 
 
         {/* Asset grid */}
-        <div className="flex-1 overflow-y-auto px-6 pb-24">
+        <div className="flex-1 overflow-y-auto px-6 pb-24" ref={setScrollEl}>
           {filteredAssets.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-20 gap-4">
               <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--ram-text-tertiary)" strokeWidth="1">
@@ -1019,7 +1036,7 @@ export default function Home() {
             </div>
           ) : (
             <>
-              <div className="masonry-grid" ref={gridRef}>
+              <div className="masonry-grid" ref={setGridEl}>
                 {visibleAssets.map((asset) => (
                   <AssetCard
                     key={asset.id}
@@ -1039,7 +1056,7 @@ export default function Home() {
 
               {/* Infinite scroll sentinel */}
               {hasMore && (
-                <InfiniteScrollSentinel onIntersect={() => setVisibleCount((v) => v + PAGE_SIZE)} />
+                <InfiniteScrollSentinel root={scrollEl} version={visibleCount} onIntersect={loadMore} />
               )}
             </>
           )}
@@ -1125,23 +1142,33 @@ export default function Home() {
 }
 
 // Sentinel that triggers loading when scrolled into view
-function InfiniteScrollSentinel({ onIntersect }: { onIntersect: () => void }) {
+function InfiniteScrollSentinel({ root, version, onIntersect }: {
+  root: HTMLElement | null;
+  /** Changes after each load; re-observing re-checks a still-visible sentinel. */
+  version: number;
+  onIntersect: () => void;
+}) {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const el = ref.current;
-    if (!el) return;
+    if (!el || !root) return;
 
+    // root must be the scroll container: with the default (viewport) root,
+    // the container clips the sentinel and rootMargin can't extend past that
+    // clip, so the lookahead never happened and users hit the spinner.
+    // A new observer reports the current state on creation, so re-creating
+    // it per `version` keeps loading while the sentinel is still in range.
     const observer = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting) onIntersect();
       },
-      { rootMargin: '400px' } // start loading 400px before visible
+      { root, rootMargin: '0px 0px 150% 0px' } // ~1.5 screens of lookahead
     );
 
     observer.observe(el);
     return () => observer.disconnect();
-  }, [onIntersect]);
+  }, [root, version, onIntersect]);
 
   return (
     <div ref={ref} className="flex justify-center py-8">

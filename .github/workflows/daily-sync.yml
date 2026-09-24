@@ -11,15 +11,29 @@ on:
         description: 'Skip thumbnail processing (faster sync)'
         type: boolean
         default: false
+      allow_mass_orphan:
+        description: 'Allow trashing a large number of missing assets (only for a real bulk deletion)'
+        type: boolean
+        default: false
 
 permissions:
   id-token: write   # Required for WIF OIDC token
   contents: read
 
+# Never run two syncs at once (cron + manual trigger): overlapping runs double
+# Drive/Gemini spend and race each other's orphan detection. A queued run waits
+# for the active one rather than cancelling it mid-write.
+concurrency:
+  group: drive-sync
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Thumbnails are time-boxed (SYNC_THUMBNAIL_BUDGET_MIN, default 15) so the
+    # upsert/orphan/embed steps always get to run. Keep this under 60: the
+    # Google access token is fetched once and lasts an hour.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -57,5 +71,8 @@ jobs:
           FLAGS=""
           if [ "${{ inputs.skip_thumbnails }}" = "true" ]; then
             FLAGS="$FLAGS --skip-thumbnails"
+          fi
+          if [ "${{ inputs.allow_mass_orphan }}" = "true" ]; then
+            FLAGS="$FLAGS --allow-mass-orphan"
           fi
           npx tsx scripts/sync.ts $FLAGS

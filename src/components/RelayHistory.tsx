@@ -210,6 +210,10 @@ function RelayRow({
     onUndo: () => void;
 }) {
     const [undoing, setUndoing] = useState(false);
+    // Shortcuts still to remove. Retries target only these: ones already
+    // deleted are no longer tracked and would otherwise fail on every retry.
+    const [remainingIds, setRemainingIds] = useState<string[]>(item.shortcutIds);
+    const [undoError, setUndoError] = useState<string | null>(null);
     const isUndone = item.status === 'undone';
 
     const statusColor =
@@ -223,19 +227,34 @@ function RelayRow({
 
     const handleUndo = async (e: React.MouseEvent) => {
         e.stopPropagation();
-        if (undoing || isUndone || item.shortcutIds.length === 0) return;
+        if (undoing || isUndone || remainingIds.length === 0) return;
         setUndoing(true);
+        setUndoError(null);
         try {
             const res = await fetch('/api/drive/shortcut/delete', {
                 method: 'DELETE',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ shortcutIds: item.shortcutIds }),
+                body: JSON.stringify({ shortcutIds: remainingIds }),
             });
-            if (res.ok) {
+            const data = await res.json().catch(() => null) as
+                { results?: { id: string; success: boolean; untracked?: boolean }[]; error?: string } | null;
+            if (!res.ok || !data?.results) {
+                setUndoError(data?.error || `Undo failed (${res.status})`);
+                return;
+            }
+            // The route answers 200 even when individual deletes fail.
+            // Untracked IDs are already gone (history outlives shortcut rows),
+            // so they count as removed rather than retried forever.
+            const stillThere = data.results.filter((r) => !r.success && !r.untracked).map((r) => r.id);
+            if (stillThere.length === 0) {
                 onUndo();
+            } else {
+                setRemainingIds(stillThere);
+                setUndoError(`${stillThere.length} of ${item.shortcutIds.length} couldn't be removed — try again`);
             }
         } catch (err) {
             logger.error('relay-history', 'Undo relay failed', { error: err instanceof Error ? err.message : String(err) });
+            setUndoError('Undo failed — check your connection and try again');
         } finally {
             setUndoing(false);
         }
@@ -288,6 +307,11 @@ function RelayRow({
                         {isUndone ? 'Undone' : `→ ${item.targetFolder}`}
                         <span className="ml-2">{timeAgo(item.timestamp)}</span>
                     </p>
+                    {undoError && !isUndone && (
+                        <p className="text-[10px] mt-0.5" style={{ color: 'var(--ram-red, #ef4444)' }}>
+                            {undoError}
+                        </p>
+                    )}
                 </div>
 
                 {/* Undo button — only for non-undone, non-failed items with shortcutIds */}

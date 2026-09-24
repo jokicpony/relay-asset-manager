@@ -101,7 +101,11 @@ export interface AISettings {
 
 export interface SchemaField {
     id: string;
-    type: 'text' | 'select' | 'date' | 'counter';
+    /**
+     * `constant` is a fixed token defined once in Settings (e.g. "TikTok").
+     * Its `value` is baked into every name and is not editable in the builder.
+     */
+    type: 'text' | 'select' | 'date' | 'counter' | 'constant';
     label: string;
     value: string;
     required: boolean;

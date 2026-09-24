@@ -40,11 +40,11 @@ export interface ParsedFilename {
  * Parse an asset filename into structured metadata fields.
  *
  * @example
- * parseFilename('20260205_Tatianna-Repstock_Tailgate_Firelight-Flask_010.jpg')
+ * parseFilename('20260205_Jane-Doe_Tailgate_Camp-Bottle_010.jpg')
  * // => {
  * //   shootDate: Date('2026-02-05'),
- * //   creator: 'Tatianna Repstock',
- * //   shootDescription: 'Tailgate / Firelight Flask',
+ * //   creator: 'Jane Doe',
+ * //   shootDescription: 'Tailgate / Camp Bottle',
  * //   sequence: '010',
  * //   parsed: true,
  * //   tags: [],

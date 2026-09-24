@@ -109,6 +109,8 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
     const [saving, setSaving] = useState(false);
     const [configExpanded, setConfigExpanded] = useState(false);
     const [thresholdValue, setThresholdValue] = useState(0.3);
+    const thresholdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const [configError, setConfigError] = useState<string | null>(null);
     // Chip UI state for array fields
     const [chipAddValue, setChipAddValue] = useState('');
     const [pendingDelete, setPendingDelete] = useState<{ key: string; index: number } | null>(null);
@@ -258,8 +260,8 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                     }
                 }
             }, 5000);
-        } catch (err: any) {
-            setSyncError(err.message);
+        } catch (err) {
+            setSyncError(err instanceof Error ? err.message : String(err));
             setSyncing(false);
         }
     };
@@ -802,16 +804,18 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                     max="0.8"
                                     step="0.05"
                                     value={thresholdValue}
-                                    onChange={async (e) => {
+                                    onChange={(e) => {
                                         const val = parseFloat(e.target.value);
                                         setThresholdValue(val);
-                                        try {
-                                            await fetch('/api/settings/config', {
+                                        // Debounced: a drag used to fire one PUT per step
+                                        if (thresholdTimerRef.current) clearTimeout(thresholdTimerRef.current);
+                                        thresholdTimerRef.current = setTimeout(() => {
+                                            fetch('/api/settings/config', {
                                                 method: 'PUT',
                                                 headers: { 'Content-Type': 'application/json' },
                                                 body: JSON.stringify({ key: 'semantic_similarity_threshold', value: val }),
-                                            });
-                                        } catch { /* silent */ }
+                                            }).catch(() => { /* next change retries */ });
+                                        }, 400);
                                     }}
                                     style={{
                                         flex: 1,
@@ -894,8 +898,24 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                             return `${val.slice(0, 4)}${'•'.repeat(6)}${val.slice(-4)}`;
                                         };
 
+                                        // Edits build on `config`; if it never loaded, an edit
+                                        // would save on top of an empty list (e.g. adding one
+                                        // sync folder would drop all the others).
+                                        if (!config) {
+                                            return (
+                                                <div style={{ fontSize: 12, color: 'var(--ram-red, #f87171)', padding: '10px 14px' }}>
+                                                    Couldn&apos;t load configuration.{' '}
+                                                    <button onClick={() => fetchSettings()}
+                                                        style={{ background: 'none', border: 'none', color: 'var(--ram-accent)', cursor: 'pointer', textDecoration: 'underline', fontSize: 12 }}
+                                                    >Retry</button>
+                                                </div>
+                                            );
+                                        }
+
                                         const saveConfigField = async (key: string, value: unknown) => {
+                                            if (saving) return; // edits build on the current list — no overlapping saves
                                             setSaving(true);
+                                            setConfigError(null);
                                             try {
                                                 const res = await fetch('/api/settings/config', {
                                                     method: 'PUT',
@@ -904,10 +924,16 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                 });
                                                 if (res.ok) {
                                                     setEditingField(null);
-                                                    const configRes = await fetch('/api/settings/config');
-                                                    if (configRes.ok) setConfig(await configRes.json());
+                                                } else {
+                                                    const body = await res.json().catch(() => ({}));
+                                                    setConfigError(body.error || `Save failed (${res.status})`);
                                                 }
-                                            } catch { /* silent */ }
+                                                // Re-sync either way so the UI shows what's actually stored
+                                                const configRes = await fetch('/api/settings/config');
+                                                if (configRes.ok) setConfig(await configRes.json());
+                                            } catch {
+                                                setConfigError('Save failed — check your connection');
+                                            }
                                             setSaving(false);
                                         };
 
@@ -921,6 +947,9 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
 
                                         return (
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                                                {configError && (
+                                                    <div style={{ fontSize: 12, color: 'var(--ram-red, #f87171)' }}>{configError}</div>
+                                                )}
                                                 {/* ── Single-value fields ── */}
                                                 {singleFields.map(({ key, label, value, sensitive }) => (
                                                     <div key={key} style={{ padding: '10px 14px', background: 'var(--ram-bg-tertiary)', borderRadius: 10, border: '1px solid var(--ram-border)' }}>
@@ -978,7 +1007,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                                                     <span>{sensitive ? maskId(item) : item}</span>
                                                                     {pendingDelete?.key === key && pendingDelete?.index === idx ? (
                                                                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginLeft: 4 }}>
-                                                                            <button onClick={async () => { await saveConfigField(key, items.filter((_, i) => i !== idx)); setPendingDelete(null); }}
+                                                                            <button disabled={saving} onClick={async () => { await saveConfigField(key, items.filter((_, i) => i !== idx)); setPendingDelete(null); }}
                                                                                 style={{ background: 'var(--ram-red,#f87171)', border: 'none', color: '#fff', fontSize: 9, fontWeight: 700, padding: '1px 6px', borderRadius: 4, cursor: 'pointer' }}
                                                                             >Remove</button>
                                                                             <button onClick={() => setPendingDelete(null)}

@@ -28,6 +28,11 @@ export interface DownloadItem {
 export function useDownloadQueue(onAuthError?: () => void) {
     const [items, setItems] = useState<DownloadItem[]>([]);
 
+    // Latest-callback ref: keeps `enqueue` referentially stable without
+    // capturing a stale onAuthError from the first render.
+    const onAuthErrorRef = useRef(onAuthError);
+    useEffect(() => { onAuthErrorRef.current = onAuthError; });
+
     // Warn user before navigating away when downloads are in progress
     useEffect(() => {
         const hasActive = items.some(
@@ -108,9 +113,9 @@ export function useDownloadQueue(onAuthError?: () => void) {
                         if (!res.ok) {
                             const errData = await res.json().catch(() => ({}));
                             const isAuth = res.status === 401;
-                            if (isAuth) onAuthError?.();
-                            const err = new Error(errData.error || `Download failed: ${res.status}`);
-                            (err as any).isAuthError = isAuth;
+                            if (isAuth) onAuthErrorRef.current?.();
+                            const err = new Error(errData.error || `Download failed: ${res.status}`) as Error & { isAuthError?: boolean };
+                            err.isAuthError = isAuth;
                             throw err;
                         }
 
@@ -142,7 +147,7 @@ export function useDownloadQueue(onAuthError?: () => void) {
                         );
                     }
                 } catch (err) {
-                    const isAuthErr = (err as any)?.isAuthError === true;
+                    const isAuthErr = (err as { isAuthError?: boolean } | null)?.isAuthError === true;
                     setItems((prev) =>
                         prev.map((i) =>
                             i.id === id

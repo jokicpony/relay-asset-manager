@@ -87,24 +87,29 @@ export async function GET() {
     }
 
     try {
-        // Fetch shortcuts and first asset batch in parallel
+        // Fetch shortcuts (paginated — PostgREST caps a select at 1000 rows,
+        // which silently dropped relay badges and virtual project folders
+        // once the table grew past that) alongside the asset pages.
         const shortcutMap = new Map<string, string[]>();
-        const shortcutPromise = supabase
-            .from('shortcuts')
-            .select('target_asset_id, project_folder_path')
-            .then(({ data, error }) => {
+        const shortcutPromise = (async () => {
+            for (let from = 0; ; from += 1000) {
+                const { data, error } = await supabase
+                    .from('shortcuts')
+                    .select('target_asset_id, project_folder_path')
+                    .order('id')
+                    .range(from, from + 999);
                 if (error) {
                     logger.warn('shortcuts', 'Query error', { error: error.message });
                     return;
                 }
-                if (data) {
-                    for (const s of data) {
-                        const existing = shortcutMap.get(s.target_asset_id) || [];
-                        existing.push(s.project_folder_path);
-                        shortcutMap.set(s.target_asset_id, existing);
-                    }
+                for (const s of data ?? []) {
+                    const existing = shortcutMap.get(s.target_asset_id) || [];
+                    existing.push(s.project_folder_path);
+                    shortcutMap.set(s.target_asset_id, existing);
                 }
-            });
+                if (!data || data.length < 1000) return;
+            }
+        })();
 
         // Fetch all asset pages while the shortcuts query runs concurrently
         const PAGE_SIZE = 1000;
@@ -119,6 +124,10 @@ export async function GET() {
                 .eq('is_active', true)
                 .order('folder_path', { ascending: true })
                 .order('name', { ascending: true })
+                // Unique tie-breaker: Drive allows duplicate names in a folder,
+                // and offset paging over non-unique sort keys can skip or
+                // repeat rows at page boundaries.
+                .order('id', { ascending: true })
                 .range(offset, offset + PAGE_SIZE - 1);
 
             if (error) {

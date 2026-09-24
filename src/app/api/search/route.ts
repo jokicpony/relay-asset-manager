@@ -1,11 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
 import { createClient as createServerClient } from '@/lib/supabase/server';
 import { logger } from '@/lib/logger';
 import { getConfig } from '@/lib/config';
+import { getAdminClient } from '@/lib/supabase/admin';
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
 const GEMINI_EMBED_URL =
@@ -29,10 +27,10 @@ export async function GET(request: NextRequest) {
     }
 
     const query = request.nextUrl.searchParams.get('q')?.trim();
-    const limit = Math.min(
-        parseInt(request.nextUrl.searchParams.get('limit') || '50', 10),
-        200
-    );
+    // Clamp to [1, 200]; NaN (e.g. ?limit=abc) serialized to null, which the
+    // RPC treated as LIMIT NULL — unbounded.
+    const parsedLimit = parseInt(request.nextUrl.searchParams.get('limit') || '50', 10);
+    const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 200) : 50;
 
     if (!query) {
         return NextResponse.json({ error: 'Missing query parameter "q"' }, { status: 400 });
@@ -77,7 +75,7 @@ export async function GET(request: NextRequest) {
         const queryEmbedding = embedData.embedding.values;
 
         // Step 2: Search Supabase using cosine similarity (RPC function)
-        const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+        const supabase = getAdminClient();
 
         const { data, error } = await supabase.rpc('match_assets', {
             query_embedding: JSON.stringify(queryEmbedding),
@@ -99,10 +97,11 @@ export async function GET(request: NextRequest) {
             query,
             count: data?.length || 0,
         });
-    } catch (err: any) {
-        logger.error('search', 'Search error', { error: err.message });
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error('search', 'Search error', { error: message });
         return NextResponse.json(
-            { error: err.message || 'Internal server error' },
+            { error: message || 'Internal server error' },
             { status: 500 }
         );
     }

@@ -10,15 +10,10 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
 import { createClient as createServerClient } from '@/lib/supabase/server';
+import { getAdminClient } from '@/lib/supabase/admin';
 import type { NamerSettings, NamingSchemas, Dropdowns, AISettings } from '@/lib/namer/types';
 import { DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_PROMPT } from '@/lib/namer/ai-defaults';
-
-const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
 
 // Default settings — used for seeding and fallbacks
 const DEFAULT_AI_SETTINGS: AISettings = {
@@ -83,7 +78,7 @@ const DEFAULT_DROPDOWNS: Dropdowns = {
 // ---------------------------------------------------------------------------
 
 async function getSetting<T>(key: string, fallback: T): Promise<T> {
-    const { data, error } = await supabase
+    const { data, error } = await getAdminClient()
         .from('app_settings')
         .select('value')
         .eq('key', key)
@@ -94,7 +89,7 @@ async function getSetting<T>(key: string, fallback: T): Promise<T> {
 }
 
 async function setSetting(key: string, value: unknown, email?: string): Promise<void> {
-    await supabase
+    const { error } = await getAdminClient()
         .from('app_settings')
         .upsert({
             key,
@@ -102,6 +97,8 @@ async function setSetting(key: string, value: unknown, email?: string): Promise<
             updated_at: new Date().toISOString(),
             updated_by: email || null,
         });
+    // Throw so PUT answers 500 — this used to return {success:true} regardless.
+    if (error) throw new Error(`Failed to save ${key}: ${error.message}`);
 }
 
 // ---------------------------------------------------------------------------

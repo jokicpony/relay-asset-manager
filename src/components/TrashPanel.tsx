@@ -1,16 +1,17 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { PURGE_AFTER_DAYS } from '@/lib/sync/constants';
 
-interface TrashItem {
+export interface TrashItem {
     id: string;
     name: string;
     thumbnail_url: string | null;
     folder_path: string;
     asset_type: 'photo' | 'video';
     deleted_at: string;
-    deleted_reason: 'orphaned' | 'ignored' | null;
-    daysRemaining: number;
+    deleted_reason: 'orphaned' | 'ignored' | 'out-of-scope' | null;
+    daysRemaining: number | null;  // null = exempt from purge (out-of-scope)
 }
 
 interface TrashPanelProps {
@@ -22,6 +23,13 @@ interface TrashPanelProps {
 export default function TrashPanel({ items, onAction, onClose }: TrashPanelProps) {
     const overlayRef = useRef<HTMLDivElement>(null);
     const [expandedId, setExpandedId] = useState<string | null>(null);
+    // Two-click confirm for permanent delete — it sits right next to Restore.
+    const [confirmPurgeId, setConfirmPurgeId] = useState<string | null>(null);
+    useEffect(() => {
+        if (!confirmPurgeId) return;
+        const t = setTimeout(() => setConfirmPurgeId(null), 4000);
+        return () => clearTimeout(t);
+    }, [confirmPurgeId]);
 
     // Close on overlay click
     useEffect(() => {
@@ -45,6 +53,8 @@ export default function TrashPanel({ items, onAction, onClose }: TrashPanelProps
         switch (reason) {
             case 'ignored':
                 return { text: 'In ignored folder', icon: '🚫', color: 'var(--ram-amber, #f59e0b)' };
+            case 'out-of-scope':
+                return { text: 'Folder out of sync scope', icon: '📁', color: 'var(--ram-blue, #3b82f6)' };
             case 'orphaned':
             default:
                 return { text: 'Removed from Drive', icon: '☁️', color: 'var(--ram-text-tertiary)' };
@@ -173,7 +183,9 @@ export default function TrashPanel({ items, onAction, onClose }: TrashPanelProps
                     ) : (
                         items.map((item, index) => {
                             const reason = reasonLabel(item.deleted_reason);
-                            const urgencyPct = Math.max(0, Math.min(1, 1 - item.daysRemaining / 14));
+                            const urgencyPct = item.daysRemaining === null
+                                ? 0
+                                : Math.max(0, Math.min(1, 1 - item.daysRemaining / PURGE_AFTER_DAYS));
                             const urgencyColor = urgencyPct > 0.7
                                 ? 'var(--ram-red, #ef4444)'
                                 : urgencyPct > 0.4
@@ -212,6 +224,7 @@ export default function TrashPanel({ items, onAction, onClose }: TrashPanelProps
                                         transition: 'width 0.2s ease, height 0.2s ease',
                                     }}>
                                         {item.thumbnail_url ? (
+                                            // eslint-disable-next-line @next/next/no-img-element -- dynamic Supabase-storage thumbnails; next/image optimization adds per-image Vercel cost for no benefit at this size
                                             <img
                                                 src={item.thumbnail_url}
                                                 alt=""
@@ -286,9 +299,11 @@ export default function TrashPanel({ items, onAction, onClose }: TrashPanelProps
                                                 fontWeight: 500,
                                                 color: urgencyColor,
                                             }}>
-                                                {item.daysRemaining === 0
-                                                    ? 'Purging soon'
-                                                    : `${item.daysRemaining} day${item.daysRemaining !== 1 ? 's' : ''} left`}
+                                                {item.daysRemaining === null
+                                                    ? 'Kept until re-scoped'
+                                                    : item.daysRemaining === 0
+                                                        ? 'Purging soon'
+                                                        : `${item.daysRemaining} day${item.daysRemaining !== 1 ? 's' : ''} left`}
                                             </span>
                                             <span style={{
                                                 width: 3,
@@ -335,31 +350,36 @@ export default function TrashPanel({ items, onAction, onClose }: TrashPanelProps
                                         >
                                             Restore
                                         </button>
-                                        <button
-                                            onClick={() => onAction(item.id, 'purge')}
-                                            style={{
-                                                padding: '5px 12px',
-                                                borderRadius: 6,
-                                                fontSize: 11,
-                                                fontWeight: 600,
-                                                border: '1px solid rgba(239, 68, 68, 0.3)',
-                                                cursor: 'pointer',
-                                                background: 'transparent',
-                                                color: 'var(--ram-red, #f87171)',
-                                                transition: 'all 0.15s',
-                                            }}
-                                            onMouseOver={(e) => {
-                                                e.currentTarget.style.background = 'rgba(239, 68, 68, 0.1)';
-                                                e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.5)';
-                                            }}
-                                            onMouseOut={(e) => {
-                                                e.currentTarget.style.background = 'transparent';
-                                                e.currentTarget.style.borderColor = 'rgba(239, 68, 68, 0.3)';
-                                            }}
-                                            title="Delete permanently"
-                                        >
-                                            Delete
-                                        </button>
+                                        {(() => {
+                                            const confirming = confirmPurgeId === item.id;
+                                            return (
+                                                <button
+                                                    onClick={() => {
+                                                        if (confirming) {
+                                                            setConfirmPurgeId(null);
+                                                            onAction(item.id, 'purge');
+                                                        } else {
+                                                            setConfirmPurgeId(item.id);
+                                                        }
+                                                    }}
+                                                    style={{
+                                                        padding: '5px 12px',
+                                                        borderRadius: 6,
+                                                        fontSize: 11,
+                                                        fontWeight: 600,
+                                                        border: '1px solid rgba(239, 68, 68, 0.3)',
+                                                        cursor: 'pointer',
+                                                        background: confirming ? 'rgba(239, 68, 68, 0.9)' : 'transparent',
+                                                        color: confirming ? '#fff' : 'var(--ram-red, #f87171)',
+                                                        transition: 'all 0.15s',
+                                                        whiteSpace: 'nowrap',
+                                                    }}
+                                                    title={confirming ? 'Click again to delete permanently' : 'Delete permanently'}
+                                                >
+                                                    {confirming ? 'Confirm?' : 'Delete'}
+                                                </button>
+                                            );
+                                        })()}
                                     </div>
                                 </div>
                             );

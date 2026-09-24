@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
 import { createClient as createServerClient } from '@/lib/supabase/server';
+import { getAdminClient } from '@/lib/supabase/admin';
 import { logger } from '@/lib/logger';
 
 /**
@@ -34,10 +34,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        const supabase = createClient(
-            process.env.NEXT_PUBLIC_SUPABASE_URL!,
-            process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-        );
+        const supabase = getAdminClient();
 
         // Only accept thumbnails for files that exist as active library assets.
         // This also rejects malformed IDs before they reach a storage key.

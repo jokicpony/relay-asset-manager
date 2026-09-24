@@ -174,7 +174,7 @@ async function batchEmbed(
     }
 
     const data = await res.json();
-    return data.embeddings.map((e: any) => e.values);
+    return (data.embeddings as { values: number[] }[]).map((e) => e.values);
 }
 
 // ---------------------------------------------------------------------------
@@ -303,9 +303,10 @@ async function main() {
                     }
                 }
             }
-        } catch (err: any) {
+        } catch (err) {
             // Rate limit — back off and retry the whole batch
-            if (err.message.includes('429')) {
+            const message = err instanceof Error ? err.message : String(err);
+            if (message.includes('429')) {
                 log('\n  ⏳ Rate limited — waiting 30s...');
                 await sleep(30000);
                 i -= BATCH_SIZE; // retry this batch
@@ -360,9 +361,9 @@ async function main() {
                                 errors++;
                             }
                         }
-                    } catch (e2: any) {
+                    } catch (e2) {
                         errors++;
-                        log(`    ↳ ${asset.name}: failed entirely — ${e2.message}`);
+                        log(`    ↳ ${asset.name}: failed entirely — ${e2 instanceof Error ? e2.message : String(e2)}`);
                     }
                 }
                 await sleep(200); // Small delay between individual retries

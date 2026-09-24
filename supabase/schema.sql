@@ -50,9 +50,10 @@ create table public.assets (
     -- Gemini embedding (nullable — videos may lack descriptions)
     embedding       vector(768),
 
-    -- Soft delete (14-day trash queue)
+    -- Soft delete (14-day trash queue; 'out-of-scope' rows are exempt from
+    -- the purge — the Drive files still exist, only the allowlist changed)
     deleted_at      timestamptz default null,
-    deleted_reason  text check (deleted_reason in ('orphaned', 'ignored')),
+    deleted_reason  text check (deleted_reason in ('orphaned', 'ignored', 'out-of-scope')),
 
     -- Drive timestamps (preserved from Google Drive, separate from Supabase auto-timestamps)
     drive_created_at  timestamptz,
@@ -70,8 +71,10 @@ create table public.assets (
 -- 3. Assets indexes
 -- ────────────────────────────────────────────────────────────
 
-create index idx_assets_embedding on public.assets
-    using ivfflat (embedding vector_cosine_ops) with (lists = 100);
+-- HNSW, not ivfflat: ivfflat trains its lists at build time, and this
+-- script runs on an empty table (see migrations/2026-09-24_hnsw_embedding_index.sql).
+create index idx_assets_embedding_hnsw on public.assets
+    using hnsw (embedding vector_cosine_ops);
 
 create index idx_assets_shoot_date on public.assets (parsed_shoot_date);
 create index idx_assets_creator    on public.assets (parsed_creator);
@@ -94,7 +97,8 @@ create table public.shortcuts (
     target_asset_id         uuid not null references public.assets(id) on delete cascade,
     project_folder_path     text not null,                        -- e.g. /Special Projects/Q1 Campaign
     project_folder_drive_id text not null,                        -- Drive ID of the containing folder
-    created_at              timestamptz default now()
+    created_at              timestamptz default now(),
+    missing_since           timestamptz default null              -- set when a sync doesn't see the shortcut; deleted after a grace period
 );
 
 create index idx_shortcuts_target on public.shortcuts (target_asset_id);
@@ -226,6 +230,7 @@ create or replace function match_assets(
 )
 returns table (id uuid, similarity float)
 language sql stable
+set hnsw.ef_search = 200  -- default 40 caps results below the app's limit of 100
 as $$
   select
     assets.id,
@@ -251,6 +256,5 @@ create policy "Public thumbnail access"
     on storage.objects for select to public
     using (bucket_id = 'thumbnails');
 
-create policy "Authenticated users can upload thumbnails"
-    on storage.objects for insert to authenticated
-    with check (bucket_id = 'thumbnails');
+-- No authenticated INSERT policy: all thumbnail uploads use the service role
+-- (see migrations/2026-06-10_drop_authenticated_thumbnail_upload.sql).

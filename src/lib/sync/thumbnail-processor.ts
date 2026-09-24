@@ -1,6 +1,7 @@
-import { createClient } from '@supabase/supabase-js';
 import { google } from 'googleapis';
 import { logger } from '@/lib/logger';
+import { getAdminClient } from '@/lib/supabase/admin';
+import { encodeThumbnail, THUMBNAIL_MAX_PX } from './thumbnail-encode';
 
 /**
  * Thumbnail processor for the sync pipeline.
@@ -18,7 +19,6 @@ import { logger } from '@/lib/logger';
  * 3. Skip (asset gets no thumbnail — won't crash the UI)
  */
 
-const THUMBNAIL_SIZE = 800;       // Max dimension in pixels
 const BATCH_SIZE = 5;              // Concurrent downloads per batch
 const BATCH_DELAY_MS = 500;        // Delay between batches
 const SINGLE_RETRY_DELAY_MS = 1000; // Delay before retrying a failed download
@@ -28,17 +28,6 @@ interface ThumbnailResult {
     driveFileId: string;
     publicUrl: string | null;
     error?: string;
-}
-
-/**
- * Create a Supabase client for storage operations.
- * Uses service role key when available (server-side ingest) to bypass RLS.
- */
-function getSupabaseClient() {
-    return createClient(
-        process.env.NEXT_PUBLIC_SUPABASE_URL!,
-        process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-    );
 }
 
 /**
@@ -56,7 +45,7 @@ async function downloadThumbnail(
     if (thumbnailLink) {
         try {
             // Google's thumbnailLink supports size parameter: append =s800
-            const sizedUrl = thumbnailLink.replace(/=s\d+$/, '') + `=s${THUMBNAIL_SIZE}`;
+            const sizedUrl = thumbnailLink.replace(/=s\d+$/, '') + `=s${THUMBNAIL_MAX_PX}`;
             const res = await fetch(sizedUrl, {
                 headers: { Authorization: `Bearer ${accessToken}` },
             });
@@ -109,7 +98,6 @@ async function uploadToStorage(
     fileId: string,
     imageBuffer: Buffer
 ): Promise<string | null> {
-    // Store as WebP-named file even if it's JPEG — browser handles it fine
     const filePath = `${fileId}.webp`;
 
     const { error } = await supabase.storage
@@ -150,37 +138,28 @@ export async function processThumbnails(
     }>,
     onProgress?: (processed: number, total: number) => void
 ): Promise<Map<string, string>> {
-    const supabase = getSupabaseClient();
+    const supabase = getAdminClient();
     const urlMap = new Map<string, string>();
     let processed = 0;
 
     // Pre-check: find assets that already have a user-set custom thumbnail
-    // in storage (custom_{driveFileId}.webp). We must never overwrite these
-    // with an auto-generated thumbnail.
+    // (custom_{driveFileId}.webp). We must never overwrite these with an
+    // auto-generated thumbnail. Looked up in the DB for just these IDs — the
+    // previous full storage-bucket listing grew with the library and ran on
+    // every ingest request.
     const customThumbnailIds = new Set<string>();
-    try {
-        let listOffset = 0;
-        const LIST_PAGE = 1000;
-        while (true) {
-            const { data: storageFiles, error: listErr } = await supabase.storage
-                .from('thumbnails')
-                .list('', { limit: LIST_PAGE, offset: listOffset, sortBy: { column: 'name', order: 'asc' } });
-
-            if (listErr || !storageFiles || storageFiles.length === 0) break;
-
-            for (const sf of storageFiles) {
-                if (sf.name.startsWith('custom_')) {
-                    const driveId = sf.name.replace(/^custom_/, '').replace(/\.webp$/, '');
-                    if (driveId) customThumbnailIds.add(driveId);
-                }
-            }
-
-            if (storageFiles.length < LIST_PAGE) break;
-            listOffset += LIST_PAGE;
+    const ids = files.map(f => f.driveFileId);
+    for (let i = 0; i < ids.length; i += 150) {
+        const { data, error } = await supabase
+            .from('assets')
+            .select('drive_file_id')
+            .in('drive_file_id', ids.slice(i, i + 150))
+            .like('thumbnail_url', '%/custom_%');
+        if (error) {
+            logger.warn('thumbnail', 'Custom-thumbnail lookup failed, proceeding without guard', { error: error.message });
+            break;
         }
-    } catch {
-        // Non-fatal — proceed without the guard
-        logger.warn('thumbnail', 'Failed to scan for custom thumbnails, proceeding without guard');
+        for (const row of data ?? []) customThumbnailIds.add(row.drive_file_id);
     }
 
     // Filter out files that already have a custom thumbnail
@@ -211,7 +190,14 @@ export async function processThumbnails(
                         return { driveFileId: file.driveFileId, publicUrl: null, error: 'Download failed' };
                     }
 
-                    const publicUrl = await uploadToStorage(supabase, file.driveFileId, buffer);
+                    // Normalize to a real, bounded WebP — the fallback above can
+                    // return a full-resolution original.
+                    const webp = await encodeThumbnail(buffer);
+                    if (!webp) {
+                        return { driveFileId: file.driveFileId, publicUrl: null, error: 'Undecodable image' };
+                    }
+
+                    const publicUrl = await uploadToStorage(supabase, file.driveFileId, webp);
                     return { driveFileId: file.driveFileId, publicUrl };
                 } catch (err) {
                     const msg = err instanceof Error ? err.message : 'Unknown error';

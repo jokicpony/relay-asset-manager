@@ -2,6 +2,7 @@
 
 import type { SchemaField, Dropdowns } from '@/lib/namer/types';
 import NamerSelect from './NamerSelect';
+import { sanitizeNameToken } from '@/lib/namer/name-token';
 
 interface NamingBuilderProps {
     fields: SchemaField[];
@@ -23,7 +24,7 @@ export default function NamingBuilder({ fields, onChange, dropdowns, counter, on
         if (field.type === 'counter') {
             previewSegments.push({ text: String(counter).padStart(3, '0'), filled: true });
         } else if (field.value) {
-            previewSegments.push({ text: field.value, filled: true });
+            previewSegments.push({ text: sanitizeNameToken(field.value), filled: true });
         } else {
             previewSegments.push({ text: `[${field.label}]`, filled: false });
         }
@@ -39,9 +40,12 @@ export default function NamingBuilder({ fields, onChange, dropdowns, counter, on
                 marginBottom: '20px',
             }}>
                 {fields.map((field, i) => {
+                    const isConstant = field.type === 'constant';
                     const isRequired = field.required !== false;
                     const isOptional = field.required === false;
-                    const borderAccent = isRequired ? 'var(--ram-accent)' : 'var(--ram-teal)';
+                    const borderAccent = isConstant
+                        ? 'var(--ram-text-tertiary)'
+                        : isRequired ? 'var(--ram-accent)' : 'var(--ram-teal)';
 
                     return (
                         <div
@@ -100,17 +104,44 @@ export default function NamingBuilder({ fields, onChange, dropdowns, counter, on
                                     fontWeight: 700,
                                     padding: '1px 5px',
                                     borderRadius: '3px',
-                                    background: isRequired ? 'rgba(232, 160, 72, 0.15)' : 'rgba(45, 212, 191, 0.15)',
-                                    color: isRequired ? 'var(--ram-accent)' : 'var(--ram-teal)',
+                                    background: isConstant
+                                        ? 'rgba(255, 255, 255, 0.06)'
+                                        : isRequired ? 'rgba(232, 160, 72, 0.15)' : 'rgba(45, 212, 191, 0.15)',
+                                    color: isConstant
+                                        ? 'var(--ram-text-tertiary)'
+                                        : isRequired ? 'var(--ram-accent)' : 'var(--ram-teal)',
                                     textTransform: 'uppercase',
                                 }}>
-                                    {isOptional ? 'OPT' : 'REQ'}
+                                    {isConstant ? 'FIXED' : isOptional ? 'OPT' : 'REQ'}
                                 </span>
                             </div>
 
                             {/* Field input — pushed to bottom for alignment */}
                             <div style={{ marginTop: 'auto' }}>
-                            {field.type === 'counter' ? (
+                            {isConstant ? (
+                                <div
+                                    title="Fixed value — change it in Settings"
+                                    style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '6px',
+                                        padding: '5px 8px',
+                                        borderRadius: '5px',
+                                        border: '1px solid var(--ram-border)',
+                                        background: 'var(--ram-bg-primary)',
+                                        color: field.value ? 'var(--ram-text-secondary)' : 'var(--ram-text-tertiary)',
+                                        fontSize: '12px',
+                                        fontFamily: 'monospace',
+                                        opacity: 0.8,
+                                        cursor: 'default',
+                                    }}
+                                >
+                                    <span style={{ fontSize: '10px' }}>🔒</span>
+                                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        {field.value || 'Not set'}
+                                    </span>
+                                </div>
+                            ) : field.type === 'counter' ? (
                                 <input
                                     type="number"
                                     min={1}

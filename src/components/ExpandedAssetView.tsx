@@ -95,7 +95,10 @@ export default function ExpandedAssetView({
         }, 800);
     }, [isQueued, onDownload, downloadFeedback, asset]);
 
-    // Preload video on expand — start fetching immediately
+    // Attach the stream on expand with preload="metadata" (dimensions/duration
+    // only). Full buffering starts on play intent — hovering the poster —
+    // rather than on open: every open used to pull the original through the
+    // serverless stream proxy, even when arrowing past videos.
     useEffect(() => {
         if (!isVideo || !asset.driveFileId) return;
 
@@ -136,7 +139,16 @@ export default function ExpandedAssetView({
                 videoRef.current?.play();
             }, 50);
         } else {
-            // Video still loading — show spinner, will auto-play when ready
+            // Video still loading — show spinner, will auto-play when ready.
+            // Upgrade preload in case there was no hover (keyboard/touch), and
+            // call play() — the one call every browser treats as "load now"
+            // (WebKit may not resume loading on a preload change alone, which
+            // would leave the spinner up waiting for canplay).
+            const video = videoRef.current;
+            if (video) {
+                video.preload = 'auto';
+                video.play().catch(() => { /* canplay effect retries */ });
+            }
             setWantPlay(true);
         }
     };
@@ -289,7 +301,7 @@ export default function ExpandedAssetView({
                         {isVideo && (
                             <video
                                 ref={videoRef}
-                                preload="auto"
+                                preload="metadata"
                                 onEnded={handleVideoEnd}
                                 className={playing ? `rounded-lg ${isLandscape ? 'w-full' : 'h-full'}` : 'hidden'}
                                 style={playing ? { maxHeight: '60vh', maxWidth: '100%', background: '#000' } : { display: 'none' }}
@@ -302,6 +314,10 @@ export default function ExpandedAssetView({
                                 <div
                                     className="relative cursor-pointer group"
                                     onClick={handlePlay}
+                                    onPointerEnter={() => {
+                                        // Play intent: start buffering now so a click plays promptly
+                                        if (videoRef.current) videoRef.current.preload = 'auto';
+                                    }}
                                     style={{ maxHeight: '60vh' }}
                                 >
                                     <Image

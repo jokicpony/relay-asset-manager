@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
-import { createClient as createServiceClient } from '@supabase/supabase-js';
+import { getAdminClient } from '@/lib/supabase/admin';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { isInSharedDrive } from '@/lib/google/drive-scope';
 import { resolveFolderPathById } from '@/lib/google/folder-path';
@@ -24,6 +24,11 @@ import { logger } from '@/lib/logger';
  * shortcut rows always carry the full canonical path, regardless of how the
  * client built its breadcrumb.
  */
+export const maxDuration = 120;
+
+const MAX_ASSETS_PER_RELAY = 500;
+const RELAY_CONCURRENCY = 5;
+
 export async function POST(request: NextRequest) {
     try {
         const { assets, targetFolderId } = await request.json() as {
@@ -31,8 +36,14 @@ export async function POST(request: NextRequest) {
             targetFolderId: string;
         };
 
-        if (!assets || assets.length === 0) {
+        if (!Array.isArray(assets) || assets.length === 0) {
             return NextResponse.json({ error: 'No assets specified' }, { status: 400 });
+        }
+        if (assets.length > MAX_ASSETS_PER_RELAY) {
+            return NextResponse.json(
+                { error: `Relay at most ${MAX_ASSETS_PER_RELAY} assets at a time` },
+                { status: 400 }
+            );
         }
         if (!targetFolderId) {
             return NextResponse.json({ error: 'No target folder specified' }, { status: 400 });
@@ -51,10 +62,7 @@ export async function POST(request: NextRequest) {
         // Shortcut rows are written with the service role — RLS allows only
         // service-role writes to the shortcuts table; the user client above is
         // used only for the auth check.
-        const admin = createServiceClient(
-            process.env.NEXT_PUBLIC_SUPABASE_URL!,
-            process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-        );
+        const admin = getAdminClient();
 
         // Authorization: the target folder must live in the configured shared
         // drive — the service account may reach other drives, but shortcuts
@@ -70,14 +78,20 @@ export async function POST(request: NextRequest) {
         // Authorization: only shortcut files that exist as active library
         // assets. Resolve the asset UUID server-side from drive_file_id —
         // never trust the client-supplied assetId (confused-deputy / IDOR).
-        const { data: assetRows } = await admin
-            .from('assets')
-            .select('id, drive_file_id')
-            .in('drive_file_id', assets.map((a) => a.driveFileId))
-            .eq('is_active', true);
-        const assetIdByDriveId = new Map(
-            (assetRows ?? []).map((r) => [r.drive_file_id, r.id])
-        );
+        // (Batched: long .in() lists overflow URL limits.)
+        const assetIdByDriveId = new Map<string, string>();
+        const driveIds = assets.map((a) => a.driveFileId);
+        for (let i = 0; i < driveIds.length; i += 150) {
+            const { data: assetRows, error: lookupErr } = await admin
+                .from('assets')
+                .select('id, drive_file_id')
+                .in('drive_file_id', driveIds.slice(i, i + 150))
+                .eq('is_active', true);
+            if (lookupErr) {
+                return NextResponse.json({ error: 'Failed to verify assets' }, { status: 500 });
+            }
+            for (const r of assetRows ?? []) assetIdByDriveId.set(r.drive_file_id, r.id);
+        }
 
         // Resolve the canonical folder path from the Drive folder ID. This is
         // the source-of-truth value written into shortcuts.project_folder_path —
@@ -95,13 +109,12 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        const results: { name: string; success: boolean; shortcutId?: string; error?: string }[] = [];
+        type RelayResult = { name: string; success: boolean; shortcutId?: string; error?: string };
 
-        for (const asset of assets) {
+        const relayOne = async (asset: typeof assets[number]): Promise<RelayResult> => {
             const libraryAssetId = assetIdByDriveId.get(asset.driveFileId);
             if (!libraryAssetId) {
-                results.push({ name: asset.name, success: false, error: 'Not an active library asset' });
-                continue;
+                return { name: asset.name, success: false, error: 'Not an active library asset' };
             }
             try {
                 // Create the Google Drive shortcut
@@ -124,8 +137,7 @@ export async function POST(request: NextRequest) {
                 if (!res.ok) {
                     const errData = await res.json().catch(() => ({}));
                     const msg = errData?.error?.message || `HTTP ${res.status}`;
-                    results.push({ name: asset.name, success: false, error: msg });
-                    continue;
+                    return { name: asset.name, success: false, error: msg };
                 }
 
                 const created = await res.json();
@@ -141,19 +153,38 @@ export async function POST(request: NextRequest) {
                     });
 
                 if (dbError) {
-                    logger.warn('shortcut', `DB insert failed for ${asset.name}`, { error: dbError.message });
-                    // Still counts as success — the Drive shortcut was created
+                    // An untracked shortcut can't be undone from the app (the
+                    // delete route only removes tracked shortcuts) and shows no
+                    // relay badge — roll it back and report the failure.
+                    logger.warn('shortcut', `DB insert failed for ${asset.name}; rolling back`, { error: dbError.message });
+                    await fetch(
+                        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(created.id)}?supportsAllDrives=true`,
+                        { method: 'DELETE', headers: { Authorization: `Bearer ${accessToken}` } }
+                    ).catch(() => { /* next sync will pick it up if this fails */ });
+                    return { name: asset.name, success: false, error: 'Could not record relay' };
                 }
 
-                results.push({ name: asset.name, success: true, shortcutId: created.id });
+                return { name: asset.name, success: true, shortcutId: created.id };
             } catch (err) {
-                results.push({
+                return {
                     name: asset.name,
                     success: false,
                     error: err instanceof Error ? err.message : 'Unknown error',
-                });
+                };
             }
-        }
+        };
+
+        // Small bounded pool instead of strictly sequential Drive POSTs, so
+        // large relays finish well inside the function timeout. Results keep
+        // request order.
+        const results: RelayResult[] = new Array(assets.length);
+        let next = 0;
+        await Promise.all(Array.from({ length: Math.min(RELAY_CONCURRENCY, assets.length) }, async () => {
+            while (next < assets.length) {
+                const i = next++;
+                results[i] = await relayOne(assets[i]);
+            }
+        }));
 
         const succeeded = results.filter((r) => r.success).length;
         const failed = results.filter((r) => !r.success).length;

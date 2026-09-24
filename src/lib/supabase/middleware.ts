@@ -58,6 +58,17 @@ export async function updateSession(request: NextRequest) {
         data: { user },
     } = await supabase.auth.getUser();
 
+    // API routes get JSON errors, not a redirect: a 307 to /login made
+    // fetch() follow through to a 200 HTML page, so clients failed with
+    // "Unexpected token <" instead of seeing the 401.
+    const isApi = request.nextUrl.pathname.startsWith('/api/');
+    if (isApi && !user) {
+        return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+    }
+    if (isApi && user && !isAllowedUser(user.email)) {
+        return NextResponse.json({ error: 'Not authorized' }, { status: 403 });
+    }
+
     // If no user and not on the login page, redirect to login
     if (
         !user &&

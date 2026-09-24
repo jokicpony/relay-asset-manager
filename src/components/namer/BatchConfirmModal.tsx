@@ -2,6 +2,7 @@
 
 import type { SchemaField, DriveLabel } from '@/lib/namer/types';
 import { PASSTHROUGH_SCHEMA_KEY } from '@/lib/namer/types';
+import { sanitizeNameToken } from '@/lib/namer/name-token';
 
 interface BatchConfirmModalProps {
     pendingCount: number;
@@ -28,10 +29,10 @@ export default function BatchConfirmModal({
     onConfirm,
     onCancel,
 }: BatchConfirmModalProps) {
-    // Build naming template preview
+    // Build naming template preview (constants ride through on their value)
     const templateParts = schemaFields
         .filter(f => f.value || f.type === 'counter')
-        .map(f => f.type === 'counter' ? '001' : f.value!.replace(/\s+/g, '-'));
+        .map(f => f.type === 'counter' ? '001' : sanitizeNameToken(f.value!));
 
     // Count label field stats
     const selectedLabels = labels.filter(l => selectedLabelIds.includes(l.id));

@@ -210,14 +210,30 @@ export default function NamerSettingsPanel({ settings, onSave, onClose }: NamerS
     const [promptsUnlocked, setPromptsUnlocked] = useState(false);
 
     // ─── Save ─────────────────────────────────────────────────
+    const [saveError, setSaveError] = useState<string | null>(null);
+
     const handleSave = async () => {
+        // A Fixed value field with no value would block every batch of that
+        // asset type (it's required and not editable in the builder).
+        for (const [schemaName, schema] of Object.entries(schemas)) {
+            const empty = schema.fields.find(f => f.type === 'constant' && !f.value?.trim());
+            if (empty) {
+                setSaveError(`"${empty.label || 'Fixed value'}" in ${displayName(schemaName)} needs a value`);
+                return;
+            }
+        }
+
         setSaving(true);
+        setSaveError(null);
         try {
             await onSave({
                 schemas,
                 dropdowns,
                 aiSettings,
             });
+            onClose();
+        } catch (err) {
+            setSaveError(err instanceof Error ? err.message : 'Save failed');
         } finally {
             setSaving(false);
         }
@@ -556,6 +572,10 @@ export default function NamerSettingsPanel({ settings, onSave, onClose }: NamerS
                                                                     const updates: Partial<SchemaField> = { type: newType };
                                                                     // Clear source if switching away from select
                                                                     if (newType !== 'select') updates.source = undefined;
+                                                                    // Constants always fill, so they're always required
+                                                                    if (newType === 'constant') updates.required = true;
+                                                                    // Don't carry a fixed value over as a hidden default
+                                                                    if (field.type === 'constant' && newType !== 'constant') updates.value = '';
                                                                     updateField(name, idx, updates);
                                                                 }}
                                                                 disabled={field.frozen}
@@ -573,18 +593,37 @@ export default function NamerSettingsPanel({ settings, onSave, onClose }: NamerS
                                                                 <option value="select">Dropdown</option>
                                                                 <option value="date">Date</option>
                                                                 <option value="counter">Counter</option>
+                                                                <option value="constant">Fixed value</option>
                                                             </select>
 
                                                             {/* Required toggle */}
                                                             <div style={{ display: 'flex', justifyContent: 'center' }}>
-                                                                <Toggle
-                                                                    checked={field.required}
-                                                                    onChange={checked => updateField(name, idx, { required: checked })}
-                                                                />
+                                                                {field.type === 'constant' ? (
+                                                                    <span style={{ fontSize: '9px', color: 'var(--ram-text-tertiary)' }} title="Fixed values are always included">Always</span>
+                                                                ) : (
+                                                                    <Toggle
+                                                                        checked={field.required}
+                                                                        onChange={checked => updateField(name, idx, { required: checked })}
+                                                                    />
+                                                                )}
                                                             </div>
 
-                                                            {/* Source dropdown (only for select type) */}
-                                                            {field.type === 'select' ? (
+                                                            {/* Source column: dropdown category for select, fixed value for constant */}
+                                                            {field.type === 'constant' ? (
+                                                                <input
+                                                                    value={field.value}
+                                                                    onChange={e => updateField(name, idx, { value: e.target.value })}
+                                                                    placeholder="Fixed value…"
+                                                                    style={{
+                                                                        fontSize: '11px',
+                                                                        padding: '4px 8px',
+                                                                        borderRadius: '4px',
+                                                                        background: 'var(--ram-bg-primary)',
+                                                                        color: 'var(--ram-text-primary)',
+                                                                        border: `1px solid ${field.value ? 'var(--ram-border)' : 'rgba(248, 113, 113, 0.5)'}`,
+                                                                    }}
+                                                                />
+                                                            ) : field.type === 'select' ? (
                                                                 <select
                                                                     value={field.source || ''}
                                                                     onChange={e => updateField(name, idx, { source: e.target.value || undefined })}
@@ -935,6 +974,11 @@ export default function NamerSettingsPanel({ settings, onSave, onClose }: NamerS
                     padding: '12px 24px',
                     borderTop: '1px solid var(--ram-border)',
                 }}>
+                    {saveError && (
+                        <span style={{ fontSize: '12px', color: 'var(--ram-red, #f87171)', marginRight: 'auto' }}>
+                            {saveError}
+                        </span>
+                    )}
                     <button
                         onClick={onClose}
                         style={{

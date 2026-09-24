@@ -1,11 +1,6 @@
 import { NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
 import { createClient as createServerClient } from '@/lib/supabase/server';
-
-const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
+import { getAdminClient } from '@/lib/supabase/admin';
 
 export async function GET() {
     // Auth check — require authenticated session
@@ -16,6 +11,8 @@ export async function GET() {
     }
 
     try {
+        const supabase = getAdminClient();
+
         // All queries are independent — run them concurrently
         const [
             { data: latestSync },
@@ -109,7 +106,8 @@ export async function GET() {
                 trashCount: trashCount || 0,
             },
         });
-    } catch (err: any) {
-        return NextResponse.json({ error: err.message }, { status: 500 });
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return NextResponse.json({ error: message }, { status: 500 });
     }
 }

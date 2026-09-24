@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createClient as createServerClient } from '@/lib/supabase/server';
-import { createClient } from '@supabase/supabase-js';
+import { getAdminClient } from '@/lib/supabase/admin';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -163,10 +163,7 @@ export async function GET(request: Request) {
         // Read live sync progress from Supabase (written by scripts/sync.ts)
         let syncProgress: { step: string; detail: string; pct: number | null; updated_at: string } | null = null;
         try {
-            const admin = createClient(
-                process.env.NEXT_PUBLIC_SUPABASE_URL!,
-                process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-            );
+            const admin = getAdminClient();
             const { data } = await admin
                 .from('app_settings')
                 .select('value')

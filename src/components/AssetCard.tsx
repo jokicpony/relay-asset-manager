@@ -10,6 +10,7 @@ import Image from 'next/image';
 
 // Grid row unit must match grid-auto-rows in globals.css
 const ROW_UNIT = 10;
+const CARD_GAP = 12; // must match .masonry-item margin-bottom in globals.css
 
 interface AssetCardProps {
     asset: Asset;
@@ -41,10 +42,9 @@ const AssetCard = memo(function AssetCard({ asset, selected, isExpired, similari
         const estimatedHeight = Math.round(colWidth * ratio);
         // Minimum = 40% of column width so horizontals stay visible
         const minHeight = Math.round(colWidth * 0.4);
-        return Math.max(
-            Math.ceil(minHeight / ROW_UNIT),
-            Math.ceil(estimatedHeight / ROW_UNIT)
-        );
+        // The span must also cover .masonry-item's margin-bottom, or every
+        // card loses its bottom CARD_GAP px to overflow clipping.
+        return Math.ceil((Math.max(minHeight, estimatedHeight) + CARD_GAP) / ROW_UNIT);
     }, [asset.width, asset.height, colWidth]);
 
     const handleClick = (e: React.MouseEvent) => {
@@ -117,7 +117,9 @@ const AssetCard = memo(function AssetCard({ asset, selected, isExpired, similari
                 alt={asset.description || asset.name}
                 width={asset.width}
                 height={asset.height}
-                className="w-full h-auto block"
+                // Fill the card: the row span rounds up to 10px units, so a
+                // natural-height image would leave a sliver of background.
+                className="w-full h-full object-cover block"
                 sizes="(max-width: 480px) 100vw, (max-width: 768px) 50vw, (max-width: 1280px) 33vw, 25vw"
                 loading="lazy"
             />

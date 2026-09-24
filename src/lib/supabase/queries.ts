@@ -8,6 +8,10 @@ import { Asset, FolderNode } from '@/types';
 // ---------------------------------------------------------------------------
 export async function fetchAllAssets(options?: { fresh?: boolean }): Promise<Asset[]> {
     const res = await fetch('/api/assets', options?.fresh ? { cache: 'reload' } : undefined);
+    if (res.status === 401 && typeof window !== 'undefined') {
+        // Session expired mid-use — send the user back through sign-in
+        window.location.href = '/login';
+    }
     if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `Failed to fetch assets (${res.status})`);

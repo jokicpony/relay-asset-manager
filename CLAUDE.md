@@ -46,6 +46,7 @@ npm run build      # Production build
 npm run lint       # ESLint check
 npx tsx scripts/sync.ts              # Run sync pipeline
 npx tsx scripts/sync.ts --skip-thumbnails  # Sync without thumbnail processing
+npx tsx scripts/sync.ts --allow-mass-orphan # Let a run trash >max(100, 10%) missing assets
 npx tsx scripts/embed.ts             # Generate embeddings for assets missing them
 npx tsx scripts/embed.ts --force     # Regenerate all embeddings
 ```
@@ -62,7 +63,10 @@ Things that aren't obvious from the code but cost time when forgotten.
 
 - **The folder sidebar tree mixes two sources.** Paths come from `assets.folder_path` (real ingested files) AND virtual entries synthesized from `shortcuts.project_folder_path` in `/api/assets`. A phantom top-level folder usually means a bad path in `shortcuts`, not a sync bug.
 - **Drive folder paths must be derived from `project_folder_drive_id`, never trusted from client-supplied strings.** The folder ID is the gold-standard identifier; path strings are display/cache values that can drift.
-- **`[relay-ignore]` in a folder's Drive description** skips that folder and all descendants during sync.
+- **`[relay-ignore]` in a folder's Drive description** skips that folder and all descendants during sync (the targeted ingest honors it too).
+- **Three trash reasons, two purge behaviors.** `orphaned` (file gone from Drive) and `ignored` (`[relay-ignore]` folder) hard-purge after 14 days. `out-of-scope` (top-level folder removed from `sync_folders`) is exempt from the purge — the Drive files still exist, so rows/embeddings/thumbnails are kept and auto-restore on the next sync if the folder is re-scoped.
+- **The sync refuses to mass-trash.** If one run would mark more than max(100, 10% of active) assets `orphaned`, it skips that soft-delete and logs a `partial` run with an explanation in Settings. The usual cause is a renamed top-level folder: scope is matched by folder *name*, so a rename makes every file under it look deleted. Rename it back (or update `sync_folders`); only use `--allow-mass-orphan` (or the "Allow mass orphan" checkbox on a manual GitHub Actions run) for a real bulk deletion.
+- **Thumbnails are time-boxed per sync** (`SYNC_THUMBNAIL_BUDGET_MIN`, default 15) so a big backlog can't starve the upsert/orphan/embed steps; leftovers are picked up next run. Every stored thumbnail goes through `encodeThumbnail` (`src/lib/sync/thumbnail-encode.ts`) — real WebP, ≤800px — in both the cron and the in-app ingest.
 - **`parseFilename` is shared** — `src/lib/filename-utils.ts` is the single parser used by the app, the namer ingest, and `scripts/sync.ts`. Don't fork it: divergent parsed values trigger mass re-embeds on the next sync (embedding text includes the parsed description).
 
 ### Caching
@@ -71,12 +75,13 @@ Things that aren't obvious from the code but cost time when forgotten.
 
 ### Supabase RLS
 
-- **`assets`, `shortcuts`, and `app_settings` are read-only for the user's anon-key client; all writes are service-role-only.** Authenticated clients get SELECT (the `/api/assets` route reads via the user session); every INSERT/UPDATE/DELETE goes through a server route or the sync pipeline using a service-role client (`createClient` from `@supabase/supabase-js` with `SUPABASE_SERVICE_ROLE_KEY`). Mutating these tables from the browser will be denied by RLS. (Migrations: `supabase/migrations/2026-06-08_lockdown_write_rls.sql`, `2026-06-10_drop_authenticated_thumbnail_upload.sql` — both applied manually in the SQL Editor.)
+- **`assets`, `shortcuts`, and `app_settings` are read-only for the user's anon-key client; all writes are service-role-only.** Authenticated clients get SELECT (the `/api/assets` route reads via the user session); every INSERT/UPDATE/DELETE goes through a server route or the sync pipeline using the service-role client from `getAdminClient()` (`src/lib/supabase/admin.ts`) — use it rather than hand-rolling `createClient`; it throws when the key is missing instead of falling back to the anon key, whose writes silently no-op under RLS. Mutating these tables from the browser will be denied by RLS. (Migrations: `supabase/migrations/2026-06-08_lockdown_write_rls.sql`, `2026-06-10_drop_authenticated_thumbnail_upload.sql` — both applied manually in the SQL Editor.)
 - **Supabase silently no-ops RLS-filtered updates** — no error returned, just zero rows affected. Always chain `.select('id')` after `.update()` if you need to verify rows actually changed.
 
 ### Configuration
 
-- **`?? []` fallback in `src/lib/config.ts` is a trap.** Nullish coalescing only fires on `null`/`undefined`, so a setting saved as `[]` short-circuits the env-var fallback. An empty `sync_folders` list disables filtering entirely (allows every Drive folder).
+- **`?? []` fallback in `src/lib/config.ts` is a trap.** Nullish coalescing only fires on `null`/`undefined`, so a setting saved as `[]` short-circuits the env-var fallback. An empty `sync_folders` list disables filtering entirely (allows every Drive folder). `PUT /api/settings/config` now rejects `[]` for `sync_folders` and an empty `shared_drive_id`, but a direct DB write can still set them.
+- **`getConfig()` fails closed.** It throws on a Supabase error rather than falling back to env vars — an env-only config can have an empty `sharedDriveId`, which turns off the shared-drive scope checks.
 
 ### Auth tiers
 

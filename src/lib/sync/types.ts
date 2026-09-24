@@ -12,6 +12,7 @@ export interface DriveFile {
     description: string | null;
     folderPath: string;
     thumbnailLink: string | null;
+    webViewLink: string | null;
     width: number;
     height: number;
     duration: number | null;

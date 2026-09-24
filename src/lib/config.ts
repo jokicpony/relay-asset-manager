@@ -11,22 +11,11 @@
  *   // config.sharedDriveId, config.syncFolders, config.driveLabelId
  */
 
-import { createClient } from '@supabase/supabase-js';
+import { getAdminClient } from './supabase/admin';
 
-const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
-
-export interface RightsLabelConfig {
-    fieldIds: {
-        organicRights: string;
-        organicExpiration: string;
-        paidRights: string;
-        paidExpiration: string;
-    };
-    choiceMap: Record<string, string>;  // choice ID → 'unlimited' | 'limited' | 'expired'
-}
+// Canonical definition lives with the shared label parser.
+export type { RightsLabelConfig } from './sync/rights-labels';
+import type { RightsLabelConfig } from './sync/rights-labels';
 
 export interface AppConfig {
     sharedDriveId: string;
@@ -44,6 +33,17 @@ export interface AppConfig {
 let _configCache: { value: AppConfig; expires: number } | null = null;
 const CONFIG_TTL_MS = 30_000;
 
+const CONFIG_KEYS = [
+    'shared_drive_id',
+    'sync_folders',
+    'drive_label_id',
+    'namer_label_ids',
+    'semantic_similarity_threshold',
+    'hidden_folders',
+    'namer_auto_ingest_delay_ms',
+    'rights_label_config',
+];
+
 /**
  * Fetch app config from DB with env var fallback.
  * Uses service role key so it works from API routes and the sync script.
@@ -55,18 +55,22 @@ export async function getConfig(): Promise<AppConfig> {
 
     const dbMap = new Map<string, unknown>();
 
-    try {
-        const { data } = await supabase
-            .from('app_settings')
-            .select('key, value');
+    // Fail closed: a DB error must not silently degrade to env-var defaults.
+    // An empty shared_drive_id disables the shared-drive scope check and an
+    // empty sync_folders disables folder filtering, so a transient Supabase
+    // failure would otherwise loosen security for the whole cache window.
+    // Only the keys read below are fetched — app_settings also holds large
+    // blobs (folder_drive_ids, pending ingests) that config doesn't need.
+    const { data, error } = await getAdminClient()
+        .from('app_settings')
+        .select('key, value')
+        .in('key', CONFIG_KEYS);
 
-        if (data) {
-            for (const row of data) {
-                dbMap.set(row.key, row.value);
-            }
-        }
-    } catch {
-        // DB not available — fall through to env vars
+    if (error) {
+        throw new Error(`Failed to load app_settings: ${error.message}`);
+    }
+    for (const row of data ?? []) {
+        dbMap.set(row.key, row.value);
     }
 
     // Parse SYNC_FOLDERS env var (comma-separated string → array)
@@ -128,7 +132,7 @@ export async function updateSetting(
     value: unknown,
     updatedBy?: string
 ): Promise<{ success: boolean; error?: string }> {
-    const { error } = await supabase
+    const { error } = await getAdminClient()
         .from('app_settings')
         .upsert({
             key,

@@ -12,8 +12,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { google } from 'googleapis';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { getConfig } from '@/lib/config';
-import { createClient } from '@supabase/supabase-js';
 import { createClient as createServerClient } from '@/lib/supabase/server';
+import { getAdminClient } from '@/lib/supabase/admin';
 import { logger } from '@/lib/logger';
 
 export const runtime = 'nodejs';
@@ -43,10 +43,7 @@ export async function GET(request: NextRequest) {
         }
 
         // 1. Check the cached folder_drive_ids mapping first (no API call needed)
-        const supabase = createClient(
-            process.env.NEXT_PUBLIC_SUPABASE_URL!,
-            process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-        );
+        const supabase = getAdminClient();
 
         const { data: mappingRow } = await supabase
             .from('app_settings')

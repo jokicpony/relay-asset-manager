@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { createClient } from '@supabase/supabase-js';
 import { createClient as createServerClient } from '@/lib/supabase/server';
+import { getAdminClient } from '@/lib/supabase/admin';
 
 /**
  * GET /api/folders/drive-ids
@@ -16,10 +16,7 @@ export async function GET() {
     }
 
     try {
-        const adminClient = createClient(
-            process.env.NEXT_PUBLIC_SUPABASE_URL!,
-            process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-        );
+        const adminClient = getAdminClient();
 
         const { data, error } = await adminClient
             .from('app_settings')

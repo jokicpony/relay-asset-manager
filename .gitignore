@@ -44,3 +44,6 @@ next-env.d.ts
 # Claude Code — local, per-developer settings (never commit; keep out of the public repo)
 .claude/settings.local.json
 
+
+# thumbnail re-encode backups (scripts/reencode-thumbnails.ts)
+/.thumb-backup/

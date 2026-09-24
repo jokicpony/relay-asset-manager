@@ -1,51 +1,18 @@
-import { createClient } from '@supabase/supabase-js';
 import type { DriveFile } from './types';
-
-/**
- * Create a Supabase admin client (bypasses RLS) for server-side sync operations.
- * Uses the service role key for write access, falling back to anon key.
- */
-function createAdminClient() {
-    return createClient(
-        process.env.NEXT_PUBLIC_SUPABASE_URL!,
-        process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-    );
-}
+import { buildAssetRow } from './asset-row';
+import { getAdminClient } from '@/lib/supabase/admin';
 
 /**
  * Upsert a batch of Drive files into the assets table.
  * Uses drive_file_id as the conflict key for idempotent upserts.
+ * Column mapping lives in buildAssetRow (shared with scripts/sync.ts).
  *
  * @returns Number of rows upserted
  */
 export async function upsertAssets(
-    files: DriveFile[],
-    options?: { preserveExistingThumbnails?: boolean }
+    files: DriveFile[]
 ): Promise<{ upserted: number; errors: string[] }> {
-    const supabase = createAdminClient();
-    const preserveThumbnails = options?.preserveExistingThumbnails ?? false;
-
-    // When preserving thumbnails, look up which assets already have one
-    // so we only set thumbnail_url for genuinely new assets
-    const existingThumbnailIds = new Set<string>();
-    if (preserveThumbnails) {
-        const driveIds = files.map((f) => f.id);
-        // Query in batches of 500 to avoid URL length limits
-        for (let i = 0; i < driveIds.length; i += 500) {
-            const batch = driveIds.slice(i, i + 500);
-            const { data } = await supabase
-                .from('assets')
-                .select('drive_file_id')
-                .in('drive_file_id', batch)
-                .not('thumbnail_url', 'is', null)
-                .not('thumbnail_url', 'like', '%googleusercontent.com%');
-            if (data) {
-                for (const row of data) {
-                    existingThumbnailIds.add(row.drive_file_id);
-                }
-            }
-        }
-    }
+    const supabase = getAdminClient();
 
     const errors: string[] = [];
     let upserted = 0;
@@ -55,51 +22,7 @@ export async function upsertAssets(
 
     for (let i = 0; i < files.length; i += BATCH_SIZE) {
         const batch = files.slice(i, i + BATCH_SIZE);
-
-        const rows = batch.map((file) => {
-            const row: Record<string, unknown> = {
-                drive_file_id: file.id,
-                name: file.name,
-                description: file.description,
-                mime_type: file.mimeType,
-                asset_type: file.assetType,
-                folder_path: file.folderPath,
-                width: file.width,
-                height: file.height,
-                duration: file.duration,
-                parsed_creator: file.parsedCreator,
-                parsed_shoot_date: file.parsedShootDate,
-                parsed_shoot_description: file.parsedShootDescription,
-                is_active: true,
-                drive_created_at: file.createdTime,
-                drive_modified_at: file.modifiedTime,
-                file_size: file.fileSize ?? null,
-                updated_at: new Date().toISOString(),
-            };
-            // Only write rights columns if the caller actually fetched labels.
-            // When labels weren't requested/available, these are null — omit
-            // them so the upsert preserves values set by the overnight sync.
-            const hasRightsData = file.organicRights !== null || file.paidRights !== null
-                || file.organicRightsExpiration !== null || file.paidRightsExpiration !== null;
-            if (hasRightsData) {
-                row.organic_rights = file.organicRights;
-                row.organic_rights_expiration = file.organicRightsExpiration;
-                row.paid_rights = file.paidRights;
-                row.paid_rights_expiration = file.paidRightsExpiration;
-                row.creator = file.creator;
-                row.project_description = file.projectDescription;
-            }
-            // Include thumbnail for new assets; preserve existing permanent URLs.
-            // Never write temporary Google thumbnailLink URLs — they expire and
-            // are low-resolution. Only write actual Supabase Storage URLs.
-            if (!preserveThumbnails || !existingThumbnailIds.has(file.id)) {
-                const isGoogleTempUrl = file.thumbnailLink?.includes('googleusercontent.com');
-                if (file.thumbnailLink && !isGoogleTempUrl) {
-                    row.thumbnail_url = file.thumbnailLink;
-                }
-            }
-            return row;
-        });
+        const rows = batch.map(buildAssetRow);
 
         const { error, count } = await supabase
             .from('assets')
@@ -123,7 +46,7 @@ export async function upsertAssets(
  * Used to determine the `sinceDate` for incremental syncs.
  */
 export async function getLastSyncTimestamp(): Promise<string | null> {
-    const supabase = createAdminClient();
+    const supabase = getAdminClient();
 
     const { data, error } = await supabase
         .from('assets')

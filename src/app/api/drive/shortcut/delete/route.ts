@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
-import { createClient as createServiceClient } from '@supabase/supabase-js';
+import { getAdminClient } from '@/lib/supabase/admin';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { logger } from '@/lib/logger';
 
@@ -35,25 +35,33 @@ export async function DELETE(request: NextRequest) {
         // Shortcut rows are removed with the service role — RLS allows only
         // service-role writes to the shortcuts table; the user client above is
         // used only for the auth check.
-        const admin = createServiceClient(
-            process.env.NEXT_PUBLIC_SUPABASE_URL!,
-            process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-        );
+        const admin = getAdminClient();
 
         // Authorization: only delete Drive files that are tracked shortcuts.
         // The service account can delete anything it can reach, so without this
         // check any authenticated user could delete arbitrary Drive files by ID.
-        const { data: knownRows } = await admin
-            .from('shortcuts')
-            .select('shortcut_drive_id')
-            .in('shortcut_drive_id', shortcutIds);
-        const knownIds = new Set((knownRows ?? []).map((r) => r.shortcut_drive_id));
+        // (A failed lookup must be an error — ignoring it reported every ID as
+        // "Not a tracked shortcut" with a 200. Batched for URL length.)
+        const knownIds = new Set<string>();
+        for (let i = 0; i < shortcutIds.length; i += 150) {
+            const { data: knownRows, error: lookupErr } = await admin
+                .from('shortcuts')
+                .select('shortcut_drive_id')
+                .in('shortcut_drive_id', shortcutIds.slice(i, i + 150));
+            if (lookupErr) {
+                return NextResponse.json({ error: 'Failed to verify shortcuts' }, { status: 500 });
+            }
+            for (const r of knownRows ?? []) knownIds.add(r.shortcut_drive_id);
+        }
 
-        const results: { id: string; success: boolean; error?: string }[] = [];
+        const results: { id: string; success: boolean; untracked?: boolean; error?: string }[] = [];
 
         for (const id of shortcutIds) {
             if (!knownIds.has(id)) {
-                results.push({ id, success: false, error: 'Not a tracked shortcut' });
+                // Nothing is deleted (authorization), but tell the client —
+                // an untracked ID is usually one already removed (by an
+                // earlier undo, the sync's cleanup, or a purged target).
+                results.push({ id, success: false, untracked: true, error: 'Not a tracked shortcut' });
                 continue;
             }
             try {
