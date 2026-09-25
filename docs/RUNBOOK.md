@@ -38,9 +38,14 @@ with `allow_mass_orphan` checked.
 
 ## Assets are missing, or wrongly in the Trash
 
-- Trashed assets stay in Settings → Trash for 14 days and can be restored
-  (out-of-scope ones are kept indefinitely and come back if the folder is
-  re-scoped).
+- Trashed assets stay in Settings → Trash for 14 days and can be restored.
+  Files deleted in Drive, moved out of the synced folders, or moved into a
+  `[relay-ignore]` folder are purged after that. Only assets whose whole
+  top-level folder was removed from Sync Folders in Settings are kept
+  indefinitely (and come back if the folder is re-added).
+- Relays follow the same idea: a relay disappears from Relay within 2 days of
+  its shortcut being deleted or its project folder being moved out of the
+  synced folders. New relays can only target folders inside them.
 - A folder tagged `[relay-ignore]` in its Drive description is excluded with
   everything under it.
 - To see what a sync *would* do without changing anything: run the workflow

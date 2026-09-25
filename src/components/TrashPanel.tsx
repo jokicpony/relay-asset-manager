@@ -10,7 +10,7 @@ export interface TrashItem {
     folder_path: string;
     asset_type: 'photo' | 'video';
     deleted_at: string;
-    deleted_reason: 'orphaned' | 'ignored' | 'out-of-scope' | null;
+    deleted_reason: 'orphaned' | 'ignored' | 'moved-out' | 'out-of-scope' | null;
     daysRemaining: number | null;  // null = exempt from purge (out-of-scope)
 }
 
@@ -53,6 +53,8 @@ export default function TrashPanel({ items, onAction, onClose }: TrashPanelProps
         switch (reason) {
             case 'ignored':
                 return { text: 'In ignored folder', icon: '🚫', color: 'var(--ram-amber, #f59e0b)' };
+            case 'moved-out':
+                return { text: 'Moved out of the library', icon: '↗', color: 'var(--ram-text-tertiary)' };
             case 'out-of-scope':
                 return { text: 'Folder out of sync scope', icon: '📁', color: 'var(--ram-blue, #3b82f6)' };
             case 'orphaned':

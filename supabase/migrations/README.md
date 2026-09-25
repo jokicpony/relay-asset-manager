@@ -23,6 +23,7 @@ fails without them.
 | `2026-09-24_add_thumb_color.sql` | Adds `assets.thumb_color` (placeholder colour); then run `npx tsx scripts/backfill-thumb-colors.ts --apply` | **required** — `/api/assets` selects it |
 | `2026-09-24_sync_logs_source_details.sql` | Adds `sync_logs.source` / `details` (activity log for sync + ingest) | **required** — the sync, ingest and Settings use it |
 | `2026-09-24_asset_list_index.sql` | Index for the asset list's sort order; drops two redundant indexes | — (performance; safe anytime) |
+| `2026-09-24_add_moved_out_deleted_reason.sql` | Adds the `moved-out` trash reason (files moved out of the synced folders; purged after 14 days) | **required** — the sync writes it |
 
 ## Adding a migration
 

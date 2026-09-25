@@ -59,10 +59,13 @@ create table if not exists public.assets (
     -- Gemini embedding (nullable — videos may lack descriptions)
     embedding       vector(768),
 
-    -- Soft delete (14-day trash queue; 'out-of-scope' rows are exempt from
-    -- the purge — the Drive files still exist, only the allowlist changed)
+    -- Soft delete (14-day trash queue). Reasons: 'orphaned' (gone from
+    -- Drive), 'ignored' ([relay-ignore] folder), 'moved-out' (moved out of the
+    -- synced folders) — all purged after 14 days; 'out-of-scope' (its
+    -- top-level folder was removed from Sync Folders) is exempt, since that's
+    -- a config change that can be undone.
     deleted_at      timestamptz default null,
-    deleted_reason  text check (deleted_reason in ('orphaned', 'ignored', 'out-of-scope')),
+    deleted_reason  text check (deleted_reason in ('orphaned', 'ignored', 'out-of-scope', 'moved-out')),
 
     -- Drive timestamps (preserved from Google Drive, separate from Supabase auto-timestamps)
     drive_created_at  timestamptz,

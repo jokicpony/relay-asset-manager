@@ -4,6 +4,7 @@ import { getAdminClient } from '@/lib/supabase/admin';
 import { getDriveAccessToken } from '@/lib/google/auth';
 import { isInSharedDrive, DriveScopeUnavailableError } from '@/lib/google/drive-scope';
 import { resolveFolderPathById } from '@/lib/google/folder-path';
+import { normalizeSyncFolders, isInSyncScope } from '@/lib/sync/scope';
 import { getConfig } from '@/lib/config';
 import { logger } from '@/lib/logger';
 
@@ -96,7 +97,7 @@ export async function POST(request: NextRequest) {
         // Resolve the canonical folder path from the Drive folder ID. This is
         // the source-of-truth value written into shortcuts.project_folder_path —
         // never trust whatever path string the client constructed.
-        const { path: targetFolderPath } = await resolveFolderPathById(
+        const { path: targetFolderPath, ignored: targetIgnored } = await resolveFolderPathById(
             accessToken,
             targetFolderId,
             config.sharedDriveId
@@ -105,6 +106,15 @@ export async function POST(request: NextRequest) {
         if (targetFolderPath === '/unknown') {
             return NextResponse.json(
                 { error: 'Could not resolve target folder path' },
+                { status: 400 }
+            );
+        }
+        // Relays live inside the library: the sync drops shortcut rows outside
+        // the synced folders or under [relay-ignore], so a relay made there
+        // would silently disappear from Relay within days.
+        if (targetIgnored || !isInSyncScope(targetFolderPath, normalizeSyncFolders(config.syncFolders))) {
+            return NextResponse.json(
+                { error: 'Relay into a folder inside the synced library folders (this one is outside them or tagged [relay-ignore])' },
                 { status: 400 }
             );
         }

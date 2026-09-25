@@ -72,7 +72,7 @@ const plan = {
     thumbnailsToGenerate: [] as string[],
     staleThumbnailRepairs: [] as string[],
     assetUpserts: [] as Record<string, unknown>[],
-    softDelete: { orphaned: [] as string[], ignored: [] as string[], 'out-of-scope': [] as string[] },
+    softDelete: { orphaned: [] as string[], ignored: [] as string[], 'moved-out': [] as string[], 'out-of-scope': [] as string[] },
     massOrphanBlocked: 0,
     restore: [] as string[],
     shortcutUpserts: [] as Record<string, string>[],
@@ -736,12 +736,12 @@ async function resolveShortcuts(
     let matched = 0;
     let failed = 0;
     const upsertRows: Record<string, string>[] = [];
-    // "Still exists in Drive" is every shortcut the listing returned — not
-    // just the in-scope ones. Relays can target any folder in the shared
-    // drive (a project folder outside the synced ones is normal); the scope
-    // filter only decides which shortcuts the sync adds by itself. Counting
-    // only in-scope ones marked such relays missing and deleted them.
-    const discoveredShortcutIds = new Set(shortcuts.map((sc) => sc.id));
+    // A relay stays only while its shortcut sits inside the synced folders
+    // and outside [relay-ignore]: deleting a project folder, or moving it out
+    // of the library, removes its relays from Relay (after the grace
+    // period). The relay route only creates relays inside the synced
+    // folders, so nothing made in-app falls outside this rule.
+    const discoveredShortcutIds = new Set(filteredShortcuts.map((sc) => sc.id));
 
     for (const sc of filteredShortcuts) {
         const assetId = targetToAssetId.get(sc.targetId);
@@ -1194,20 +1194,24 @@ async function detectOrphans(
     // Find active assets NOT in the Drive crawl set → soft-delete
     const orphanIds: string[] = [];
     const ignoredIds: string[] = [];
+    const movedOutIds: string[] = [];
     const outOfScopeIds: string[] = [];
     for (const asset of activeAssets || []) {
         if (crawledIds.has(asset.drive_file_id)) continue;
 
         // The crawl saw the file but skipped it — it still exists in Drive,
-        // it just moved out of scope or into an ignored folder. Classify by
-        // where it is now; the stored folder_path is where it *was*, and
-        // judging by that tagged moved files 'orphaned' (purged in 14 days).
+        // it just moved into an ignored folder or out of the synced folders.
+        // Classify by where it is now (the stored folder_path is where it
+        // *was*). Both are curation decisions and purge after 14 days.
         if (seenIgnored.has(asset.drive_file_id)) {
             ignoredIds.push(asset.id);
             continue;
         }
         if (seenOutOfScope.has(asset.drive_file_id)) {
-            outOfScopeIds.push(asset.id);
+            // Unless its old top-level folder was itself removed from Sync
+            // Folders — that's a settings change (kept, see below), not a move
+            if (isInSyncScope(asset.folder_path, SYNC_FOLDERS)) movedOutIds.push(asset.id);
+            else outOfScopeIds.push(asset.id);
             continue;
         }
 
@@ -1243,24 +1247,27 @@ async function detectOrphans(
     // the upsert just wrote — it's essentially the orphan candidates alone.
     const librarySize = crawledIds.size + activeAssets.filter(a => !crawledIds.has(a.drive_file_id)).length;
     const orphanLimit = Math.max(MASS_ORPHAN_MIN, Math.floor(librarySize * MASS_ORPHAN_FRACTION));
-    // Both reasons end in a hard purge after 14 days, and [relay-ignore] is a
-    // description tag any Drive editor can type — so a mistaken tag on a big
-    // folder is throttled the same way. (out-of-scope rows are never purged.)
-    const purgeBound = orphanIds.length + ignoredIds.length;
+    // Every reason here ends in a hard purge after 14 days. A renamed synced
+    // top-level folder makes all its files look "moved out", and
+    // [relay-ignore] is a description tag any Drive editor can type — so all
+    // three are throttled together. (out-of-scope rows are never purged.)
+    const purgeBound = orphanIds.length + ignoredIds.length + movedOutIds.length;
     let massOrphanBlocked = 0;
     if (purgeBound > orphanLimit && !ALLOW_MASS_ORPHAN) {
         massOrphanBlocked = purgeBound;
-        log(`  🛑 ${purgeBound} assets would be trashed (${orphanIds.length} orphaned, ${ignoredIds.length} [relay-ignore]; limit ${orphanLimit}) — skipping.`);
-        log('     Likely a renamed/moved top-level folder, a [relay-ignore] tag on a large folder, or an incomplete Drive listing.');
+        log(`  🛑 ${purgeBound} assets would be trashed (${orphanIds.length} gone from Drive, ${movedOutIds.length} moved out, ${ignoredIds.length} [relay-ignore]; limit ${orphanLimit}) — skipping.`);
+        log('     Likely a renamed top-level folder, a large folder moved or tagged [relay-ignore], or an incomplete Drive listing.');
         log('     If this is intended, re-run with --allow-mass-orphan.');
         orphanIds.length = 0;
         ignoredIds.length = 0;
+        movedOutIds.length = 0;
     }
     plan.massOrphanBlocked = massOrphanBlocked;
 
     const allDeleteIds = [
         ...orphanIds.map(id => ({ id, reason: 'orphaned' as const })),
         ...ignoredIds.map(id => ({ id, reason: 'ignored' as const })),
+        ...movedOutIds.map(id => ({ id, reason: 'moved-out' as const })),
         ...outOfScopeIds.map(id => ({ id, reason: 'out-of-scope' as const })),
     ];
 
@@ -1273,7 +1280,7 @@ async function detectOrphans(
         for (let i = 0; i < allDeleteIds.length; i += BATCH) {
             const batch = allDeleteIds.slice(i, i + BATCH);
             // Group by reason for correct tagging
-            for (const reason of ['orphaned', 'ignored', 'out-of-scope'] as const) {
+            for (const reason of ['orphaned', 'ignored', 'moved-out', 'out-of-scope'] as const) {
                 const ids = batch.filter(b => b.reason === reason).map(b => b.id);
                 if (ids.length === 0) continue;
                 const { data, error } = await supabase.from('assets')
@@ -1296,7 +1303,7 @@ async function detectOrphans(
                 }
             }
         }
-        log(`  🗑️  Soft-deleted ${softDeleted} assets (${orphanIds.length} orphaned, ${ignoredIds.length} in ignored folders, ${outOfScopeIds.length} out of sync scope)`);
+        log(`  🗑️  Soft-deleted ${softDeleted} assets (${orphanIds.length} gone from Drive, ${movedOutIds.length} moved out, ${ignoredIds.length} in ignored folders, ${outOfScopeIds.length} out of sync scope)`);
     }
 
     // Check for previously soft-deleted assets that are back in Drive → restore (paginated)
