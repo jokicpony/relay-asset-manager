@@ -40,5 +40,5 @@ test('large single files hand off to Google Drive\'s own download URL', () => {
     assert.equal(url.searchParams.get('id'), '1AbCdEfGhIjKlMnOpQrStUvWxYz012345');
     assert.equal(url.searchParams.get('export'), 'download');
     assert.equal(url.searchParams.get('confirm'), 't');
-    assert.equal(DIRECT_DRIVE_DOWNLOAD_BYTES, 100 * 1024 * 1024);
+    assert.equal(DIRECT_DRIVE_DOWNLOAD_BYTES, 1024 * 1024 * 1024); // only genuinely big files leave Relay
 });

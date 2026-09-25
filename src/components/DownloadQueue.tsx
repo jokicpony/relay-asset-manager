@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import type { DownloadPreflightResponse, SkippedDownloadFile } from '@/lib/download/shared';
-import { DIRECT_DRIVE_DOWNLOAD_BYTES, driveDirectDownloadUrl } from '@/lib/download/shared';
+import { DIRECT_DRIVE_DOWNLOAD_BYTES, DRIVE_FALLBACK_HINT_BYTES, driveDirectDownloadUrl } from '@/lib/download/shared';
 
 // ─── Types ───────────────────────────────────────────────────────
 // 'complete' / 'partial' mean "handed to the browser's download manager" —
@@ -26,8 +26,10 @@ export interface DownloadItem {
     driveFileIds: string[];
     /** Files left out of the download, with the server's reason */
     skipped?: SkippedDownloadFile[];
-    /** Set when a large file was handed to Google Drive's own download */
+    /** Set when a very large file was handed to Google Drive's own download */
     directUrl?: string;
+    /** Fail-safe Drive download link for a large file that went through Relay */
+    fallbackUrl?: string;
 }
 
 /** How long the hidden download frame lingers — long enough for the browser
@@ -198,10 +200,10 @@ export function useDownloadQueue(onAuthError?: () => void) {
                     }
 
                     if (ready.length === 1 && totalBytes >= DIRECT_DRIVE_DOWNLOAD_BYTES) {
-                        // ── Large single file: download straight from Google
-                        // Drive (full speed, no server time limit). A new tab
-                        // opened after the preflight can be popup-blocked, so
-                        // the row also offers the link (see DownloadRow). ──
+                        // ── Very large single file (≥ 1 GiB): Relay's server
+                        // could hit its time limit, so download straight from
+                        // Google Drive. A new tab opened after the preflight
+                        // can be popup-blocked, so the row also offers the link. ──
                         const directUrl = driveDirectDownloadUrl(ready[0].driveFileId);
                         window.open(directUrl, '_blank', 'noopener');
                         update({ status: 'complete', directUrl, completedAt: Date.now() });
@@ -226,10 +228,14 @@ export function useDownloadQueue(onAuthError?: () => void) {
                     }
 
                     // Honest status: handed to the browser, and flagged partial
-                    // when anything was left out
+                    // when anything was left out. Large relayed single files
+                    // get a fail-safe Drive link in case the download stalls.
                     update({
                         status: skipped.length > 0 ? 'partial' : 'complete',
                         skipped,
+                        fallbackUrl: ready.length === 1 && totalBytes >= DRIVE_FALLBACK_HINT_BYTES
+                            ? driveDirectDownloadUrl(ready[0].driveFileId)
+                            : undefined,
                         completedAt: Date.now(),
                     });
                 } catch (err) {
@@ -510,7 +516,7 @@ function DownloadRow({ item, onReconnect }: { item: DownloadItem; onReconnect?: 
                         )}
                         {item.status === 'complete' && item.directUrl && (
                             <span>
-                                Large file — downloading from Google Drive ·{' '}
+                                Very large file — downloading from Google Drive ·{' '}
                                 <a
                                     href={item.directUrl}
                                     target="_blank"
@@ -522,7 +528,25 @@ function DownloadRow({ item, onReconnect }: { item: DownloadItem; onReconnect?: 
                                 </a>
                             </span>
                         )}
-                        {item.status === 'complete' && !item.directUrl && `Sent to browser downloads${elapsed ? ` · ${elapsed}` : ''}`}
+                        {item.status === 'complete' && !item.directUrl && (
+                            <span>
+                                {`Sent to browser downloads${elapsed ? ` · ${elapsed}` : ''}`}
+                                {item.fallbackUrl && (
+                                    <>
+                                        {' · '}
+                                        <a
+                                            href={item.fallbackUrl}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            onClick={(e) => e.stopPropagation()}
+                                            style={{ color: 'var(--ram-accent)', textDecoration: 'underline', fontWeight: 600 }}
+                                        >
+                                            Stalled? Download from Drive ↗
+                                        </a>
+                                    </>
+                                )}
+                            </span>
+                        )}
                         {item.status === 'partial' && (
                             <span style={{ color: 'var(--ram-amber, #f59e0b)' }}>
                                 Sent to browser · {skipped.length} of {item.fileCount} skipped
