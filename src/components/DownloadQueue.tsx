@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import type { DownloadPreflightResponse, SkippedDownloadFile } from '@/lib/download/shared';
+import { DIRECT_DRIVE_DOWNLOAD_BYTES, driveDirectDownloadUrl } from '@/lib/download/shared';
 
 // ─── Types ───────────────────────────────────────────────────────
 // 'complete' / 'partial' mean "handed to the browser's download manager" —
@@ -25,6 +26,8 @@ export interface DownloadItem {
     driveFileIds: string[];
     /** Files left out of the download, with the server's reason */
     skipped?: SkippedDownloadFile[];
+    /** Set when a large file was handed to Google Drive's own download */
+    directUrl?: string;
 }
 
 /** How long the hidden download frame lingers — long enough for the browser
@@ -180,7 +183,7 @@ export function useDownloadQueue(onAuthError?: () => void) {
                         throw err;
                     }
 
-                    const { ready, skipped } = await res.json() as DownloadPreflightResponse;
+                    const { ready, skipped, totalBytes } = await res.json() as DownloadPreflightResponse;
 
                     if (ready.length === 0) {
                         update({
@@ -194,7 +197,16 @@ export function useDownloadQueue(onAuthError?: () => void) {
                         return;
                     }
 
-                    if (ready.length === 1) {
+                    if (ready.length === 1 && totalBytes >= DIRECT_DRIVE_DOWNLOAD_BYTES) {
+                        // ── Large single file: download straight from Google
+                        // Drive (full speed, no server time limit). A new tab
+                        // opened after the preflight can be popup-blocked, so
+                        // the row also offers the link (see DownloadRow). ──
+                        const directUrl = driveDirectDownloadUrl(ready[0].driveFileId);
+                        window.open(directUrl, '_blank', 'noopener');
+                        update({ status: 'complete', directUrl, completedAt: Date.now() });
+                        return;
+                    } else if (ready.length === 1) {
                         // ── Single file: browser-native download via GET endpoint ──
                         const file = ready[0];
                         startNativeDownload(
@@ -496,7 +508,21 @@ function DownloadRow({ item, onReconnect }: { item: DownloadItem; onReconnect?: 
                                 </a>
                             </span>
                         )}
-                        {item.status === 'complete' && `Sent to browser downloads${elapsed ? ` · ${elapsed}` : ''}`}
+                        {item.status === 'complete' && item.directUrl && (
+                            <span>
+                                Large file — downloading from Google Drive ·{' '}
+                                <a
+                                    href={item.directUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={(e) => e.stopPropagation()}
+                                    style={{ color: 'var(--ram-accent)', textDecoration: 'underline', fontWeight: 600 }}
+                                >
+                                    Didn&apos;t start? Download from Drive ↗
+                                </a>
+                            </span>
+                        )}
+                        {item.status === 'complete' && !item.directUrl && `Sent to browser downloads${elapsed ? ` · ${elapsed}` : ''}`}
                         {item.status === 'partial' && (
                             <span style={{ color: 'var(--ram-amber, #f59e0b)' }}>
                                 Sent to browser · {skipped.length} of {item.fileCount} skipped

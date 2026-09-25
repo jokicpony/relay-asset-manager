@@ -31,3 +31,14 @@ test('mapWithConcurrency keeps order and respects the limit', async () => {
     assert.deepEqual(out, [50, 10, 40, 20, 30]);
     assert.ok(peak <= 2);
 });
+
+import { driveDirectDownloadUrl, DIRECT_DRIVE_DOWNLOAD_BYTES } from '../src/lib/download/shared';
+
+test('large single files hand off to Google Drive\'s own download URL', () => {
+    const url = new URL(driveDirectDownloadUrl('1AbCdEfGhIjKlMnOpQrStUvWxYz012345'));
+    assert.equal(url.hostname, 'drive.usercontent.google.com');
+    assert.equal(url.searchParams.get('id'), '1AbCdEfGhIjKlMnOpQrStUvWxYz012345');
+    assert.equal(url.searchParams.get('export'), 'download');
+    assert.equal(url.searchParams.get('confirm'), 't');
+    assert.equal(DIRECT_DRIVE_DOWNLOAD_BYTES, 100 * 1024 * 1024);
+});

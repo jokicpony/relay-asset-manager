@@ -256,15 +256,9 @@ async function preflight(
         });
     }
 
-    // Everything streams through a function limited to maxDuration, so a
-    // single huge file (e.g. a multi-GB video) would be cut off mid-download
-    // just like an oversized zip — send it to Google Drive instead.
-    if (ready.length === 1 && totalBytes > MAX_ZIP_BYTES) {
-        return NextResponse.json(
-            { error: `This file is ${formatBytes(totalBytes)} — downloads through Relay are limited to ${formatBytes(MAX_ZIP_BYTES)}. Use "Open in Google Drive" to download it.` },
-            { status: 413 }
-        );
-    }
+    // Single files: no cap — large ones are downloaded straight from Google
+    // Drive by the client (see DIRECT_DRIVE_DOWNLOAD_BYTES). Zips stream
+    // through this function, so they are capped.
     if (ready.length > 1 && totalBytes > MAX_ZIP_BYTES) {
         return NextResponse.json(
             { error: `Selection is ${formatBytes(totalBytes)} — zip downloads are limited to ${formatBytes(MAX_ZIP_BYTES)}. Select fewer files or download from Google Drive.` },

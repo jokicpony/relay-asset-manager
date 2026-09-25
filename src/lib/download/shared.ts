@@ -33,6 +33,22 @@ export interface DownloadPreflightResponse {
 // window and fail fast with a clear message instead of a download that dies
 // half-way. Bigger selections should be split or fetched from Drive directly.
 export const MAX_ZIP_FILES = 1000;
+
+/**
+ * Single files at least this large download straight from Google Drive in the
+ * user's own browser session instead of through Relay's server. Relaying
+ * pipes every byte through one serverless function: far slower than Google's
+ * download servers, billed per second, and cut off at the function's time
+ * limit (a large video could fail part-way). Every Relay user has access to
+ * the shared drive, so Drive can serve it directly. Relay still runs its
+ * library scope check (the preflight) before handing off.
+ */
+export const DIRECT_DRIVE_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+
+/** Google Drive's own download URL (`confirm=t` skips the "can't scan large file" page). */
+export function driveDirectDownloadUrl(fileId: string): string {
+    return `https://drive.usercontent.google.com/download?id=${encodeURIComponent(fileId)}&export=download&confirm=t`;
+}
 // Drive bodies stream one file at a time; ~1.5 GiB leaves headroom inside the
 // route's 300s limit at realistic Drive throughput (5 GiB would need a
 // sustained ~17 MB/s and gets cut off mid-zip, which the queue can't see).
