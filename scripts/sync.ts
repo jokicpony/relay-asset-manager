@@ -2,18 +2,17 @@
 /**
  * Relay Asset Manager — Standalone Sync Script
  *
- * Usage:  npx tsx scripts/sync.ts
+ * Usage:  npx tsx scripts/sync.ts [--dry-run] [--skip-thumbnails] [--allow-mass-orphan]
  *
- * Prerequisites:
- *   1. Dev server running (npm run dev)
- *   2. Signed in via the browser (Google OAuth)
+ * Runs every 6 hours in GitHub Actions (.github/workflows/daily-sync.yml),
+ * authenticating to Drive as the service account via WIF. Locally it needs
+ * GOOGLE_APPLICATION_CREDENTIALS (ADC) or GOOGLE_REFRESH_TOKEN, plus the
+ * Supabase service-role key in .env.local.
  *
- * This script:
- *   1. Grabs your Google token from the running dev server session
- *   2. Crawls the Shared Drive (respecting SYNC_FOLDERS allowlist)
- *   3. Downloads thumbnails → uploads to Supabase Storage
- *   4. Upserts everything to the assets table
- *   5. Shows real-time progress in the terminal
+ * This script crawls the Shared Drive (scoped to the sync folders), makes
+ * thumbnails, upserts the assets table, trashes/restores/purges assets,
+ * records relays (shortcuts), re-embeds changed assets and writes a
+ * sync_logs row. The steps are described in docs/ARCHITECTURE.md.
  */
 
 import * as dotenv from 'dotenv';

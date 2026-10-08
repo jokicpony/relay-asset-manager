@@ -1,292 +1,140 @@
 # Relay Asset Manager
 
-A high-performance visual and semantic layer on top of Google Drive. Browse, search, organize, and distribute creative assets — all synced from your team's Shared Drive.
+A fast visual and semantic layer on top of Google Drive. Browse, search, name
+and distribute a team's photos and videos — without moving them out of their
+Shared Drive.
 
-**Why this exists:** Creative teams store thousands of photos and videos in Google Shared Drives, but Drive's native interface makes it painful to browse visually, search by concept, or manage naming conventions at scale. Relay indexes your Drive into a fast, searchable database with AI-powered semantic search, thumbnail previews, batch renaming, and compliance tracking — without moving your files out of Drive.
+Drive's own interface makes it painful to browse thousands of images visually,
+search by concept, or keep naming consistent. Relay indexes one Shared Drive
+into a database with thumbnails and AI search embeddings, and sends every
+change (rename, relay, download) back to Drive. Drive stays the source of
+truth; Relay never stores the files themselves.
 
-## ✨ Features
+## Features
 
-- **Google Drive Sync** — Automatically indexes photos and videos from your Shared Drive with thumbnail generation, metadata extraction, and folder structure preservation
-- **Semantic Search** — AI-powered search using Gemini embeddings. Find assets by concept ("golden hour camping") instead of exact filenames
-- **Asset Namer** — Batch rename and tag files in Google Drive with configurable naming schemas, AI-assisted metadata, and Drive Label integration
-- **Relay (Shortcuts)** — Create Google Drive shortcuts to organize assets into project folders without duplicating files
-- **Rights & Compliance** — Visual badges showing organic/paid usage rights and expiration dates, pulled from Google Drive Labels
-- **Pinboard** — Pin assets to a session-scoped collection for comparison and bulk actions
-- **Bulk Actions** — Multi-select assets for batch download (individual files or zipped), relay to project folders, or trash
-- **Video Streaming** — Preview videos directly in the browser with adaptive streaming
-- **Shareable URLs** — Filter state (folder, sort, type, orientation) is encoded in the URL for team sharing
+- **Browse** — the Shared Drive's folders as a fast thumbnail grid, with
+  filters (type, orientation, rights) and sort; filter state lives in the URL,
+  so views can be shared.
+- **Semantic search** — find assets by meaning ("golden hour camping"), not
+  just filename, using Gemini multimodal embeddings of each thumbnail plus its
+  name and folder. Falls back to keyword matching.
+- **Asset Namer** — batch rename, file, label and describe new uploads using
+  configurable naming schemas, with optional Gemini image analysis. Results
+  appear in the library within minutes.
+- **Relays** — put an asset into project folders as Drive shortcuts, without
+  duplicating the file.
+- **Rights badges** — organic/paid usage rights and expiry dates, read from a
+  Google Drive Label.
+- **Pinboard, bulk download and relay** — collect assets, download them as
+  individual files or a streamed zip, or relay them in one go.
+- **Video preview** — play videos in the browser, streamed from Drive.
+- **Trash** — assets that leave the library stay restorable for 14 days.
 
-## 🏗 Architecture
+## How it works
 
 ```
-Google Drive (Shared Drive)
-        │
-        ▼
-   Sync Pipeline ──────▶ Supabase (Postgres + pgvector)
-   (API routes)                    │
-        │                          ▼
-        ▼                    Next.js Frontend
-   Supabase Storage         (React 19 + Tailwind)
-   (thumbnails)
-        │
-        ▼
-   Gemini API
-   (embeddings)
+Google Shared Drive ──▶ Daily Sync (GitHub Actions, every 6h) ──▶ Supabase
+        ▲                 metadata, thumbnails, embeddings         │ (database, thumbnails,
+        │                                                          │  sign-in)
+        └── renames, relays, downloads ◀── Next.js app on Vercel ◀─┘
 ```
 
-| Layer | Technology |
-|-------|-----------|
-| Frontend | Next.js 16, React 19, Tailwind CSS 4 |
-| Backend | Next.js API Routes (serverless) |
-| Database | Supabase (Postgres + pgvector for semantic search) |
-| Storage | Supabase Storage (thumbnail cache) |
-| Auth | Supabase Auth with Google OAuth |
-| Drive Access | Google Drive API v3 (user OAuth or WIF service account) |
-| AI | Gemini API (multimodal embeddings + asset analysis) |
-| Hosting | Vercel (or any Node.js host) |
+Next.js 16 · React 19 · Tailwind CSS 4 · Supabase · Google Drive API v3 ·
+Gemini · Vercel · GitHub Actions. All Drive access goes through a Google
+service account with no stored keys (Workload Identity Federation). The full
+picture — the sync's steps, the Namer's ingest, relays, permissions and the
+rules that keep it consistent — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## 🚀 Getting Started
+## What you need
 
-### Prerequisites
+- A **Google Workspace** account with a **Shared Drive** holding the assets
+  (Drive Labels, for rights badges, need a Workspace edition that supports
+  them — optional).
+- A **Google Cloud** project, a **Supabase** project, a **Vercel** account and
+  a **GitHub** repository (your fork). Free tiers are enough to start.
+- A **Gemini API key** for semantic search and Namer analysis — optional.
 
-- **Node.js** 18+
-- **Supabase** project ([create one free](https://supabase.com))
-- **Google Cloud** project with Drive API enabled
-- **Google Shared Drive** containing your asset library
+**[docs/SETUP.md](docs/SETUP.md) walks through building your own instance**,
+start to finish.
 
-> **Detailed walkthrough:** See [docs/SETUP.md](docs/SETUP.md) for step-by-step instructions on configuring Supabase, Google Cloud, Drive Labels, and Vercel.
+## Which folders are in Relay
 
-### 1. Clone & Install
+Relay looks at **one Google Shared Drive**, and inside it only at the
+**top-level folders you list as Sync Folders**. Everything below those folders
+— photos and videos only — is the library. Files anywhere else in the drive
+(other top-level folders, the drive's root) are ignored.
+
+| You want to… | Do this | What happens |
+|---|---|---|
+| Choose what the library is | **Settings → Advanced → Sync Folders**: the names of top-level folders in the Shared Drive (not case-sensitive) | The next sync adds everything under them |
+| Leave out one folder inside the library (drafts, raw files…) | In Google Drive, add `[relay-ignore]` anywhere in that folder's **description** (folder ⓘ → Details → Description) | That folder *and everything under it* is excluded. Assets already in Relay go to the Trash and are **permanently removed after 14 days**; delete the tag before then to bring them back |
+| Keep a folder out of the main view without removing it | Click the **eye icon** next to a top-level folder in the sidebar | Its assets no longer appear in All Folders (browsing or search) but are still there when you open that folder. Applies to everyone |
+| Stop syncing a whole top-level folder | Remove it from **Sync Folders** | Its assets move to the Trash but are **kept indefinitely**, and come back if you add the folder again |
+
+Things to know:
+
+- **Changes take effect on the next sync** (every 6 hours, or Settings → Sync
+  Now).
+- **Moving a file** to another folder inside the library just updates it.
+  Moving it **out** of the synced folders, or deleting it in Drive, sends it to
+  the Trash for 14 days, then removes it. Trashed assets can be restored from
+  Settings → Trash until then.
+- **Don't rename a synced top-level folder** without updating Sync Folders to
+  match: Sync Folders are matched by name, so to Relay a renamed folder looks
+  as if every file in it was deleted. A safety limit stops any sync that would
+  trash more than 100 assets or 10% of the library (whichever is larger) and
+  explains why in Settings → Recent Activity — rename the folder back, or
+  update Sync Folders.
+- **Relays** (shortcuts) can only be created in folders inside the library,
+  and disappear from Relay when the shortcut is deleted or its folder moves out.
+
+## Documentation
+
+| Doc | Read it when |
+|---|---|
+| [docs/SETUP.md](docs/SETUP.md) | Building your own instance |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | You want to understand or change how Relay works |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Running an instance: users, upgrades, fixing a failed sync |
+| [supabase/migrations/README.md](supabase/migrations/README.md) | Upgrading or changing the database |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Sending a change |
+| [CLAUDE.md](CLAUDE.md) | Conventions and gotchas for AI coding agents (useful for people too) |
+
+## Local development
+
+Requires Node.js 22 (what CI uses) and a Supabase project with the schema
+applied ([SETUP.md](docs/SETUP.md) steps 1–2).
 
 ```bash
-git clone https://github.com/jokicpony/relay-asset-manager.git
+git clone https://github.com/<you>/relay-asset-manager.git
 cd relay-asset-manager
 npm install
+cp .env.example .env.local   # Supabase + Google OAuth values; see SETUP.md
+npm run dev                  # http://localhost:3000
 ```
 
-### 2. Set Up Supabase
+Settings (shared drive, sync folders, labels, Namer schemas) live in the
+database and are edited in the app's Settings; env vars are only credentials.
+If `.env.local` points at the same Supabase project as your deployment, local
+writes are real.
 
-1. Create a new project at [supabase.com](https://supabase.com)
-2. Go to **SQL Editor** and run the full schema:
+Drive access locally:
+
+- By default the app uses **your own Google sign-in** (it asks for Drive
+  access when you log in locally), so you see what your account can see.
+- To act as the service account, set `USE_SERVICE_ACCOUNT=true` and log in with
+  `gcloud auth application-default login --impersonate-service-account=<sa-email>`
+  (without the impersonation flag you're still using your personal account).
+- `scripts/sync.ts` only picks those credentials up when
+  `GOOGLE_APPLICATION_CREDENTIALS` is set, and needs the service-role key even
+  for a dry run:
 
 ```bash
-# Copy the contents of supabase/schema.sql and paste into the SQL Editor
+npm run lint && npm test && npx tsc --noEmit    # what CI runs
+GOOGLE_APPLICATION_CREDENTIALS=~/.config/gcloud/application_default_credentials.json \
+  npx tsx scripts/sync.ts --dry-run --dry-run-out=plan.json   # what a sync would change
+npx tsx scripts/embed.ts                        # embed assets missing embeddings (--force: all)
 ```
 
-3. Enable **Google** as an auth provider:
-   - Go to **Authentication → Providers → Google**
-   - Add your Google OAuth client ID and secret
-   - Set the redirect URL to `http://localhost:3000/auth/callback`
-
-### 3. Set Up Google Cloud
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Enable the **Google Drive API**
-3. Create **OAuth 2.0 credentials** (Web application type)
-   - Authorized redirect URI: your Supabase auth callback URL (found in Supabase Dashboard → Auth → URL Configuration)
-4. Note your **Client ID** and **Client Secret**
-
-### 4. Configure Environment
-
-```bash
-cp .env.example .env.local
-```
-
-Edit `.env.local` with your Supabase credentials, Google OAuth keys, and Shared Drive ID. See `.env.example` for detailed descriptions of each variable.
-
-### 5. Run
-
-```bash
-npm run dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) and sign in with Google.
-
-### 6. Initial Sync
-
-After signing in, go to **Settings → Sync** and trigger a manual sync to index your Drive assets. The sync pipeline will:
-
-1. Crawl your configured Shared Drive folders
-2. Extract metadata and generate thumbnails (WebP, ≤800px, with a placeholder colour)
-3. Store everything in Supabase
-4. Generate Gemini embeddings for semantic search (if API key is configured)
-
-Every run — scheduled or in-app — is recorded in **Settings → Recent Activity**,
-with the reason for anything that failed. To see what a sync *would* change
-without writing anything, run `npx tsx scripts/sync.ts --dry-run`.
-
-## 📁 Project Structure
-
-```
-src/
-├── app/
-│   ├── api/                    # Next.js API routes
-│   │   ├── assets/             # Thumbnail serving
-│   │   ├── drive/              # Download, stream, shortcuts, folders
-│   │   ├── namer/              # Asset naming pipeline
-│   │   ├── search/             # Semantic search endpoint
-│   │   ├── settings/           # App configuration
-│   │   ├── sync/               # Drive ↔ Supabase sync pipeline
-│   │   └── trash/              # Soft delete management
-│   ├── auth/                   # OAuth callback handler
-│   ├── login/                  # Login page
-│   └── page.tsx                # Main app (Browse + Namer views)
-├── components/
-│   ├── namer/                  # Asset Namer module (11 components)
-│   ├── ActionBar.tsx           # Bulk action toolbar
-│   ├── AssetCard.tsx           # Grid card with thumbnail
-│   ├── ExpandedAssetView.tsx   # Full-screen asset preview
-│   ├── FolderSidebar.tsx       # Folder tree navigation
-│   ├── SearchBar.tsx           # Search with semantic indicators
-│   └── ...
-├── lib/
-│   ├── google/                 # Drive auth (WIF + OAuth + ADC)
-│   ├── supabase/               # Client, server, middleware helpers
-│   ├── sync/                   # Shared sync engine: scope, Drive retry, file mapping,
-│   │                           #   thumbnails, embeddings (used by the cron sync + in-app ingest)
-│   ├── download/               # Streaming zip downloads
-│   ├── config.ts               # DB-backed app configuration
-│   └── filename-utils.ts       # Filename parsing conventions
-└── types/                      # TypeScript interfaces
-scripts/
-├── sync.ts                     # Full sync (GitHub Actions / CLI); --dry-run to preview
-└── embed.ts                    # Backfill or regenerate embeddings
-supabase/
-├── schema.sql                  # Complete database schema — fresh installs run this
-└── migrations/                 # Upgrades for existing installs (see its README)
-tests/                          # Unit tests (npm test), incl. schema/migration parity
-```
-
-## ⚙️ Configuration
-
-Most operational settings are editable from the **Settings** panel in the UI, which persists to the `app_settings` table. This includes:
-
-| Setting | Description |
-|---------|-------------|
-| Shared Drive ID | The Google Shared Drive to sync from |
-| Sync Folders | Which top-level folders to index |
-| Drive Label ID | Google Drive Label for rights/compliance tracking |
-| Hidden Folders | Folders to exclude from the "All Folders" view |
-| Namer Schemas | Configurable naming templates with field types |
-| Namer Dropdowns | Option lists for select fields in naming schemas |
-| AI Config | Gemini prompts for asset analysis |
-
-Environment variables serve as fallback defaults — see `.env.example` for the complete list.
-
-## 🔌 Optional Features
-
-Relay works out of the box as a Drive browser and asset organizer. The features below are optional and can be enabled as needed.
-
-### Google Drive Labels (Rights & Compliance)
-
-Relay can pull usage rights data from [Google Drive Labels](https://support.google.com/a/answer/9292382) and display visual compliance badges on each asset. This is powerful for teams managing content licensing (e.g., organic vs. paid usage rights with expiration dates).
-
-**To set up:**
-
-1. **Create a Drive Label** in your Google Workspace admin with fields for rights tracking
-2. **Enable the Drive Labels API** in your Google Cloud project
-3. **Configure in Settings → Advanced → Google Drive Labels** — set the label ID, map field IDs, and map choice values to `unlimited` / `limited` / `expired`
-
-See [docs/SETUP.md](docs/SETUP.md#optional-google-drive-labels-rights-tracking) for the recommended label structure and a step-by-step walkthrough.
-
-> **Without Drive Labels:** Everything works fine — assets will show "Not Labeled" badges and the compliance filter will be inactive.
-
-### Semantic Search (Gemini)
-
-Relay uses multimodal Gemini embeddings (768-dimension vectors) stored in pgvector for concept-based search. Users can search by meaning ("golden hour camping") instead of exact filenames.
-
-**How it works:**
-
-The embedding pipeline builds a rich text description for each asset by parsing its filename, folder path, and metadata. Relay recognizes three filename conventions:
-
-- **Date-first** — `YYYYMMDD_Creator_Description_001.jpg` → extracts date, creator, and shoot description
-- **Brand-first** — `$BrandName_Description_$Tag_001.jpg` → extracts brand, description, and tags
-- **Generic** — falls back to the raw filename
-
-These parsed fields are composed into a single embedding string:
-
-```
-[filename] | [shoot_description] | by [creator] | [asset_type] | [folder_path] | [description]
-```
-
-The pipeline then sends both this text and the asset's thumbnail image to `gemini-embedding-2-preview` as a multimodal embedding request. The resulting 768-dimension vector captures both visual and textual meaning — so a photo of a mountain lake gets an embedding that reflects both its filename metadata and what's actually in the image.
-
-**Cross-modal search:** At query time, a text-only embedding is generated for the user's search query and matched against these multimodal document embeddings using pgvector cosine similarity. This means text queries like "red kayak on a lake" can find relevant photos even if the filename says `IMG_4521.jpg`.
-
-**To set up:**
-
-1. **Get a Gemini API key** from [Google AI Studio](https://aistudio.google.com/apikey)
-2. **Set `GEMINI_API_KEY`** in `.env.local`
-3. **Run a sync** — embeddings are generated automatically during the sync pipeline
-4. **Batch generate** — Run `npx tsx scripts/embed.ts` to generate embeddings for existing assets, or `--force` to regenerate all
-
-> **Without Gemini:** Text search still works via client-side keyword matching on filenames, descriptions, and tags.
-
-### Asset Namer
-
-The Namer module provides a batch renaming workflow with configurable naming schemas, dropdown options, and optional AI-powered metadata extraction.
-
-**To set up:**
-
-1. **Configure naming schemas** — Go to Settings and define naming templates with fields like date, creator, product, and auto-incrementing counters
-2. **Add dropdown options** — Populate the select field option lists (photographers, products, etc.)
-3. **Enable AI analysis (optional)** — With a Gemini API key, the Namer can analyze images and suggest metadata (environment, lighting, objects, etc.)
-
-Schemas and dropdowns are stored in the `app_settings` table and fully configurable from the UI.
-
-### GitHub Actions (Automated Sync)
-
-The included workflow (`.github/workflows/daily-sync.yml`) runs the sync pipeline on a cron schedule (every 6 hours by default). It uses Google Cloud Workload Identity Federation for keyless authentication.
-
-**To set up:**
-
-1. **Configure WIF** in your GCP project — create a Workload Identity Pool and Provider for GitHub Actions ([docs](https://github.com/google-github-actions/auth#workload-identity-federation-through-a-service-account))
-2. **Add repository variables** in GitHub (Settings → Secrets and variables → Actions → Variables):
-   - `GCP_PROJECT_NUMBER` — your GCP project number
-   - `GCP_WIF_POOL_ID` — Workload Identity Pool ID
-   - `GCP_WIF_PROVIDER_ID` — Workload Identity Provider ID
-   - `GCP_SERVICE_ACCOUNT_EMAIL` — service account email with Drive access
-3. **Add repository secrets** (same page, Secrets tab):
-   - `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`
-   - `GEMINI_API_KEY` (optional, for semantic search embeddings)
-   > Operational config (Shared Drive ID, sync folders, label ID) is loaded from the database at runtime — configure these in Settings → Advanced.
-
-**Manual runs** (Actions → Daily Sync → Run workflow) offer three options:
-`dry_run` (write nothing; the planned changes are attached to the run as an
-artifact), `skip_thumbnails`, and `allow_mass_orphan` (see below). Runs never
-overlap, and a run that fails, is cancelled or times out is still recorded in
-Settings → Recent Activity.
-
-**Safety limit:** if one run would trash an unusually large number of assets
-(more than 100, or 10% of the library) — typically because a synced top-level
-folder was renamed — the sync skips trashing and records why. If the files
-really were deleted, re-run with `allow_mass_orphan`.
-
-> **Without GitHub Actions:** Run syncs manually from the Settings panel in the UI, or via `npx tsx scripts/sync.ts`.
-
-See [docs/RUNBOOK.md](docs/RUNBOOK.md) for what to do when a sync or ingest fails.
-
-### Access Control (Sign-In Allowlist)
-
-By default, anyone who clears Google sign-in (governed by your OAuth consent screen — see [docs/SETUP.md](docs/SETUP.md#oauth-consent-screen)) can use Relay. To additionally restrict access at the application layer, set either or both:
-
-- `AUTH_ALLOWED_EMAILS` — comma-separated list of allowed email addresses
-- `AUTH_ALLOWED_DOMAINS` — comma-separated list of allowed email domains
-
-When both are empty (the default), no app-level restriction is applied. When set, a signed-in user whose email isn't on the list is redirected to login. It's enforced in middleware as defense-in-depth, independent of your OAuth configuration.
-
-## 🔐 Authentication
-
-Relay supports a 3-tier Google auth strategy:
-
-1. **Production (Vercel)** — Workload Identity Federation via `@vercel/oidc` for keyless service account access to Drive
-2. **Local Testing** — Application Default Credentials via `gcloud auth` with service account impersonation
-3. **Local Dev** — User's Google OAuth token from the Supabase session (zero setup)
-
-## 🤝 Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions, commit conventions, and PR guidelines.
-
-## 📄 License
+## License
 
 [MIT](LICENSE)

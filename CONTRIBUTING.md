@@ -1,80 +1,56 @@
 # Contributing to Relay Asset Manager
 
-Thanks for your interest in contributing! This guide covers how to get set up and submit changes.
+Thanks for your interest. Bug reports, fixes and focused improvements are all
+welcome.
 
-## Prerequisites
+## Getting set up
 
-- **Node.js** 18+
-- **Supabase** project ([create one free](https://supabase.com))
-- **Google Cloud** project with the Drive API enabled
-- **Google Shared Drive** containing assets to index
+You'll need your own instance to test against — at least a Supabase project
+with the schema applied and a Google OAuth client ([docs/SETUP.md](docs/SETUP.md)
+steps 1–3). Then follow "Local development" in the [README](README.md).
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how the pieces connect,
+and [CLAUDE.md](CLAUDE.md) lists the conventions and the gotchas that have
+cost time before — worth a skim whoever (or whatever) is writing the code.
 
-## Local Setup
+## Before you open a PR
 
-1. Fork and clone the repo
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Copy the environment template and fill in your credentials:
-   ```bash
-   cp .env.example .env.local
-   ```
-   See `.env.example` for detailed descriptions of each variable.
-4. Set up Supabase by running `supabase/schema.sql` in your project's SQL Editor.
-5. Start the dev server:
-   ```bash
-   npm run dev
-   ```
+CI runs these on every push and PR; please run them locally first:
 
-## Commit Conventions
+```bash
+npm run lint
+npm test
+npx tsc --noEmit
+```
 
-Follow the existing commit style visible in `git log`:
+(`npm run build` needs real environment variables, so CI doesn't run it.)
 
-| Prefix | Use for |
-|--------|---------|
-| `feat:` | New features |
-| `fix:` | Bug fixes |
-| `ui:` | Visual/UX changes |
-| `refactor:` | Code restructuring (no behavior change) |
-| `docs:` | Documentation only |
-| `chore:` | Build, tooling, dependency updates |
+Depending on what you touched:
 
-Keep commit messages concise (under 72 chars for the subject line). Use the body for context when the "why" isn't obvious.
+- **Database:** add an idempotent file to `supabase/migrations/` *and* make the
+  same change in `supabase/schema.sql`, with a row in
+  [`supabase/migrations/README.md`](supabase/migrations/README.md). `npm test`
+  fails if a fresh install and an upgrade don't match.
+- **Sync behaviour:** run `scripts/sync.ts --dry-run --dry-run-out=before.json`
+  on `main` and the same on your branch, and diff the two plans. Every
+  difference should be intended; refactors should produce identical plans.
+- **Anything the sync and the app both do** (scope, filename parsing,
+  thumbnails, embeddings): change the shared module in `src/lib/sync/` or
+  `src/lib/filename-utils.ts`, never a copy.
+- **Behaviour described in the docs:** update the README, `docs/` or
+  `CLAUDE.md` in the same PR.
 
-## Pull Requests
+## Pull requests
 
-1. Create a feature branch from `main`
-2. Make your changes with clear, focused commits
-3. Run `npm run build` to verify the build passes
-4. Open a PR against `main` with:
-   - A short description of what changed and why
-   - Screenshots for UI changes
-   - Any setup steps reviewers need to test locally
+- Branch from `main`; keep each PR to one concern.
+- Describe what changed and why, how you tested it, and include screenshots for
+  UI changes and any migration an upgrader must apply.
+- Commit subjects start with `feat:`, `fix:`, `ui:`, `refactor:`, `docs:` or
+  `chore:`, under 72 characters.
 
-Keep PRs focused on a single concern. If you're fixing a bug and notice a nearby refactoring opportunity, submit them as separate PRs.
+## Reporting issues
 
-## Code Style
-
-- TypeScript strict mode is enabled
-- ESLint is configured — run `npm run lint` to check
-- Unit tests: `npm test` (lint, `npx tsc --noEmit` and tests all run in CI)
-- Database changes: add an idempotent file to `supabase/migrations/` *and* update
-  `supabase/schema.sql` — see `supabase/migrations/README.md`; `npm test` checks the two agree
-- Sync changes: compare `npx tsx scripts/sync.ts --dry-run --dry-run-out=before.json` against the
-  same run on your branch before merging
-- CSS variables use the `--ram-` prefix (defined in `src/app/globals.css`)
-- Tailwind CSS 4 for utility classes
-- No external state management library — plain React hooks
-
-## Reporting Issues
-
-Open a GitHub issue with:
-- What you expected to happen
-- What actually happened
-- Steps to reproduce
-- Browser/OS if relevant
-
-## Questions?
-
-Open a discussion or issue — happy to help you get oriented in the codebase.
+Open an issue with what you expected, what happened, and steps to reproduce.
+For sync problems, the Settings → Recent Activity entry (and the GitHub
+Actions log it links to) usually says what went wrong — include it, with any
+IDs or keys removed. Security problems go to [SECURITY.md](SECURITY.md), not
+an issue.

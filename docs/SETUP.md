@@ -1,154 +1,178 @@
-# Setup Guide
+# Setup — building your own instance
 
-This walks through connecting Relay to its external services: Supabase, Google Cloud, and optionally Gemini and Drive Labels. Most steps involve creating accounts and copying IDs into your `.env.local` file.
+This walks through standing up Relay on your own accounts: Supabase (database,
+thumbnails, sign-in), Google Cloud (Drive access), Vercel (the app) and GitHub
+Actions (the scheduled sync). Do the steps in order; later ones need IDs from
+earlier ones. [ARCHITECTURE.md](ARCHITECTURE.md) explains how the pieces fit
+if you want the picture first.
 
-## 1. Supabase
+You'll need a Google Workspace account with a **Shared Drive** (not My Drive)
+holding the photos and videos, and permission to add members to it.
 
-Supabase provides the database, auth, and thumbnail storage.
+**How Relay reaches Drive:** everything server-side — the app on Vercel and
+the sync on GitHub Actions — acts as one Google **service account**, which is a
+member of the Shared Drive. Neither stores a key: each proves its identity to
+Google with a short-lived OIDC token (Workload Identity Federation, "WIF") and
+gets a Drive token back. Users sign in with Google only to prove who they are.
 
-1. Create a free project at [supabase.com](https://supabase.com)
-2. Go to **SQL Editor** and paste the entire contents of `supabase/schema.sql`, then click **Run**. This creates:
-   - `assets` table with pgvector embeddings column
-   - `shortcuts` table for Drive shortcut tracking
-   - `sync_logs` table for sync history
-   - `app_settings` table for UI-editable configuration
-   - Row-level security policies
-   - A `thumbnails` storage bucket
-   - The `match_assets` function for semantic search
+## 1. Fork the repository
 
-   > **Upgrading an existing install?** Run the files in `supabase/migrations/` you haven't applied yet, in date order, *before* deploying the new code — see [`supabase/migrations/README.md`](../supabase/migrations/README.md) for what each one does and which are required. Every migration is safe to re-run. `schema.sql` is always the complete, current schema for fresh installs (and is itself safe to re-run); CI checks that both paths produce the same database.
+Fork this repo on GitHub (it's what Vercel and Actions will run), then
+clone your fork. In the fork's **Actions** tab, enable workflows — GitHub
+switches them off in new forks.
 
-3. Go to **Project Settings → API** and copy:
-   - **Project URL** → `NEXT_PUBLIC_SUPABASE_URL`
-   - **anon public key** → `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-   - **service_role secret key** → `SUPABASE_SERVICE_ROLE_KEY`
+## 2. Supabase
 
-### Auth Provider
+1. Create a project at [supabase.com](https://supabase.com).
+2. **SQL Editor:** paste and run all of `supabase/schema.sql`. It creates the
+   tables, row-level security, the `thumbnails` storage bucket and the
+   `match_assets` search function, and is safe to re-run.
+3. **Project Settings → API:** note the project URL, the `anon` key and the
+   `service_role` key (keep that one secret — it bypasses row-level security).
+4. **Authentication → Providers → Google:** turn it on; you'll paste the
+   client ID and secret from step 3.3. Copy the **Callback URL** it shows
+   (`https://<project-ref>.supabase.co/auth/v1/callback`).
+5. **Authentication → URL Configuration:** add
+   `http://localhost:3000/auth/callback` to the redirect URLs (you'll add the
+   production one in step 4).
 
-4. Go to **Authentication → Providers → Google**
-5. Toggle it on and add your Google OAuth client ID and secret (created in the next section)
-6. Copy the **Callback URL** shown — you'll need it when creating Google OAuth credentials
+## 3. Google Cloud
 
-## 2. Google Cloud
+1. **Create a project** in the [Cloud Console](https://console.cloud.google.com)
+   and enable the **Google Drive API** and the **Drive Labels API**. Note the
+   project *number* (Dashboard → Project info).
+2. **OAuth consent screen** — this decides who can sign in. Pick one:
+   - **Internal** — everyone in your Workspace can sign in. Simplest for a
+     company tool.
+   - **External, left in Testing** — only the accounts you add under **Test
+     users** can sign in (up to 100); everyone else gets "403:
+     access_denied". Good for a small team or users outside your Workspace.
+   - **External, published** — *any* Google account can sign in, so also set
+     `AUTH_ALLOWED_EMAILS` / `AUTH_ALLOWED_DOMAINS` (step 4), or Relay is open
+     to anyone with a Google account.
+3. **Credentials → Create credentials → OAuth client ID** (Web application),
+   with the Supabase callback URL from step 2.4 as the authorized redirect
+   URI. Paste the client ID and secret into Supabase (step 2.4) and keep them
+   for the environment.
+4. **Service account:** IAM & Admin → Service accounts → create one (no roles
+   needed). Then, in Google Drive, add its email to the Shared Drive as a
+   **Content manager** — it renames, moves and creates shortcuts.
+5. **Workload Identity Federation:** IAM & Admin → Workload Identity
+   Federation → create **one pool** with **two OIDC providers**, and let both
+   impersonate the service account (grant `Workload Identity User` on the
+   service account to each provider's principals):
+   - **GitHub Actions** — follow
+     [google-github-actions/auth](https://github.com/google-github-actions/auth#workload-identity-federation-through-a-service-account);
+     restrict it to your fork with an attribute condition such as
+     `assertion.repository == '<owner>/<repo>'`.
+   - **Vercel** — follow [Vercel's GCP guide](https://vercel.com/docs/oidc/gcp):
+     issuer `https://oidc.vercel.com/<team-slug>`, allowed audience
+     `https://vercel.com/<team-slug>`. The team slug is the part after
+     `vercel.com/` in your Vercel dashboard URL.
 
-Google Cloud provides Drive API access and OAuth.
+   Note the pool ID and both provider IDs.
 
-1. Go to [Google Cloud Console](https://console.cloud.google.com) and create a project (or use an existing one)
-2. Enable the **Google Drive API** (APIs & Services → Enable APIs)
-3. Go to **APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client ID**
-   - Application type: **Web application**
-   - Authorized redirect URI: paste the Supabase callback URL from step 6 above
-4. Copy the **Client ID** and **Client Secret**:
-   - `GOOGLE_CLIENT_ID`
-   - `GOOGLE_CLIENT_SECRET`
+## 4. Vercel
 
-### OAuth Consent Screen
+1. **Import your fork** in Vercel. Production deploys `main`.
+2. **Settings → Environment Variables** — add:
 
-5. Go to **APIs & Services → OAuth consent screen** and configure it:
-   - **Internal** (Google Workspace only) — any user in your organization can sign in without additional setup. Best for company-internal deployments.
-   - **External** — required if users are outside your Workspace org. Starts in **Testing** mode, which means only users you explicitly add as test users can sign in (everyone else gets a 403). To allow anyone to sign in, click **Publish App**. Google may require a verification review for apps requesting sensitive scopes.
+   | Variable | Value |
+   |---|---|
+   | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Step 2.3 |
+   | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Step 3.3 |
+   | `GCP_PROJECT_NUMBER`, `GCP_SERVICE_ACCOUNT_EMAIL` | Steps 3.1, 3.4 |
+   | `GCP_WORKLOAD_IDENTITY_POOL_ID`, `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID` | Step 3.5 — the **Vercel** provider |
+   | `VERCEL_TEAM_SLUG` | Your team slug. **Vercel doesn't set this for you**; without it every Drive call fails |
+   | `GEMINI_API_KEY` | Optional — from [Google AI Studio](https://aistudio.google.com/apikey); powers semantic search and Namer analysis |
+   | `GITHUB_TOKEN`, `GITHUB_REPO` | Optional — for the Sync Now button (step 5.2) |
+   | `AUTH_ALLOWED_EMAILS`, `AUTH_ALLOWED_DOMAINS` | Optional — comma-separated app-level allowlist; required if the consent screen is published |
 
-   > **Common gotcha:** If users can't sign in and see a "403: access_denied" error, check that the app isn't still in Testing mode, or add their Google account under **OAuth consent screen → Test users**.
+3. Check **Settings → Security → OIDC Federation** is enabled with the *Team*
+   issuer mode (the default for new projects).
+4. Deploy, then in Supabase → Authentication → URL Configuration set the
+   **Site URL** to the production URL and add `<production URL>/auth/callback`
+   to the redirect URLs.
 
-### Shared Drive ID
+## 5. GitHub Actions (the scheduled sync)
 
-5. Open your Google Shared Drive in a browser. The URL looks like:
-   ```
-   https://drive.google.com/drive/u/0/folders/0AOo...9PVA
-   ```
-   The ID after `/folders/` is your `GOOGLE_SHARED_DRIVE_ID`. You can set this in `.env.local` for local dev, or configure it later in **Settings → Advanced** (which writes it to the database).
+1. In your fork, **Settings → Secrets and variables → Actions**:
+   - **Secrets:** `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
+     `SUPABASE_SERVICE_ROLE_KEY`, and optionally `GEMINI_API_KEY` (without it
+     the sync skips embeddings and search falls back to keywords).
+   - **Variables:** `GCP_PROJECT_NUMBER`, `GCP_WIF_POOL_ID`,
+     `GCP_WIF_PROVIDER_ID` (the **GitHub** provider), `GCP_SERVICE_ACCOUNT_EMAIL`.
+2. **Sync Now (optional):** create a
+   [fine-grained personal access token](https://github.com/settings/personal-access-tokens)
+   for your fork with **Actions: Read and write**, and set it in Vercel as
+   `GITHUB_TOKEN`, with `GITHUB_REPO` = `<owner>/<repo>`. The button dispatches
+   the workflow on `main`. Tokens expire — note the date.
 
-## 3. Environment File
+## 6. Configure and run the first sync
 
-```bash
-cp .env.example .env.local
-```
+Sign in to the deployed app, then in **Settings → Advanced**:
 
-Fill in the values from steps 1-2. The required variables for a basic local setup are:
+1. **Shared Drive ID** — the ID after `/folders/` when the drive is open in
+   Google Drive.
+2. **Sync Folders** — the top-level folders that make up the library (see
+   "Which folders are in Relay" in the README). Set this *before* syncing:
+   with no list, Relay syncs the whole drive.
 
-| Variable | Source |
-|----------|--------|
-| `NEXT_PUBLIC_SUPABASE_URL` | Supabase → Project Settings → API |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Same page |
-| `SUPABASE_SERVICE_ROLE_KEY` | Same page (secret) |
-| `GOOGLE_CLIENT_ID` | Google Cloud → Credentials |
-| `GOOGLE_CLIENT_SECRET` | Same page |
-| `GOOGLE_SHARED_DRIVE_ID` | Your Shared Drive URL |
+Then **Actions → Daily Sync → Run workflow**, with `dry_run` checked first: it
+writes nothing and attaches the planned changes to the run as an artifact.
+Run it again without `dry_run` to fill the library. After that it runs every 6
+hours on its own (edit the `cron:` line in `.github/workflows/daily-sync.yml`
+to change that). The first run on a big drive may take a couple of runs to
+finish thumbnails — they're time-boxed and pick up where they left off.
 
-Everything else is optional for getting started.
+Every run is recorded in **Settings → Recent Activity**.
 
-## 4. Run & First Sync
+## Optional: rights badges (Drive Labels)
 
-```bash
-npm install
-npm run dev
-```
+Rights badges read a [Drive Label](https://support.google.com/a/answer/9292382)
+created in Google Workspace admin → Labels, with four fields:
 
-Open [http://localhost:3000](http://localhost:3000), sign in with Google, then go to **Settings → Sync** and trigger a sync. Your Drive assets will appear within a few minutes.
+| Field | Type |
+|---|---|
+| Organic Rights | Selection |
+| Organic Expiration | Date |
+| Paid Rights | Selection |
+| Paid Expiration | Date |
 
----
+Name the selection choices however you like ("Perpetual", "1-Year License",
+"Revoked"…); Relay maps each to `unlimited` (green), `limited` (amber, check
+the expiry) or `expired` (red). Publish the label, and make sure the service
+account can read and apply it.
 
-## Optional: Access Control
+In **Settings → Advanced → Google Drive Labels**, enter the label ID, the four
+field IDs (**Field Mappings**) and each choice ID with its status (**Choice
+Mappings**). The label ID is in the label's URL in the Labels manager; once
+it's saved, `/api/namer/labels` (opened in the browser while signed in) lists
+its field and choice IDs. Extra labels for the Namer to read and apply (e.g.
+"Content Tags") go under **Additional Namer Labels**. Badges appear after the
+next sync. Without a label, assets show "Not Labeled" and the rights filter is
+inactive.
 
-By default, anyone who clears the Google OAuth consent screen can sign in. To restrict access at the app layer (defense-in-depth, independent of OAuth), set either or both in your environment:
+## Optional: the Asset Namer
 
-- `AUTH_ALLOWED_EMAILS` — comma-separated allowed email addresses
-- `AUTH_ALLOWED_DOMAINS` — comma-separated allowed email domains
+In the **Asset Namer** tab, open its **Settings** (gear button) and define naming schemas (date, creator, product,
+counters…), the dropdown lists they draw from, and — with a Gemini key — the
+prompts for image analysis. Names are written to round-trip through the
+filename parser (`src/lib/filename-utils.ts`), which also feeds search; the
+built-in conventions are date-first (`YYYYMMDD_Creator_Description_001.jpg`)
+and brand-first (`$Brand_Description_$Tag_001.jpg`).
 
-Leave both empty (the default) for no app-level restriction. When set, signed-in users whose email isn't permitted are bounced to the login page by middleware.
+## Hosting somewhere other than Vercel
 
-## Optional: Gemini (Semantic Search)
+The keyless service-account login in the app uses Vercel's OIDC tokens. On
+another Node host, set `USE_SERVICE_ACCOUNT=true` and provide Application
+Default Credentials for the service account (e.g. `GOOGLE_APPLICATION_CREDENTIALS`
+pointing at a key file); sign-in will then also ask users for Drive access.
+This path is not regularly tested.
 
-Without Gemini, text search uses client-side keyword matching. With it, you get vector-based semantic search ("golden hour camping" finds relevant photos even if the filename doesn't match).
+## Upgrading
 
-1. Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey)
-2. Set `GEMINI_API_KEY` in `.env.local`
-3. Run a sync — embeddings are generated automatically
-
-## Optional: Google Drive Labels (Rights Tracking)
-
-Drive Labels let you attach structured metadata to files in Google Drive — things like usage rights, licensing status, and expiration dates. Relay reads these labels during sync and displays visual compliance badges on each asset.
-
-### Recommended Label Structure
-
-Create a Drive Label in your Google Workspace admin with these fields:
-
-| Field Name | Type | Purpose |
-|------------|------|---------|
-| **Organic Rights** | Selection (dropdown) | Usage rights for organic/editorial content |
-| **Organic Expiration** | Date | When organic rights expire |
-| **Paid Rights** | Selection (dropdown) | Usage rights for paid/advertising content |
-| **Paid Expiration** | Date | When paid rights expire |
-
-For the **Selection** fields, create choices that map to these three statuses:
-
-| Choice | Meaning | Badge Color |
-|--------|---------|-------------|
-| Unlimited | Perpetual usage rights | Green |
-| Limited | Time-bound usage rights (check expiration) | Amber |
-| Expired | Rights have lapsed, do not use | Red |
-
-You can name the choices whatever makes sense for your team (e.g., "Perpetual", "1-Year License", "Revoked") — the mapping to unlimited/limited/expired happens in Relay's settings.
-
-### Connecting the Label to Relay
-
-1. **Enable the Drive Labels API** in your Google Cloud project
-2. **Set the Rights Label ID** — In Relay, go to **Settings → Advanced → Google Drive Labels** and paste your label ID. To find it, use the `/api/namer/labels` endpoint (accessible when signed in).
-3. **Map field IDs** — In the same Settings section under **Field Mappings**, enter the field IDs for Organic Rights, Organic Expiration, Paid Rights, and Paid Expiration. The `/api/namer/labels` endpoint returns these.
-4. **Map choice IDs** — Under **Choice Mappings**, add each dropdown choice ID and map it to `unlimited`, `limited`, or `expired`.
-5. **Run a sync** — Rights data will be pulled from Drive and displayed as badges on each asset.
-
-> You can also add extra labels for the Namer to read (e.g., "Content Tags") under **Additional Namer Labels** in the same settings section.
-
-## Optional: GitHub Actions (Automated Sync)
-
-See the [GitHub Actions section](../README.md#github-actions-automated-sync) in the README for setting up scheduled syncs with Workload Identity Federation.
-
-## Optional: Vercel Deployment
-
-For production hosting on Vercel:
-
-1. Push your repo to GitHub and import it in [Vercel](https://vercel.com)
-2. Add all environment variables from `.env.example` to Vercel's Environment Variables settings
-3. Additionally set `VERCEL_TEAM_SLUG` to your Vercel team slug (from your dashboard URL — this is **not** automatically exposed by Vercel)
-4. For server-side Drive access, configure WIF environment variables (`GCP_PROJECT_NUMBER`, `GCP_SERVICE_ACCOUNT_EMAIL`, `GCP_WORKLOAD_IDENTITY_POOL_ID`, `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID`)
+Pull the new code, then apply any new files in `supabase/migrations/` in date
+order in the SQL Editor **before** deploying — the
+[migrations README](../supabase/migrations/README.md) says which are required.
+Every migration is safe to re-run.
