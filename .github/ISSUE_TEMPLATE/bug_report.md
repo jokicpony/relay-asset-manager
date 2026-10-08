@@ -18,7 +18,7 @@ What you expected to happen.
 **Environment**
 - Hosting: [e.g., Vercel, self-hosted]
 - Browser: [e.g., Chrome 120]
-- Node version: [e.g., 20.x]
+- Node version: [e.g., 22.x]
 
 **Screenshots / logs**
 If applicable, paste any error messages or screenshots.

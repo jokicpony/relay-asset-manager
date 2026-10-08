@@ -35,9 +35,12 @@ function getAuthClient(): AuthClient {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { getVercelOidcToken } = require('@vercel/oidc');
 
-    // The Vercel OIDC token must carry the audience we configured in the
-    // GCP WIF provider. google-auth-library passes its own STS audience
-    // by default, which doesn't match — so we wrap the call.
+    // Vercel issues the OIDC token with audience https://vercel.com/<team-slug>
+    // (team issuer mode), which the GCP WIF provider must allow. We supply the
+    // token ourselves because google-auth-library would otherwise request one
+    // for its own STS audience. Note: @vercel/oidc ignores the `audience`
+    // option passed below; VERCEL_TEAM_SLUG (or VERCEL_TEAM_ID) only has to be
+    // set for this guard.
     const vercelTeam = process.env.VERCEL_TEAM_SLUG || process.env.VERCEL_TEAM_ID;
     if (!vercelTeam) {
         throw new Error(

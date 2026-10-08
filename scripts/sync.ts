@@ -55,7 +55,8 @@ const THUMBNAIL_CONCURRENCY = 8;
 const THUMBNAIL_BUDGET_MS = (Number(process.env.SYNC_THUMBNAIL_BUDGET_MIN) || 15) * 60_000;
 
 // Mass-orphan circuit breaker (see detectOrphans). A run that would trash
-// more than this many assets as `orphaned` skips that soft-delete instead.
+// more than max(MASS_ORPHAN_MIN, MASS_ORPHAN_FRACTION of the library) assets
+// as orphaned + moved-out + ignored combined skips that soft-delete instead.
 // Override for a genuine bulk deletion: --allow-mass-orphan.
 const MASS_ORPHAN_MIN = 100;
 const MASS_ORPHAN_FRACTION = 0.1;
@@ -1239,8 +1240,8 @@ async function detectOrphans(
     // Circuit breaker. Scope is matched by top-level folder *name*, so
     // renaming a synced folder (or a Drive listing that comes back short)
     // makes every file under it look deleted — and 14 days later the purge
-    // would hard-delete rows, embeddings and custom thumbnails. Explicit
-    // admin actions (ignored / out-of-scope) are not throttled.
+    // would hard-delete rows, embeddings and custom thumbnails. out-of-scope
+    // (a Settings change, never purged) is not throttled.
     // The fraction is of the whole live library. activeAssets can't be the
     // base: it excludes rows touched since the sync started, i.e. everything
     // the upsert just wrote — it's essentially the orphan candidates alone.

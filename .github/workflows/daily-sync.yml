@@ -2,8 +2,8 @@ name: Daily Sync
 
 on:
   schedule:
-    # Run every 6 hours (4x daily): 12 AM, 6 AM, 12 PM, 6 PM UTC
-    # In MST: 5 PM, 11 PM, 5 AM, 11 AM
+    # Run every 6 hours (4x daily): 12 AM, 6 AM, 12 PM, 6 PM UTC.
+    # Keep it under 13 h — the app shows "Sync overdue" after that.
     - cron: '0 */6 * * *'
   workflow_dispatch: # Allow manual trigger from GitHub Actions UI
     inputs:
@@ -97,7 +97,7 @@ jobs:
 
       # Dry runs only: the planned changes, for review or for diffing two
       # versions of the sync against the same data. Contains asset metadata —
-      # kept briefly, and only in this (private) repository.
+      # kept briefly, in this repository — keep it private (docs/SETUP.md step 1).
       - name: Upload dry-run plan
         if: ${{ inputs.dry_run }}
         uses: actions/upload-artifact@v4

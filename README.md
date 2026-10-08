@@ -50,8 +50,9 @@ rules that keep it consistent — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE
 - A **Google Workspace** account with a **Shared Drive** holding the assets
   (Drive Labels, for rights badges, need a Workspace edition that supports
   them — optional).
-- A **Google Cloud** project, a **Supabase** project, a **Vercel** account and
-  a **GitHub** repository (your fork). Free tiers are enough to start.
+- A **Google Cloud** project, a **Supabase** project, a **Vercel** account
+  (Hobby is for non-commercial use) and a **private GitHub** repository with
+  a copy of this code.
 - A **Gemini API key** for semantic search and Namer analysis — optional.
 
 **[docs/SETUP.md](docs/SETUP.md) walks through building your own instance**,
@@ -73,18 +74,24 @@ Relay looks at **one Google Shared Drive**, and inside it only at the
 
 Things to know:
 
+Settings opens from your avatar menu → **Sync & Settings**; "Settings →
+Advanced" below means the **Advanced Configuration** section at the bottom.
+
 - **Changes take effect on the next sync** (every 6 hours, or Settings → Sync
   Now).
 - **Moving a file** to another folder inside the library just updates it.
   Moving it **out** of the synced folders, or deleting it in Drive, sends it to
-  the Trash for 14 days, then removes it. Trashed assets can be restored from
-  Settings → Trash until then.
+  the Trash for 14 days, then removes it. To get it back, undo the cause in
+  Drive (restore the file from Drive's trash, move it back, or remove the
+  tag) — the next sync restores it. The **Trash** (avatar menu) shows what's
+  pending and when it will be purged; its Restore button alone is undone by
+  the next sync if the cause is still there.
 - **Don't rename a synced top-level folder** without updating Sync Folders to
   match: Sync Folders are matched by name, so to Relay a renamed folder looks
-  as if every file in it was deleted. A safety limit stops any sync that would
-  trash more than 100 assets or 10% of the library (whichever is larger) and
-  explains why in Settings → Recent Activity — rename the folder back, or
-  update Sync Folders.
+  as if every file in it was deleted. A safety limit makes a sync skip
+  trashing when it would trash more than 100 assets or 10% of the library
+  (whichever is larger), and explains why in Settings → Recent Activity —
+  rename the folder back, or update Sync Folders.
 - **Relays** (shortcuts) can only be created in folders inside the library,
   and disappear from Relay when the shortcut is deleted or its folder moves out.
 
@@ -101,11 +108,13 @@ Things to know:
 
 ## Local development
 
-Requires Node.js 22 (what CI uses) and a Supabase project with the schema
-applied ([SETUP.md](docs/SETUP.md) steps 1–2).
+Requires Node.js 22 (what CI uses), a Supabase project with the schema
+applied and Google sign-in configured ([SETUP.md](docs/SETUP.md) steps 2 and
+3.1–3.3), and — for Drive features — a Google account with access to the
+Shared Drive.
 
 ```bash
-git clone https://github.com/<you>/relay-asset-manager.git
+git clone git@github.com:<you>/<your-private-repo>.git
 cd relay-asset-manager
 npm install
 cp .env.example .env.local   # Supabase + Google OAuth values; see SETUP.md
@@ -113,7 +122,9 @@ npm run dev                  # http://localhost:3000
 ```
 
 Settings (shared drive, sync folders, labels, Namer schemas) live in the
-database and are edited in the app's Settings; env vars are only credentials.
+database and are edited in the app's Settings; env vars are credentials (the
+few setting-like ones in `.env.example` are only used when the database has no
+value).
 If `.env.local` points at the same Supabase project as your deployment, local
 writes are real.
 
@@ -123,7 +134,9 @@ Drive access locally:
   access when you log in locally), so you see what your account can see.
 - To act as the service account, set `USE_SERVICE_ACCOUNT=true` and log in with
   `gcloud auth application-default login --impersonate-service-account=<sa-email>`
-  (without the impersonation flag you're still using your personal account).
+  (your account needs the *Service Account Token Creator* role on the service
+  account; without the impersonation flag you're still using your personal
+  account).
 - `scripts/sync.ts` only picks those credentials up when
   `GOOGLE_APPLICATION_CREDENTIALS` is set, and needs the service-role key even
   for a dry run:

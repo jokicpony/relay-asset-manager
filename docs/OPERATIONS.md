@@ -5,15 +5,22 @@ hours, no routine hands-on work. This page covers what does need a person —
 users, credentials that expire, upgrades, and what to do when something
 breaks. How the system works is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+Where things are in the app: **Settings** opens from the avatar menu (top
+right) → **Sync & Settings**; "Settings → Advanced" means its **Advanced
+Configuration** section at the bottom. **Trash** is its own item in the same
+menu.
+
 ## Users
 
-Who can sign in is decided by your **Google OAuth consent screen**, plus the
-optional `AUTH_ALLOWED_EMAILS` / `AUTH_ALLOWED_DOMAINS` allowlist (SETUP.md
-step 3.2). To add someone:
+Who can sign in is decided by your **Google Auth Platform** audience
+(SETUP.md step 3.2), plus the optional `AUTH_ALLOWED_EMAILS` /
+`AUTH_ALLOWED_DOMAINS` allowlist, which only guards the app itself. To add
+someone:
 
-1. **Let them sign in** — nothing to do for an Internal consent screen; for
-   External in Testing mode, add their Google account under **OAuth consent
-   screen → Test users** (max 100); if you use the allowlist, add them there.
+1. **Let them sign in** — nothing to do for an Internal audience; for
+   External in Testing mode, add their Google account under **Google Auth
+   Platform → Audience → Test users** (max 100); if you use the allowlist, add
+   them there too.
 2. **Give them access to the Shared Drive.** Relay reads Drive as the service
    account, but "Open in Drive" links and direct downloads of files ≥ 1 GiB use
    the person's own access.
@@ -21,33 +28,33 @@ step 3.2). To add someone:
 Users don't need Vercel, GitHub or Supabase accounts. Every signed-in user has
 the same rights, including Settings → Advanced (see "Design decisions").
 
-To **remove** someone: revoke their sign-in (test-user list or allowlist), and
+To **remove** someone: revoke their sign-in (test-user list or allowlist),
 delete them under Supabase → Authentication → Users to end their session
-immediately.
+immediately, and remove them from the Shared Drive if appropriate.
 
 ## Credentials to keep alive
 
 - **The Sync Now token** (`GITHUB_TOKEN` in Vercel) is a personal access token:
   it **expires**, and it belongs to whoever created it. When it's dead the
   button fails with a message saying so; scheduled syncs are unaffected.
-- **Scheduled workflows pause in quiet public repos.** GitHub disables `cron`
-  workflows in a public repository after 60 days without activity. If syncs
-  stop, re-enable Daily Sync in the Actions tab (or keep the repo private).
 - **Sync-failure emails** from GitHub go to whoever last edited the `cron:`
   line in `.github/workflows/daily-sync.yml`.
-- **Rotating a Supabase or Gemini key** means updating it in **both** Vercel
-  and GitHub Actions secrets.
+- **Changing a credential:** update it everywhere it lives — Vercel, GitHub
+  Actions secrets, Supabase (the OAuth client secret, under Authentication →
+  Providers → Google) and your `.env.local` — then **redeploy in Vercel**.
+  Running deployments keep the old values.
 
 ## Upgrading
 
-1. Pull the new code into your fork (GitHub's **Sync fork**, or merge
-   upstream).
-2. Read the new entries in
-   [supabase/migrations/README.md](../supabase/migrations/README.md) and apply
-   any new migrations in the Supabase SQL Editor **before** the deploy — they're
-   idempotent, so re-running one is harmless.
-3. Push to `main`; Vercel deploys it and the next sync runs it. Check Settings
-   → Recent Activity after that sync.
+Vercel deploys whatever lands on `main`, so apply database changes first:
+
+1. `git fetch upstream`, then see what's new:
+   `git diff main upstream/main -- supabase/migrations/`.
+2. Apply each new migration in the Supabase SQL Editor, in date order —
+   [supabase/migrations/README.md](../supabase/migrations/README.md) says what
+   each does. They're idempotent, so re-running one is harmless.
+3. `git merge upstream/main` and push to `main`. Vercel deploys it and the
+   next sync runs it; check Settings → Recent Activity after that sync.
 
 ---
 
@@ -60,23 +67,31 @@ overdue** (no successful sync in 13 hours).
 
 **The scheduled sync failed.** Open the row → **GitHub log ↗**. Usually:
 
-- *Google auth* — fails at "Authenticate to Google Cloud": check the `GCP_*`
-  repository variables, the GitHub provider's attribute condition, and that
-  the service account is still a member of the Shared Drive.
+- *Google auth* — fails at "Authenticate to Google Cloud" (missing or wrong
+  `GCP_*` repository variables), or in "Run sync" with "ADC/WIF auth failed"
+  (the GitHub provider's condition, the Workload Identity User binding, or a
+  disabled IAM Credentials API; ignore the message's `GOOGLE_REFRESH_TOKEN`
+  suggestion). 404s during the crawl instead mean the service account isn't a
+  member of the Shared Drive.
 - *Supabase* — errors about a relation or column: usually a migration that
   wasn't applied.
-- *Timed out / cancelled* — thumbnail and embedding backlogs are time-boxed
-  and finish over later runs; if it keeps timing out, run manually with
-  `skip_thumbnails`.
+- *Timed out / cancelled* — thumbnails are time-boxed and finish over later
+  runs; embeddings are saved as they go, so a killed run keeps its progress.
+  If it keeps timing out, run manually with **Skip thumbnail processing**
+  (assets embedded before they have a thumbnail are embedded from text only —
+  see "Search results look wrong or thin").
 
 Re-run from Actions → Daily Sync → Run workflow (runs never overlap, so it's
-safe while another is queued).
+safe while another is queued). The form's options: **Skip thumbnail
+processing**, **Allow trashing a large number of missing assets** and **Dry
+run**.
 
 **Every Drive action in the app fails** (browsing works, but downloads,
-relays, the Namer and video don't). That's the app's WIF login: check
-`VERCEL_TEAM_SLUG` and the `GCP_*` variables in Vercel, that OIDC Federation is
-on, and that the Vercel provider's issuer and audience use the same team slug.
-The Vercel function logs show the exact error.
+relays, the Namer and video don't; Vercel's function logs say "Failed to get
+Drive access token via WIF"). Check the four `GCP_*` variables and
+`VERCEL_TEAM_SLUG` in Vercel (it must be set), that OIDC Federation is on, and
+that the Vercel provider's issuer and audience use your team's real slug —
+renaming the Vercel team breaks them. Redeploy after any change.
 
 **A sync is "Partial".** Something failed without stopping the run; the details
 list each problem by step. Missing thumbnails and embeddings retry on their own
@@ -85,7 +100,8 @@ next run; a persistent problem names its cause (e.g. Gemini quota).
 **"Skipped trashing N assets … safety limit".** A sync would have trashed an
 unusually large number of assets — almost always a synced top-level folder
 that was renamed or moved. Rename it back, or update Sync Folders. Only if the
-files really were deleted, re-run manually with `allow_mass_orphan`.
+files really were deleted, re-run manually with **Allow trashing a large
+number of missing assets**.
 
 **Assets are missing, or in the Trash.** Check the rules in the README's
 "Which folders are in Relay". Quickest causes first:
@@ -95,11 +111,13 @@ files really were deleted, re-run manually with `allow_mass_orphan`.
 - *Not synced yet* — new files appear after the next sync (≤ 6 hours, or
   Settings → Sync Now); Namer batches a few minutes after the batch.
 - *Trashed* — the file was deleted in Drive, moved out of the synced folders,
-  or put under `[relay-ignore]`. Restorable from Settings → Trash for 14 days.
+  or put under `[relay-ignore]`. Undo that in Drive within 14 days and the
+  next sync restores it. Trash (avatar menu) lists what's pending; its Restore
+  button is undone by the next sync if the cause is still there.
 - *Relay gone* — its shortcut was deleted or its folder moved out of the
-  library; it disappears within 2 days.
+  library; the sync drops it about 2 days later.
 
-To see what a sync *would* do, run the workflow with `dry_run`.
+To see what a sync *would* do, run the workflow with **Dry run**.
 
 **A Namer batch or ingest failed.** The Namer queue shows each file's reason;
 **Retry failed** re-runs only what failed and never renames or moves a file
@@ -109,8 +127,10 @@ missed is picked up by the next scheduled sync.
 
 **Search results look wrong or thin.** New and changed assets are embedded by
 the scheduled sync; a Gemini problem shows as a Partial run with an
-"embeddings" problem. To rebuild everything: `npx tsx scripts/embed.ts --force`
-(slow; uses Gemini quota).
+"embeddings" problem. An asset embedded before its thumbnail existed (a run
+that skipped or ran out of time for thumbnails) is embedded from its text
+only, and isn't re-embedded when the thumbnail arrives. To rebuild
+everything: `npx tsx scripts/embed.ts --force` (slow; uses Gemini quota).
 
 ## Will need attention eventually
 
@@ -121,9 +141,9 @@ the scheduled sync; a Gemini problem shows as a Partial run with an
   use the same model.
 - **Supabase plan limits** (storage, database size) as the library grows.
   Thumbnails are roughly 100 KB each.
-- **The OAuth test-user cap of 100**, if you use Testing mode. Past it, switch
-  to an Internal consent screen, or publish it together with
-  `AUTH_ALLOWED_DOMAINS`.
+- **The test-user cap of 100**, if you use Testing mode. Past it, switch to
+  an Internal audience. Publishing an External app isn't safe on its own: the
+  allowlist doesn't protect the database.
 
 ---
 

@@ -704,7 +704,7 @@ export default function SettingsPanel({ onClose, onSyncComplete }: { onClose: ()
                                 </div>
                             ) : (
                                 <div style={{ fontSize: 12, color: 'var(--ram-text-tertiary)' }}>
-                                    No master folders configured. Set SYNC_FOLDERS in .env.local.
+                                    No sync folders configured — add them in Advanced Configuration below.
                                 </div>
                             )}
                             <div style={{

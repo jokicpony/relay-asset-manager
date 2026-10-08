@@ -6,8 +6,8 @@ welcome.
 ## Getting set up
 
 You'll need your own instance to test against — at least a Supabase project
-with the schema applied and a Google OAuth client ([docs/SETUP.md](docs/SETUP.md)
-steps 1–3). Then follow "Local development" in the [README](README.md).
+with the schema applied and Google sign-in configured
+([docs/SETUP.md](docs/SETUP.md) steps 2 and 3.1–3.3). Then follow "Local development" in the [README](README.md).
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how the pieces connect,
 and [CLAUDE.md](CLAUDE.md) lists the conventions and the gotchas that have
 cost time before — worth a skim whoever (or whatever) is writing the code.

@@ -36,8 +36,8 @@ service account.
 ┌───────▼─────────────┐       ┌─────────▼──────────┐       ┌──────────▼─────────┐
 │ GitHub Actions      │       │ Vercel             │       │ Gemini API         │
 │ "Daily Sync"        │       │ Next.js app + API  │──────▶│ embeddings,        │
-│ scripts/sync.ts     │──────▶│ routes             │       │ Namer image        │
-│ every 6h + manual   │ Gemini│ (src/app)          │       │ analysis           │
+│ scripts/sync.ts     │       │ routes             │       │ Namer image        │
+│ every 6h + manual   │       │ (src/app)          │       │ analysis           │
 └───────┬─────────────┘       └───┬───────────▲────┘       └────────────────────┘
         │ service-role key        │ service   │ user session (anon key, read-only)
         │ (all writes)            │ role      │
@@ -59,7 +59,7 @@ service account.
 | **Web app** | Browse, search, Namer, relays, downloads, settings. | `src/app/page.tsx` (UI), `src/app/api/*` (server) |
 | **Sync engine** | Shared building blocks used by the cron *and* the app, so both write identical rows. | `src/lib/sync/*` |
 | **Supabase** | Database, thumbnail storage, sign-in. | `supabase/schema.sql` |
-| **Gemini** | Turns each asset (thumbnail + text) into a 768-number vector for "search by meaning"; also suggests metadata in the Namer. | `src/lib/sync/embedder.ts`, `src/app/api/namer/analyze` |
+| **Gemini** | Turns each asset (thumbnail + text) into a 768-number vector for "search by meaning"; also suggests metadata in the Namer. Called directly by the sync (documents) and the app (queries, Namer). | `src/lib/sync/embedder.ts`, `src/app/api/namer/analyze` |
 
 ## Who is allowed to do what
 
@@ -90,11 +90,12 @@ well-formed, the file/folder must be inside the configured shared drive
 it must be an active asset or a folder inside the synced folders. Never trust a
 folder *path* sent by the browser — derive it from the Drive folder ID.
 
-**Who can sign in at all** is decided by the Google OAuth consent screen
-(Internal, External + test users, or published — see SETUP.md step 3.2).
+**Who can sign in at all** is decided by the Google Auth Platform audience
+(Internal, or External with test users — see SETUP.md step 3.2).
 `src/proxy.ts` → `src/lib/supabase/middleware.ts` then requires a session for
 every page and API route, and applies the optional email/domain allowlist
-(`AUTH_ALLOWED_EMAILS` / `AUTH_ALLOWED_DOMAINS`) when it's set.
+(`AUTH_ALLOWED_EMAILS` / `AUTH_ALLOWED_DOMAINS`) when it's set. The allowlist
+only covers the app: RLS grants reads to *any* authenticated Supabase user.
 
 ## What's in the database
 
@@ -112,7 +113,8 @@ every page and API route, and applies the optional email/domain allowlist
   missing): `shared_drive_id`, `sync_folders` (top-level folder *names* that
   make up the library), `drive_label_id`, `rights_label_config` (label field
   IDs → rights columns), `namer_label_ids`, `hidden_folders`,
-  `semantic_similarity_threshold`, `namer_auto_ingest_delay_ms`.
+  `semantic_similarity_threshold`. (`namer_auto_ingest_delay_ms` is read by
+  `getConfig()` but not used; the ingest delay is fixed in code.)
 - **Namer** setup: `namer_schemas`, `namer_dropdowns`, `namer_ai_config`,
   `namer_help_guide`.
 - **Written by the system, not people:** `folder_drive_ids` (folder path →
@@ -157,8 +159,8 @@ runs never overlap. Each run, in order:
    | `out-of-scope` | its whole top-level folder was removed from Sync Folders in Settings | **kept**; restored if re-added |
 
    Assets that reappear are restored. **Safety limit:** if a run would trash
-   more than max(100, 10% of active) assets for one of the three purged
-   reasons, it skips that trashing and records why — almost always a renamed
+   more than max(100, 10% of the library) assets for the three purged
+   reasons combined, it skips that trashing and records why — almost always a renamed
    top-level folder (scope is matched by *name*). The user-facing version of
    these rules is the README's "Which folders are in Relay".
 8. **Relays:** find every Drive shortcut inside the library that points at an
@@ -167,7 +169,9 @@ runs never overlap. Each run, in order:
 9. **Purge** trashed assets past 14 days (rows, thumbnails).
 10. **Embeddings:** assets whose name/folder/description changed get their
     embedding cleared; then everything with no embedding (new, changed,
-    previously failed) is embedded with Gemini. Skipped without a
+    previously failed) is embedded with Gemini — from the thumbnail and text,
+    or from text alone if the asset has no thumbnail yet. Adding a thumbnail
+    later doesn't trigger a re-embed (`scripts/embed.ts --force` does). Skipped without a
     `GEMINI_API_KEY`.
 11. **Log** one `sync_logs` row: `success`, `partial` (something failed but the
     run finished — each problem recorded by step) or `failed`. A run killed by
@@ -179,7 +183,7 @@ the next run (missing thumbnails and embeddings are simply retried).
 
 `--dry-run --dry-run-out=plan.json` does every read and no writes, and emits
 the plan. **Any change to sync behaviour should be checked by diffing the
-plan before and after** (the workflow's `dry_run` option uploads it as an
+plan before and after** (the workflow's **Dry run** option uploads it as an
 artifact).
 
 ## Flow 2 — The Namer and the in-app ingest
@@ -205,8 +209,7 @@ pick source folder ─▶ build names from a schema ─▶ for each file:
   failed**, **Cancel** and **Revert**. The batch queue lives in the tab
   (`src/lib/namer/batch-utils.ts`).
 - **Deferred ingest:** so the new files show up without waiting up to 6 hours,
-  the batch is ingested after a delay (`namer_auto_ingest_delay_ms`, default
-  5 min — time to undo). The intent is kept in `localStorage` *and*
+  the batch is ingested after a fixed 5-minute delay (`useDeferredIngest` — time to undo). The intent is kept in `localStorage` *and*
   `app_settings.pending_ingests`, so if the tab closes, the next person to open
   Relay fires it. `/api/sync/ingest` then re-checks each file (still in the
   shared drive? still in scope? not ignored?), upserts it with the same row
@@ -272,8 +275,8 @@ quietly, usually days later.
    (`sync/embedder.ts`, `embedding-text.ts`), filename parsing
    (`filename-utils.ts`). If two paths disagree, the next sync "corrects" every
    row the other wrote — e.g. a forked filename parser triggers a full
-   re-embed. `src/lib/sync/*` must not use the `@/` import alias: the scripts
-   import it by relative path.
+   re-embed. Modules that `scripts/` import must not use the `@/` import
+   alias: the scripts import them by relative path.
 2. **Documents and queries use the same embedding model.** Changing
    `EMBED_MODEL` means `npx tsx scripts/embed.ts --force` for the whole library.
 3. **Writes are service-role; check that updates hit rows.** Chain
