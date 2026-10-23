@@ -106,6 +106,10 @@ Things that aren't obvious from the code but cost time when forgotten.
 - **Embeddings don't notice new thumbnails.** An asset embedded before its thumbnail existed (thumbnail budget ran out, or `--skip-thumbnails`) keeps a text-only embedding, because thumbnails aren't part of `EMBED_INPUT_COLUMNS`. `scripts/embed.ts --force` fixes it.
 - **`parseFilename` is shared** — `src/lib/filename-utils.ts` is the single parser used by the app, the namer ingest, and `scripts/sync.ts`. Don't fork it: divergent parsed values trigger mass re-embeds on the next sync (embedding text includes the parsed description).
 
+### Dependencies
+
+- **`eslint-plugin-react-hooks` is pinned to 7.0.1 via `overrides`.** 7.1+ (pulled in by `eslint-config-next` ≥16.4) adds React Compiler rules (`set-state-in-effect`, `immutability`) that fail lint on ~9 existing effects. Pinned during the 2026-10-23 Next.js security upgrade so it could ship without refactors; to lift it, fix those effects, then bump `eslint-config-next` to match `next` and drop the override.
+
 ### Caching
 
 - **`/api/assets` returns `Cache-Control: private, max-age=60, stale-while-revalidate=300`.** In-app mutation flows (relay, trash, namer ingest, sync-complete) call `refreshAssets()` in `page.tsx`, which fetches with `cache: 'reload'`. Changes made *outside* your session (another user's relay, the cron sync) can still appear up to 60s stale until reload.
